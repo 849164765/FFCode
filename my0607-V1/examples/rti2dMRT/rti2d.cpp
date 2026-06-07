@@ -12,94 +12,6 @@ using T = FLOAT;
 using LatSet = D2Q9<T>;
 
 // ===================================================================
-// MRT collision with Guo force scheme for Navier-Stokes
-// Equivalent to BGKForce in moment space
-// ===================================================================
-namespace collision {
-template <typename CELL>
-struct MRTForce {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-
-  __any__ static void apply(CELL& cell) {
-    const T omega = cell.getOmega();
-    const auto& F = cell.template get<FORCE<T, LatSet::d>>();
-
-    // 1. Compute rho and u_raw from populations
-    T rho{};
-    Vector<T, LatSet::d> u{};
-    for (unsigned int k = 0; k < LatSet::q; ++k) {
-      rho += cell[k];
-      for (unsigned int d = 0; d < LatSet::d; ++d) {
-        u[d] += latset::c<LatSet>(k)[d] * cell[k];
-      }
-    }
-    for (unsigned int d = 0; d < LatSet::d; ++d) u[d] /= rho;
-
-    // 2. Half-force correction: u_c = u + F/(2*rho)
-    Vector<T, LatSet::d> uc = u;
-    for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho);
-
-    // Write macroscopic fields
-    cell.template get<RHO<T>>() = rho;
-    cell.template get<VELOCITY<T, LatSet::d>>() = uc;
-
-    // 3. NS relaxation time vector
-    T rtvec[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = mrt::s<LatSet>(i);
-    for (int i = 0; i < mrt::shearIndexes<LatSet>(); ++i)
-      rtvec[mrt::shearViscIndexes<LatSet>(i)] = omega;
-
-    // 4. Moments from population: m_k = M * f
-    T momenta[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i)
-      for (unsigned int j = 0; j < LatSet::q; ++j)
-        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
-
-    // 5. Equilibrium in population space, then to moment space
-    std::array<T, LatSet::q> feq{};
-    equilibrium::SecondOrder<CELL>::apply(feq, rho, uc);
-    T momentaEq[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i)
-      for (unsigned int j = 0; j < LatSet::q; ++j)
-        momentaEq[i] += mrt::M<LatSet>(i, j) * feq[j];
-
-    // 6. Force source in population space (matching force::Force formula)
-    T uF = T{};
-    for (unsigned int d = 0; d < LatSet::d; ++d) uF += uc[d] * F[d];
-    T fi_force[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T cF = T{}, cu = T{};
-      for (unsigned int d = 0; d < LatSet::d; ++d) {
-        cF += latset::c<LatSet>(i)[d] * F[d];
-        cu += latset::c<LatSet>(i)[d] * uc[d];
-      }
-      fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF)
-                     + LatSet::InvCs4 * cu * cF);
-    }
-
-    // 7. Force source in moment space: F_k = M * fi
-    T force_m[LatSet::q] {};
-    for (unsigned int j = 0; j < LatSet::q; ++j)
-      for (unsigned int k = 0; k < LatSet::q; ++k)
-        force_m[j] += mrt::M<LatSet>(j, k) * fi_force[k];
-
-    // 8. Combined MRT collision + force source
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T coll{};
-      T source{};
-      for (unsigned int j = 0; j < LatSet::q; ++j) {
-        T invM_ij = mrt::InvM<LatSet>(i, j);
-        coll += invM_ij * rtvec[j] * (momenta[j] - momentaEq[j]);
-        source += invM_ij * (T{1} - rtvec[j] / T{2}) * force_m[j];
-      }
-      cell[i] = cell[i] - coll + source;
-    }
-  }
-};
-} // namespace collision
-
-// ===================================================================
 // Custom Boussinesq buoyancy functor for RTI
 // Uses (rho(phi) - rho_0) * g  instead of (rho - rho_h) * g
 // ===================================================================
@@ -399,7 +311,7 @@ int main(int argc, char* argv[]) {
   // ===================================================================
 
   // ---- NS collision: MRT with Guo force ----
-  using NSBulkTask = tmp::Key_TypePair<BulkFlag, collision::MRTForce<NSCELL>>;
+  using NSBulkTask = tmp::Key_TypePair<BulkFlag, collision::MRTForce<NSCELL, FORCE<T, LatSet::d>>>;
   using NSPeriodicTask = tmp::Key_TypePair<
       PeriodicFlag, collision::PeriodicBoundary<NSCELL>>;
   using NSAllTasks = tmp::TupleWrapper<NSBulkTask, NSPeriodicTask>;

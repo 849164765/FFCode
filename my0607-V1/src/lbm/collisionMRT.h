@@ -339,4 +339,96 @@ struct MRTSource {
 
 };
 
+// MRT collision with Guo force scheme for Navier-Stokes
+// replaces BGKForce<moment::forcerhoU, equilibrium::SecondOrder, force::Force>
+template <typename CELL, typename ForceField>
+struct MRTForce {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static void apply(CELL& cell) {
+    const T omega = cell.getOmega();
+    const auto& F = cell.template get<ForceField>();
+
+    // 1. Compute rho and u_raw from populations
+    T rho{};
+    Vector<T, LatSet::d> u{};
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      rho += cell[k];
+      for (unsigned int d = 0; d < LatSet::d; ++d) {
+        u[d] += latset::c<LatSet>(k)[d] * cell[k];
+      }
+    }
+    for (unsigned int d = 0; d < LatSet::d; ++d) u[d] /= rho;
+
+    // 2. Half-force correction: u_c = u + F/(2*rho)
+    Vector<T, LatSet::d> uc = u;
+    for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho);
+
+    // Write macroscopic fields
+    cell.template get<RHO<T>>() = rho;
+    cell.template get<VELOCITY<T, LatSet::d>>() = uc;
+
+    // 3. D2Q9 MRT relaxation time vector
+    //    基于标准多松弛参数设置，守恒量设1.0（dummy值，meq=m），
+    //    非物理/鬼矩用大阻尼抑制高频噪声，剪切矩由 omega 控制
+    T rtvec[LatSet::q] {};
+    rtvec[0] = T{1.0};   // 密度 rho（守恒，dummy）
+    rtvec[3] = omega;   // 动量 jx（守恒，dummy）
+    rtvec[5] = omega;   // 动量 jy（守恒，dummy）
+    rtvec[1] = T{1.1};   // 能量 e
+    rtvec[2] = T{1.4};   // 能量平方 epsilon（鬼矩，大阻尼）
+    rtvec[4] = T{1.2};   // 热流 qx
+    rtvec[6] = T{1.2};   // 热流 qy
+    rtvec[7] = omega;    // 剪切应力 pxx（物理粘度）
+    rtvec[8] = omega;    // 剪切应力 pxy（物理粘度）
+
+    // 4. Moments from population
+    T momenta[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
+
+    // 5. Equilibrium in moment space
+    std::array<T, LatSet::q> feq{};
+    equilibrium::SecondOrder<CELL>::apply(feq, rho, uc);
+    T momentaEq[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momentaEq[i] += mrt::M<LatSet>(i, j) * feq[j];
+
+    // 6. Force source in population space (Guo force scheme)
+    T uF = T{};
+    for (unsigned int d = 0; d < LatSet::d; ++d) uF += uc[d] * F[d];
+    T fi_force[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T cF = T{}, cu = T{};
+      for (unsigned int d = 0; d < LatSet::d; ++d) {
+        cF += latset::c<LatSet>(i)[d] * F[d];
+        cu += latset::c<LatSet>(i)[d] * uc[d];
+      }
+      fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF)
+                     + LatSet::InvCs4 * cu * cF);
+    }
+
+    // 7. Force source in moment space
+    T force_m[LatSet::q] {};
+    for (unsigned int j = 0; j < LatSet::q; ++j)
+      for (unsigned int k = 0; k < LatSet::q; ++k)
+        force_m[j] += mrt::M<LatSet>(j, k) * fi_force[k];
+
+    // 8. Combined MRT collision + force source
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{};
+      T source{};
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        T invM_ij = mrt::InvM<LatSet>(i, j);
+        coll += invM_ij * rtvec[j] * (momenta[j] - momentaEq[j]);
+        source += invM_ij * (T{1} - rtvec[j] / T{2}) * force_m[j];
+      }
+      cell[i] = cell[i] - coll + source;
+    }
+  }
+};
+
 }
