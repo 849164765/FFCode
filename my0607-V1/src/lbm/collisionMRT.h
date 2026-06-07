@@ -370,18 +370,10 @@ struct MRTForce {
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
 
     // 3. D2Q9 MRT relaxation time vector
-    //    基于标准多松弛参数设置，守恒量设1.0（dummy值，meq=m），
-    //    非物理/鬼矩用大阻尼抑制高频噪声，剪切矩由 omega 控制
+    //    全设为 omega，使 MRTForce 数值等价于 BGKForce
+    //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
-    rtvec[0] = T{1.0};   // 密度 rho（守恒，dummy）
-    rtvec[3] = omega;   // 动量 jx（守恒，dummy）
-    rtvec[5] = omega;   // 动量 jy（守恒，dummy）
-    rtvec[1] = T{1.1};   // 能量 e
-    rtvec[2] = T{1.4};   // 能量平方 epsilon（鬼矩，大阻尼）
-    rtvec[4] = T{1.2};   // 热流 qx
-    rtvec[6] = T{1.2};   // 热流 qy
-    rtvec[7] = omega;    // 剪切应力 pxx（物理粘度）
-    rtvec[8] = omega;    // 剪切应力 pxy（物理粘度）
+    for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
 
     // 4. Moments from population
     T momenta[LatSet::q] {};
