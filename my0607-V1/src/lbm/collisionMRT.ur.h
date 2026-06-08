@@ -207,6 +207,143 @@ struct MRTSource<equilibrium::SecondOrder<CELL<T, D2Q9<T>, TypePack>>, NORMAL<T,
 
 };
 
+// MRT collision with Guo force scheme for Navier-Stokes (D2Q9 specialization)
+// replaces BGKForce<moment::forcerhoU, equilibrium::SecondOrder, force::Force>
+template <typename T, typename TypePack, typename ForceField>
+struct MRTForce<CELL<T, D2Q9<T>, TypePack>, ForceField> {
+  using LatSet = D2Q9<T>;
+
+  __any__ static void apply(CELL<T, D2Q9<T>, TypePack>& cell) {
+    const T omega = cell.getOmega();
+    const auto& F = cell.template get<ForceField>();
+
+    // 1. Compute rho and u from populations (unrolled D2Q9)
+    T rho = cell[0] + cell[1] + cell[2] + cell[3] + cell[4]
+          + cell[5] + cell[6] + cell[7] + cell[8];
+    T ux = (cell[1] - cell[2] + cell[5] - cell[6] + cell[7] - cell[8]) / rho;
+    T uy = (cell[3] - cell[4] + cell[5] - cell[6] - cell[7] + cell[8]) / rho;
+
+    // 2. Half-force correction: uc = u + F/(2*rho)
+    T halfInvRho = T{0.5} / rho;
+    T ucx = ux + halfInvRho * F[0];
+    T ucy = uy + halfInvRho * F[1];
+
+    // Write macroscopic fields
+    cell.template get<RHO<T>>() = rho;
+    cell.template get<VELOCITY<T, LatSet::d>>()[0] = ucx;
+    cell.template get<VELOCITY<T, LatSet::d>>()[1] = ucy;
+
+    // 3. MRT relaxation time vector
+    //    Conserved moments: 0,3,5 → s=0
+    //    Shear moments: 7,8 → s=omega (determines fluid viscosity)
+    //    High-order moments: 1,2,4,6 → s=s_e (tunable for stability)
+    const T rtvec[LatSet::q] {
+      T{0},             // rho
+      T{11./10.},       // e
+      T{11./10.},       // epsilon
+      T{0},             // jx
+      T{11./10.},       // qx
+      T{0},             // jy
+      T{11./10.},       // qy
+      omega,            // pxx
+      omega             // pxy
+    };
+
+    // 4. Moments from populations (M·f, unrolled D2Q9)
+    T m[LatSet::q];
+    m[0] = rho;
+    m[1] = T{-4} * cell[0] - cell[1] - cell[2] - cell[3] - cell[4]
+         + T{2} * (cell[5] + cell[6] + cell[7] + cell[8]);
+    m[2] = T{4} * cell[0] - T{2} * (cell[1] + cell[2] + cell[3] + cell[4])
+         + cell[5] + cell[6] + cell[7] + cell[8];
+    m[3] = cell[1] - cell[2] + cell[5] - cell[6] + cell[7] - cell[8];
+    m[4] = T{-2} * cell[1] + T{2} * cell[2] + cell[5] - cell[6] + cell[7] - cell[8];
+    m[5] = cell[3] - cell[4] + cell[5] - cell[6] - cell[7] + cell[8];
+    m[6] = T{-2} * cell[3] + T{2} * cell[4] + cell[5] - cell[6] - cell[7] + cell[8];
+    m[7] = cell[1] + cell[2] - cell[3] - cell[4];
+    m[8] = cell[5] + cell[6] - cell[7] - cell[8];
+
+    // 5. Equilibrium moments (analytical, using corrected velocity uc)
+    //    Derived from M·feq for SecondOrder D2Q9 equilibrium
+    T ucx2 = ucx * ucx;
+    T ucy2 = ucy * ucy;
+    T uc2 = ucx2 + ucy2;
+    T meq[LatSet::q];
+    meq[0] = rho;
+    meq[1] = T{-2} * rho + T{3} * rho * uc2;
+    meq[2] = T{9} * rho * ucx2 * ucy2 - T{3} * rho * uc2 + rho;
+    meq[3] = rho * ucx;
+    meq[4] = rho * ucx * (T{3} * ucy2 - T{1});
+    meq[5] = rho * ucy;
+    meq[6] = rho * ucy * (T{3} * ucx2 - T{1});
+    meq[7] = rho * (ucx2 - ucy2);
+    meq[8] = rho * ucx * ucy;
+
+    // 6. Deviation in moment space
+    T dm[LatSet::q];
+    dm[0] = m[0] - meq[0];
+    dm[1] = m[1] - meq[1];
+    dm[2] = m[2] - meq[2];
+    dm[3] = m[3] - meq[3];
+    dm[4] = m[4] - meq[4];
+    dm[5] = m[5] - meq[5];
+    dm[6] = m[6] - meq[6];
+    dm[7] = m[7] - meq[7];
+    dm[8] = m[8] - meq[8];
+
+    // 7. Guo force in population space (unrolled D2Q9, using uc)
+    //    S_i = w_i * [InvCs2*(c_i·F - u·F) + InvCs4*(c_i·u)*(c_i·F)]
+    T Fx = F[0], Fy = F[1];
+    T uF = ucx * Fx + ucy * Fy;
+    T S[LatSet::q];
+    // i=0: c=(0,0), w=4/9
+    S[0] = T{4./9.} * T{3} * (-uF);
+    // i=1: c=(1,0), w=1/9
+    S[1] = T{1./9.} * (T{3} * (Fx - uF) + T{9} * ucx * Fx);
+    // i=2: c=(-1,0), w=1/9
+    S[2] = T{1./9.} * (T{3} * (-Fx - uF) + T{9} * ucx * Fx);
+    // i=3: c=(0,1), w=1/9
+    S[3] = T{1./9.} * (T{3} * (Fy - uF) + T{9} * ucy * Fy);
+    // i=4: c=(0,-1), w=1/9
+    S[4] = T{1./9.} * (T{3} * (-Fy - uF) + T{9} * ucy * Fy);
+    // i=5: c=(1,1), w=1/36
+    S[5] = T{1./36.} * (T{3} * (Fx + Fy - uF) + T{9} * (ucx + ucy) * (Fx + Fy));
+    // i=6: c=(-1,-1), w=1/36
+    S[6] = T{1./36.} * (T{3} * (-Fx - Fy - uF) + T{9} * (ucx + ucy) * (Fx + Fy));
+    // i=7: c=(1,-1), w=1/36
+    S[7] = T{1./36.} * (T{3} * (Fx - Fy - uF) + T{9} * (ucx - ucy) * (Fx - Fy));
+    // i=8: c=(-1,1), w=1/36
+    S[8] = T{1./36.} * (T{3} * (-Fx + Fy - uF) + T{9} * (ucx - ucy) * (Fx - Fy));
+
+    // 8. Force in moment space (F_m = M·S, unrolled D2Q9)
+    T Fm[LatSet::q];
+    Fm[0] = S[0] + S[1] + S[2] + S[3] + S[4] + S[5] + S[6] + S[7] + S[8];
+    Fm[1] = T{-4} * S[0] - S[1] - S[2] - S[3] - S[4]
+          + T{2} * (S[5] + S[6] + S[7] + S[8]);
+    Fm[2] = T{4} * S[0] - T{2} * (S[1] + S[2] + S[3] + S[4])
+          + S[5] + S[6] + S[7] + S[8];
+    Fm[3] = S[1] - S[2] + S[5] - S[6] + S[7] - S[8];
+    Fm[4] = T{-2} * S[1] + T{2} * S[2] + S[5] - S[6] + S[7] - S[8];
+    Fm[5] = S[3] - S[4] + S[5] - S[6] - S[7] + S[8];
+    Fm[6] = T{-2} * S[3] + T{2} * S[4] + S[5] - S[6] - S[7] + S[8];
+    Fm[7] = S[1] + S[2] - S[3] - S[4];
+    Fm[8] = S[5] + S[6] - S[7] - S[8];
+
+    // 9. Combined MRT collision + force source
+    //    f_new = f - InvM·S·(m - m_eq) + InvM·(I - S/2)·F_m
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{};
+      T source{};
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        T invM_ij = mrt::InvM<LatSet>(i, j);
+        coll   += invM_ij * rtvec[j] * dm[j];
+        source += invM_ij * (T{1} - rtvec[j] / T{2}) * Fm[j];
+      }
+      cell[i] = cell[i] - coll + source;
+    }
+  }
+};
+
 }
 
 #endif
