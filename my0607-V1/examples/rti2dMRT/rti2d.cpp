@@ -329,11 +329,11 @@ int main(int argc, char* argv[]) {
       tmp::Key_TypePair<BulkFlag, ff::FFChemPotentialGradient2D<PFCELL>>;
   using FFChemGradSel = TaskSelector<std::uint8_t, PFCELL, FFChemGradTask>;
 
-  // ---- PF collision: MRT source collision (Cahn-Hilliard) ----
+  // ---- PF collision: MRTSource with Cahn-Hilliard relaxation ----
   using PFCollTask = tmp::Key_TypePair<
       BulkFlag,
       collision::MRTSource<equilibrium::SecondOrder<PFCELL>,
-                           NORMAL<T, LatSet::d>, true>>;
+                           NORMAL<T, LatSet::d>, true, true>>;
   using PFPeriodicTask = tmp::Key_TypePair<
       PeriodicFlag, collision::PeriodicBoundary<PFCELL>>;
   using PFAllTasks = tmp::TupleWrapper<PFCollTask, PFPeriodicTask>;
@@ -437,7 +437,7 @@ int main(int argc, char* argv[]) {
     NSLattice.NormalCommunicate();
 
     // ---------- PF MRT collision + streaming ----------
-    // Step 9: PF MRTSource collision
+    // Step 9: PF MRTSource collision (CH mode, UseCHRelaxation=true)
     PFLattice.template ApplyCellDynamics<PFTaskSelector>(FlagFM);
 
     // Step 10: PF boundaries, stream, communicate

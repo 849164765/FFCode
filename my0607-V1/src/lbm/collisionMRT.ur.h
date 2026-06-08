@@ -108,8 +108,8 @@ struct MRT_Feq_RhoU<CELL<T, D2Q9<T> ,TypePack>, WriteToField> {
 
 };
 
-template <typename T, typename TypePack, bool WriteToField>
-struct MRTSource<equilibrium::SecondOrder<CELL<T, D2Q9<T>, TypePack>>, NORMAL<T, 2>, WriteToField> {
+template <typename T, typename TypePack, bool WriteToField, bool UseCHRelaxation>
+struct MRTSource<equilibrium::SecondOrder<CELL<T, D2Q9<T>, TypePack>>, NORMAL<T, 2>, WriteToField, UseCHRelaxation> {
   using LatSet = D2Q9<T>;
   using CELLTYPE = CELL<T, D2Q9<T>, TypePack>;
   using equilibriumscheme = equilibrium::SecondOrder<CELLTYPE>;
@@ -123,7 +123,19 @@ struct MRTSource<equilibrium::SecondOrder<CELL<T, D2Q9<T>, TypePack>>, NORMAL<T,
     T omega_phi = cell.getOmega();
     T interfacewidth = cell.template get<INTERFACEWIDTH<T>>();
 
-    const T rtvec[LatSet::q] {T{1}, T{14./10.}, T{14./10.}, T{1}, T{12./10.}, T{1}, T{12./10.}, omega_phi, omega_phi};
+    // relaxation-time vector: UseCHRelaxation=false → interface sharpening (s=1 for j-moments)
+    //                        UseCHRelaxation=true  → Cahn-Hilliard     (omega_phi for j-moments)
+    const T rtvec[LatSet::q] {
+      (UseCHRelaxation ? omega_phi : T{1}),          // 0: rho (phi)
+      T{14./10.},                                     // 1: e
+      T{14./10.},                                     // 2: epsilon
+      (UseCHRelaxation ? omega_phi : T{1}),          // 3: jx
+      T{12./10.},                                     // 4: qx
+      (UseCHRelaxation ? omega_phi : T{1}),          // 5: jy
+      T{12./10.},                                     // 6: qy
+      omega_phi,                                      // 7: pxx (shear)
+      omega_phi                                       // 8: pxy (shear)
+    };
 
     T InvM_S[LatSet::q][LatSet::q] {};
     for (unsigned int i = 0; i < LatSet::q; ++i) {

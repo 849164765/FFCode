@@ -245,7 +245,17 @@ struct MRT_Feq_RhoU {
 
 };
 
-template <typename EquilibriumScheme, typename NORMAL, bool WriteToField = false>
+// MRT source collision for phase-field equations.
+//
+// Template parameters:
+//   UseCHRelaxation = false (default): interface sharpening mode.
+//     j-moments use s=1 (full relaxation), suitable for NORMAL=∇φ/|∇φ|
+//     (e.g., simpledrop2dMRT).
+//   UseCHRelaxation = true: Cahn-Hilliard diffusion mode.
+//     j-moments use s=omega_phi (matches BGKSource for correct
+//     effective mobility), suitable for NORMAL=∇μ
+//     (e.g., rti2dMRT, bubble).
+template <typename EquilibriumScheme, typename NORMAL, bool WriteToField = false, bool UseCHRelaxation = false>
 struct MRTSource {
   using CELL = typename EquilibriumScheme::CELLTYPE;
   using T = typename CELL::FloatType;
@@ -265,11 +275,19 @@ struct MRTSource {
     T interfacewidth = cell.template get<INTERFACEWIDTH<T>>();
 
     T rtvec[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      rtvec[i] = mrt::s1<LatSet>(i);
-    }
-    for (int i = 0; i < mrt::shearIndexes<LatSet>(); ++i) {
-      rtvec[mrt::shearViscIndexes<LatSet>(i)] = omega_phi;
+    if constexpr (UseCHRelaxation) {
+      // Cahn-Hilliard: use omega_phi for all → numerically matches BGKSource
+      for (unsigned int i = 0; i < LatSet::q; ++i) {
+        rtvec[i] = omega_phi;
+      }
+    } else {
+      // Interface sharpening: s1 + shear override (original behaviour)
+      for (unsigned int i = 0; i < LatSet::q; ++i) {
+        rtvec[i] = mrt::s1<LatSet>(i);
+      }
+      for (int i = 0; i < mrt::shearIndexes<LatSet>(); ++i) {
+        rtvec[mrt::shearViscIndexes<LatSet>(i)] = omega_phi;
+      }
     }
 
     T InvM_S[LatSet::q][LatSet::q] {};
