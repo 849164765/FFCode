@@ -26,11 +26,15 @@ __any__ void FF2D<CELL>::apply(CELL& cell) {
   // ε threshold for noise suppression: bulk regions have |∇φ| << 0.005
   // At the interface center: |∇φ| ≈ 1/W ≈ 0.33 (W=3) >> 0.005
   // This filters out noise-driven source terms while keeping interface dynamics
-  T delta = T(1e-8); 
-  T safe_norm = std::sqrt(grad_mag * grad_mag + delta * delta);
+  T delta = T(0.005); 
   Vector<T, LatSet::d> n;
-  n[0] = grad[0] / safe_norm;
-  n[1] = grad[1] / safe_norm;
+  if (grad_mag < delta) {
+    n[0] = T{0};
+    n[1] = T{0};
+  } else {
+    n[0] = grad[0] / grad_mag;
+    n[1] = grad[1] / grad_mag;
+  }
   cell.template get<NORMAL<T, LatSet::d>>() = n;
 }
 
