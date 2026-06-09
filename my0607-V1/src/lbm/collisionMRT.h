@@ -379,7 +379,7 @@ struct MRTForce {
     }
     for (unsigned int d = 0; d < LatSet::d; ++d) u[d] /= rho;
 
-    // 2. Half-force correction: u_c = u + F/(2*rho)
+    // 2. Half-force correction: u_c = u + F/(2*rho) **
     Vector<T, LatSet::d> uc = u;
     for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho);
 
@@ -388,8 +388,6 @@ struct MRTForce {
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
 
     // 3. D2Q9 MRT relaxation time vector
-    //    全设为 omega，使 MRTForce 数值等价于 BGKForce
-    //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
     for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
 
