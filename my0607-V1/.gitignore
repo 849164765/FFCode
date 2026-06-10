@@ -1,0 +1,6 @@
+.*
+benchmarks/
+build/
+**/vtkoutput/
+**/*.o
+**/*.exe
