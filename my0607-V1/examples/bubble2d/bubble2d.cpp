@@ -198,12 +198,12 @@ int main(int argc, char* argv[]) {
   GeoWriter.WriteBinary();
 
   // ------------------ define NS lattice ------------------
-  // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
-  // Actual density variation enters via the FORCE field
-  using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>>;
+  // RHO: holds ρ(φ)=ρ_l+φ(ρ_h-ρ_l), used by collision for feq density coefficient
+  // OMEGA: per-cell relaxation rate ω(φ)=1/(0.5+ν(φ)/cs²), used by BGKForcePure
+  using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, OMEGA<T>,
+                            POP<T, LatSet::q>, FORCE<T, LatSet::d>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{1} / Tau_ns, T{}, Vector<T, 2>{T{0}, T{0}});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -320,16 +320,33 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: BGKForce with Force vector field
+
+  // ---- NS: rho/omega interpolation from PF φ ----
+  using RhoOmegaInterpTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFRhoOmegaInterp2D<PFCELL, NSCELL>>;
+  using RhoOmegaInterpTaskSel =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, RhoOmegaInterpTask>;
+  BlockLatManagerCoupling RhoOmegaCoupling(PFLattice, NSLattice);
+
+  // ---- NS: velocity from post-stream populations ----
+  // u* = Σ c_i·g_i / Σ g_i → VELOCITY (no force correction yet)
+  using NSVelTask = tmp::Key_TypePair<BulkFlag, ff::FFVelocityCompute2D<NSCELL>>;
+  using NSVelTaskSel = TaskSelector<std::uint8_t, NSCELL, NSVelTask>;
+
+  // ---- NS: force-corrected velocity u_final = u* + F/(2ρ) ----
+  using NSFinalVelTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFFinalVelocityCompute2D<NSCELL>>;
+  using NSFinalVelTaskSel = TaskSelector<std::uint8_t, NSCELL, NSFinalVelTask>;
+
+  // ---- NS collision: BGKForcePure (reads RHO, VELOCITY, FORCE, OMEGA) ----
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
-    collision::BGKForce<
-      moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
+    collision::BGKForcePure<
       equilibrium::SecondOrder<NSCELL>,
       force::Force<NSCELL>>>;
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
 
-  // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
+  // ---- PF tasks ----
   using FFNormalTask =
     tmp::Key_TypePair<BulkFlag, ff::FF2D<PFCELL>>;
   using FFLaplacianTask =
@@ -339,14 +356,10 @@ int main(int argc, char* argv[]) {
   using PFFFTaskCollection = tmp::TupleWrapper<FFNormalTask, FFLaplacianTask, FFChemPotTask>;
   using PFFFTaskSelector = tmp::TaskSelector<PFFFTaskCollection, std::uint8_t, PFCELL>;
 
-  // Chem potential gradient (∇λ): must run AFTER all λ values are computed and communicated
-  // Overwrites NORMAL with ∇λ, turning BGKSource into Cahn-Hilliard source
   using FFChemPotGradTask =
     tmp::Key_TypePair<BulkFlag, ff::FFChemPotentialGradient2D<PFCELL>>;
   using FFChemPotGradSel = TaskSelector<std::uint8_t, PFCELL, FFChemPotGradTask>;
 
-  // PF collision: BGKSource with NORMAL (= ∇φ/|∇φ|) as Allen-Cahn source
-  // ε=0.005 threshold in FF2D suppresses source activation by bulk noise
   using PFCollisionTask = tmp::Key_TypePair<
     BulkFlag,
     collision::BGKSource<
@@ -367,6 +380,12 @@ int main(int argc, char* argv[]) {
   using GravForceTaskSelector =
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravForceTask>;
   BlockLatManagerCoupling GravCoupling(PFLattice, NSLattice);
+
+  using DensityForceTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFDensityForce2D<PFCELL, NSCELL>>;
+  using DensityForceTaskSel =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, DensityForceTask>;
+  BlockLatManagerCoupling DensityCoupling(PFLattice, NSLattice);
 
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
@@ -393,8 +412,8 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   while (MainLoopTimer() < MaxStep) {
-    // ---- Phase field pre-processing ----
-    // Step 1: Update PHI by summing populations (block iteration, like simpledrop2d)
+    /* ===== Phase field processing (from post-stream PF populations) ===== */
+    // Step 1: Σ f_i → PHI
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -411,7 +430,6 @@ int main(int argc, char* argv[]) {
             for (unsigned int k = 0; k < LatSet::q; ++k) {
               phi_new += cell[k];
             }
-            // clamp phi to [0, 1] to suppress numerical noise
             if (phi_new < T{0}) phi_new = T{0};
             if (phi_new > T{1}) phi_new = T{1};
             blockPhi.get(id) = phi_new;
@@ -421,43 +439,53 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
+    // Step 2: ∇φ, NORMAL, ∇²φ, λ → PF fields
     PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
-    // NOTE: FFChemPotentialGradient2D (∇λ→NORMAL) is available but NOT used here.
-    // The Allen-Cahn n=∇φ/|∇φ| source + higher ε threshold proves more stable
-    // than the ∇λ-based Cahn-Hilliard source for 2D D2Q9 bubble dynamics.
-    // Uncomment below to switch to CH source if needed:
-    // PFLattice.template ApplyCellDynamics<FFChemPotGradSel>(FlagFM);
-    // PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
+    /* ===== NS macroscopic update: interpolate ρ(φ), ω(φ) from φ ===== */
+    // Step 3: ρ(φ) → NS RHO, ω(φ) → NS OMEGA (coupling PF→NS)
+    RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaInterpTaskSel>(MainLoopTimer(), FlagFM);
+    NSLattice.getField<RHO<T>>().Communicate();
 
-    // ---- NS force accumulation ----
-    // Step 3: Clear NS FORCE
+    // Step 4: u* = Σ c_i·g_i / Σ g_i → NS VELOCITY (preliminary, no force correction)
+    NSLattice.template ApplyCellDynamics<NSVelTaskSel>(FlagFM);
+    NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
+
+    /* ===== NS force accumulation =====
+     * F_total = F_s + F_b + F_p + F_v
+     */
+    // Step 5: Clear NS FORCE
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
-    // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
+    // Step 6: F_s = λ·∇φ → NS FORCE
     STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // Step 5: Gravity/buoyancy force F_b → NS FORCE
+    // Step 7: F_b → NS FORCE (gravity/buoyancy)
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
+    // Step 8: F_p + F_v → NS FORCE (Eqs.27-28)
+    DensityCoupling.ApplyCellDynamics<DensityForceTaskSel>(MainLoopTimer(), FlagFM);
+
+    // Step 9: u_final = u* + F_total / (2·ρ(φ)) → VELOCITY
+    NSLattice.template ApplyCellDynamics<NSFinalVelTaskSel>(FlagFM);
+
+    /* ===== NS collision and streaming ===== */
+    // Step 10: NS BGKForcePure collision (reads RHO, VELOCITY, FORCE, OMEGA)
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
-    NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
+
+    // Step 11: NS BCs + Stream + Communicate
     NS_BB.Apply(MainLoopTimer());
     NSLattice.Stream();
     NSLattice.NormalCommunicate();
 
-    // ---- PF collision and streaming ----
-    // Step 8: PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
+    /* ===== PF collision and streaming ===== */
+    // Step 12: PF BGKSource collision
     PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
 
-    // Step 9: PF BCs + Stream + Communicate
+    // Step 13: PF BCs + Stream + Communicate
     PF_BB.Apply(MainLoopTimer());
     PFLattice.Stream();
     PFLattice.NormalCommunicate();

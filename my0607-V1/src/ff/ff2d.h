@@ -139,6 +139,54 @@ struct FFRhoOmegaUpdate2D {
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
 
+// ---- Post-stream macroscopic computation ----
+// Compute rho and preliminary velocity u* = Σc_i f_i / rho from distributions.
+// Writes ρ→RHO and u*→VELOCITY. No force correction: u_final = u* + F/(2ρ)
+// must be applied separately (via FFFinalVelocityCompute2D).
+template <typename CELL>
+struct FFRhoUCompute2D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  __any__ static void apply(CELL& cell);
+};
+
+// Force-corrected velocity: u_final = u* + F/(2ρ)
+// Reads FORCE from cell field, updates VELOCITY by adding force correction.
+template <typename CELL>
+struct FFFinalVelocityCompute2D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  __any__ static void apply(CELL& cell);
+};
+
+// Density-gradient forces: F_p + F_v (coupled PF→NS)
+// Eq.(27) F_v = ν(∇u+u∇)·∇ρ   Eq.(28) F_p = -(p/ρ)∇ρ
+// Adds both terms to ns_cell FORCE field.
+template <typename PFCELL, typename NSCELL>
+struct FFDensityForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// Interpolate ρ(φ)=ρ_l+φ(ρ_h-ρ_l) → NS RHO and ω(φ)=1/(0.5+ν(φ)/cs²) → NS OMEGA
+// Called after PF processing, before NS collision.
+template <typename PFCELL, typename NSCELL>
+struct FFRhoOmegaInterp2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// Compute u* = Σc_i·g_i / Σg_i from post-stream populations.
+// Writes VELOCITY only; does NOT overwrite RHO or OMEGA.
+template <typename CELL>
+struct FFVelocityCompute2D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  __any__ static void apply(CELL& cell);
+};
+
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())

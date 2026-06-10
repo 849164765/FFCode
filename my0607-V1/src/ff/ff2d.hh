@@ -166,4 +166,145 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   ns_cell.template get<OMEGA<T>>() = omega;
 }
 
+// ---- FFRhoUCompute2D ----
+// Post-stream macroscopic computation: ρ = Σ f_i, u* = Σ c_i f_i / ρ
+// Writes results to RHO and VELOCITY fields. No force correction.
+template <typename CELL>
+__any__ void FFRhoUCompute2D<CELL>::apply(CELL& cell) {
+  T rho_value = T{};
+  Vector<T, LatSet::d> u_value{};
+
+  for (unsigned int i = 0; i < LatSet::q; ++i) {
+    rho_value += cell[i];
+    u_value += latset::c<LatSet>(i) * cell[i];
+  }
+  u_value /= rho_value;
+
+  cell.template get<RHO<T>>() = rho_value;
+  cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
+}
+
+// ---- FFFinalVelocityCompute2D ----
+// Force-corrected velocity: u = u* + F/(2·ρ(φ))
+// Reads RHO (ρ(φ)) and FORCE; adds force correction to VELOCITY.
+template <typename CELL>
+__any__ void FFFinalVelocityCompute2D<CELL>::apply(CELL& cell) {
+  const T rho = cell.template get<RHO<T>>();
+  const auto& force = cell.template get<FORCE<T, LatSet::d>>();
+
+  auto& u = cell.template get<VELOCITY<T, LatSet::d>>();
+  u += force * (T{0.5} / rho);
+}
+
+// ---- FFDensityForce2D ----
+// Computes F_p and F_v per Eqs.(27)-(28) and adds them to ns_cell FORCE.
+//
+// F_p = -cs²·∇ρ                    ∇ρ = (ρ_h - ρ_l)·∇φ
+// F_v = ν·(∇u + u∇)·∇ρ            ν = η(φ) / ρ(φ)
+//
+// Requires pre-computed PF fields: PHI, GRAD, RHO_L, RHO_H, ETA_L, ETA_H
+// Requires pre-computed NS fields: RHO, VELOCITY (u*)
+template <typename PFCELL, typename NSCELL>
+__any__ void FFDensityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  // ---- PF side: φ, ∇φ, ρ(φ), ν(φ) ----
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T eta_l = pf_cell.template get<ETA_L<T>>();
+  T eta_h = pf_cell.template get<ETA_H<T>>();
+
+  T rho_phi = rho_l + phi * (rho_h - rho_l);
+  T eta_phi = eta_l + phi * (eta_h - eta_l);
+  T nu_phi = eta_phi / rho_phi;
+
+  const auto& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T delta_rho = rho_h - rho_l;
+  Vector<T, LatSet::d> grad_rho;
+  grad_rho[0] = delta_rho * grad_phi[0];
+  grad_rho[1] = delta_rho * grad_phi[1];
+
+  // ---- NS side: velocity gradient ∇u via isotropic FD stencil ----
+  T dux_dx = T{}, dux_dy = T{};
+  T duy_dx = T{}, duy_dy = T{};
+
+  for (unsigned int k = 1; k < LatSet::q; ++k) {
+    const auto& u_neighbor =
+        ns_cell.getNeighbor(k).template get<VELOCITY<T, LatSet::d>>();
+    T wk = latset::w<LatSet>(k);
+    const auto& ck = latset::c<LatSet>(k);
+
+    dux_dx += wk * ck[0] * u_neighbor[0];
+    dux_dy += wk * ck[1] * u_neighbor[0];
+    duy_dx += wk * ck[0] * u_neighbor[1];
+    duy_dy += wk * ck[1] * u_neighbor[1];
+  }
+  T inv_cs2 = T{1} / LatSet::cs2;
+  dux_dx *= inv_cs2;
+  dux_dy *= inv_cs2;
+  duy_dx *= inv_cs2;
+  duy_dy *= inv_cs2;
+
+  // ---- F_p = -cs² · ∇ρ ----
+  Vector<T, LatSet::d> fp;
+  fp[0] = -LatSet::cs2 * grad_rho[0];
+  fp[1] = -LatSet::cs2 * grad_rho[1];
+
+  // ---- F_v = ν · (∇u + u∇) · ∇ρ ----
+  // (∇u + u∇)_{ab} = ∂_a u_b + ∂_b u_a
+  // F_v^a = ν · Σ_b (∂_a u_b + ∂_b u_a) · ∂_b ρ
+  T vxx = T{2} * dux_dx;        // ∂_x u_x + ∂_x u_x
+  T vxy = dux_dy + duy_dx;      // ∂_x u_y + ∂_y u_x
+  T vyx = duy_dx + dux_dy;      // ∂_y u_x + ∂_x u_y (= vxy symmetric)
+  T vyy = T{2} * duy_dy;        // ∂_y u_y + ∂_y u_y
+
+  Vector<T, LatSet::d> fv;
+  fv[0] = nu_phi * (vxx * grad_rho[0] + vxy * grad_rho[1]);
+  fv[1] = nu_phi * (vyx * grad_rho[0] + vyy * grad_rho[1]);
+
+  // ---- Accumulate to NS FORCE ----
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += fp[0] + fv[0];
+  ns_force[1] += fp[1] + fv[1];
+}
+
+// ---- FFRhoOmegaInterp2D ----
+// Interpolate ρ(φ)=ρ_l+φ(ρ_h-ρ_l) → NS RHO, ω(φ)=1/(0.5+ν(φ)/cs²) → NS OMEGA
+// Called after PF φ is updated, before NS collision.
+template <typename PFCELL, typename NSCELL>
+__any__ void FFRhoOmegaInterp2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T eta_l = pf_cell.template get<ETA_L<T>>();
+  T eta_h = pf_cell.template get<ETA_H<T>>();
+
+  T rho = rho_l + phi * (rho_h - rho_l);
+  T eta = eta_l + phi * (eta_h - eta_l);
+  T nu = eta / rho;
+  T tau = T{0.5} + nu / LatSet::cs2;
+  T omega = T{1} / tau;
+  if (omega > T{1.95}) omega = T{1.95};
+  if (omega < T{0.01}) omega = T{0.01};
+
+  ns_cell.template get<RHO<T>>() = rho;
+  ns_cell.template get<OMEGA<T>>() = omega;
+}
+
+// ---- FFVelocityCompute2D ----
+// Compute u* = Σ c_i·g_i / Σ g_i from post-stream populations.
+// Reads populations; writes VELOCITY only (does NOT touch RHO).
+template <typename CELL>
+__any__ void FFVelocityCompute2D<CELL>::apply(CELL& cell) {
+  T rho_val = T{};
+  Vector<T, LatSet::d> u_val{};
+
+  for (unsigned int i = 0; i < LatSet::q; ++i) {
+    rho_val += cell[i];
+    u_val += latset::c<LatSet>(i) * cell[i];
+  }
+  u_val /= rho_val;
+
+  cell.template get<VELOCITY<T, LatSet::d>>() = u_val;
+}
+
 }  // namespace ff

@@ -66,6 +66,47 @@ struct BGKForce {
   }
 };
 
+// Pure BGK collision with force — NO macroscopic quantity computation.
+// Reads rho from RHO field, u from VELOCITY field, and force from FORCE field.
+// All macroscopic quantities must be pre-computed and stored in fields before
+// calling this operator (typically after the streaming step in the main loop).
+template <typename EquilibriumScheme, typename ForceScheme>
+struct BGKForcePure {
+  using CELL = typename EquilibriumScheme::CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using equilibriumscheme = EquilibriumScheme;
+
+  __any__ static void apply(CELL& cell) {
+    const T rho = cell.template get<RHO<T>>();
+    const Vector<T, LatSet::d>& u = cell.template get<VELOCITY<T, LatSet::d>>();
+    const auto& force = ForceScheme::getForce(cell);
+
+    std::array<T, LatSet::q> fi{};
+    ForceScheme::apply(u, force, fi);
+
+    std::array<T, LatSet::q> feq{};
+    EquilibriumScheme::apply(feq, rho, u);
+
+    // Per-cell omega when OMEGA<T> field is present (variable viscosity),
+    // otherwise fall back to block-level omega from converter.
+    T omega, _omega, fomega;
+    if constexpr (cell.template hasField<OMEGA<T>>()) {
+      omega = cell.template get<OMEGA<T>>();
+      _omega = T{1} - omega;
+      fomega = T{1} - omega * T{0.5};
+    } else {
+      omega = cell.getOmega();
+      _omega = cell.get_Omega();
+      fomega = cell.getfOmega();
+    }
+
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];
+    }
+  }
+};
+
 // a typical BGK collision process with:
 // macroscopic variables updated
 // equilibrium distribution function calculated
