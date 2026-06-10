@@ -161,6 +161,77 @@ struct rho {
   }
 };
 
+// Phase-field momenta: φ = Σ_i g_i, write to field
+template <typename CELLTYPE>
+struct PhaseFieldMomenta {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline void apply(CELL& cell) {
+    T phi = T{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) phi += cell[i];
+    if (phi < T{0}) phi = T{0};
+    if (phi > T{1}) phi = T{1};
+    cell.template get<typename CELL::GenericRho>() = phi;
+  }
+};
+
+// Phase-field: φ = Σ_i g_i
+template <typename CELLTYPE>
+struct phiSum {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline T get(CELL& cell) {
+    T phi = T{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) phi += cell[i];
+    return phi;
+  }
+};
+
+
+// Density interpolation: ρ(φ) = ρ_l + φ·(ρ_h - ρ_l), writes to GenericRho
+template <typename CELLTYPE, typename PhiField,
+          typename RhoLType, typename RhoHType>
+struct rhoInterp {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+
+  __any__ static inline void apply(CELL& cell) {
+    const T phi = cell.template get<PhiField>();
+    const T rho_l = cell.template get<RhoLType>();
+    const T rho_h = cell.template get<RhoHType>();
+    cell.template get<typename CELL::GenericRho>() = rho_l + phi * (rho_h - rho_l);
+  }
+};
+
+// Viscosity interpolation: η(φ) = η_l + φ·(η_h - η_l),  ν = η/ρ
+//   ω = 1/(ν/cs² + 0.5),  writes to OMEGA, clamps [0.01, 1.95]
+template <typename CELLTYPE, typename PhiField,
+          typename RhoLType, typename RhoHType,
+          typename EtaLType, typename EtaHType>
+struct omegaInterp {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline void apply(CELL& cell) {
+    const T phi = cell.template get<PhiField>();
+    const T rho_l = cell.template get<RhoLType>();
+    const T rho_h = cell.template get<RhoHType>();
+    const T eta_l = cell.template get<EtaLType>();
+    const T eta_h = cell.template get<EtaHType>();
+    const T rho = rho_l + phi * (rho_h - rho_l);
+    const T eta = eta_l + phi * (eta_h - eta_l);
+    const T nu = eta / rho;
+    const T omega = T{1} / (nu * LatSet::InvCs2 + T{0.5});
+    if (omega > T{1.95}) cell.template get<OMEGA<T>>() = T{1.95};
+    else if (omega < T{0.01}) cell.template get<OMEGA<T>>() = T{0.01};
+    else cell.template get<OMEGA<T>>() = omega;
+  }
+};
 
 template <typename CELLTYPE, typename SOURCE, bool WriteToField>
 struct sourcerhoImpl {
@@ -377,6 +448,33 @@ struct rhoU {
   }
 };
 
+
+// Pressure + velocity from distributions and interpolated density
+//   u = (Σc_i·f_i + 0.5·F) / ρ   (ρ from field, already interpolated)
+//   p = ρ · cs² 
+template <typename CELLTYPE, typename ForceScheme>
+struct pressU {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static inline void apply(CELL& cell) {
+    const Vector<T, LatSet::d>& F = ForceScheme::getForce(cell);
+    T rho = cell.template get<GenericRho>();
+
+    Vector<T, LatSet::d> u;
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      u += latset::c<LatSet>(i) * cell[i];
+    u += F * T{0.5};
+    u /= rho;
+
+    cell.template get<VELOCITY<T, LatSet::d>>() = u;
+    T rho_raw = T{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) rho_raw += cell[i];
+    cell.template get<PRESSURE<T>>() = rho * LatSet::cs2 * rho_raw;
+  }
+};
 
 template <typename CELLTYPE, typename ForceScheme, bool WriteToField>
 struct forcerhoUImpl {
@@ -756,30 +854,5 @@ struct RhoVelocity {
 
 
 
-
-template <typename CELLTYPE>
-struct PhaseFieldMomenta{
-  using CELL = CELLTYPE;
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  using GenericRho = typename CELL::GenericRho;
-
-  __any__ static inline void apply(CELL& cell, T& phi) {
-    phi = T{};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      phi += cell[i];
-    }
-  }
-
-  __any__ static inline void apply(CELL& cell, T& phi, Vector<T, LatSet::d>& u) {
-    phi = T{};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      phi += cell[i];
-    }
-    u = cell.template get<VELOCITY<T, LatSet::d>>();
-  }
-
-
-};
 
 }  // namespace moment

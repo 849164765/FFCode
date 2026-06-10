@@ -1,197 +1,154 @@
 #pragma once
 
+#include "data_struct/block_lattice_base.h"
 #include "data_struct/field_struct.h"
 #include "lbm/lattice_set.h"
+#include "lbm/unit_converter.h"
 
 namespace ff {
 
-// ===================================================================
-//  Section 1: Self-Owned Field Base Definitions
-//  (cf. src/ca/zhu_stefanescu2d.h: STATEBase, FSBase, ...)
-//
-//  GenericField<GenericArray<T>> — per-cell varying (ghost sync via Communicate):
-//    LaplacianBase, ChemPotentialBase
-//  Data<T> — block-level constant (no ghost cells, same mechanism as CONSTFORCE):
-//    GravityBase, BetaBase, KappaBase, RhoLBase, RhoHBase, EtaLBase, EtaHBase
-// ===================================================================
+// --- FF-specific field bases ---
+struct GRADBase : public FieldBase<1> {};
+struct NORMALBase : public FieldBase<1> {};
+struct LAPLACIANBase : public FieldBase<1> {};
+struct CHEMICALPOTENTIALBase : public FieldBase<1> {};
+struct ACSOURCEBase : public FieldBase<1> {};
+struct FORCE_SF_Base : public FieldBase<1> {};
+struct FORCE_Buoy_Base : public FieldBase<1> {};
+struct FORCE_Visc_Base : public FieldBase<1> {};
+struct FORCE_P_Base : public FieldBase<1> {};
+struct RHO_LBase : public FieldBase<1> {};
+struct RHO_HBase : public FieldBase<1> {};
+struct ETA_LBase : public FieldBase<1> {};
+struct ETA_HBase : public FieldBase<1> {};
+struct GRAVITYBase : public FieldBase<1> {};
 
-struct LaplacianBase : public FieldBase<1> {};
-struct ChemPotentialBase : public FieldBase<1> {};
+// --- FF type aliases (2D only) ---
+template <typename T>
+using GRAD = GenericField<GenericArray<Vector<T, 2>>, GRADBase>;
+template <typename T>
+using NORMAL = GenericField<GenericArray<Vector<T, 2>>, NORMALBase>;
+template <typename T>
+using LAPLACIAN = GenericField<GenericArray<T>, LAPLACIANBase>;
+template <typename T>
+using CHEMICALPOTENTIAL = GenericField<GenericArray<T>, CHEMICALPOTENTIALBase>;
+template <typename T>
+using ACSOURCE = GenericField<GenericArray<Vector<T, 2>>, ACSOURCEBase>;
+template <typename T>
+using FORCE_SF = GenericField<GenericArray<Vector<T, 2>>, FORCE_SF_Base>;
+template <typename T>
+using FORCE_Buoy = GenericField<GenericArray<Vector<T, 2>>, FORCE_Buoy_Base>;
+template <typename T>
+using FORCE_Visc = GenericField<GenericArray<Vector<T, 2>>, FORCE_Visc_Base>;
+template <typename T>
+using FORCE_P = GenericField<GenericArray<Vector<T, 2>>, FORCE_P_Base>;
+template <typename T>
+using RHO_L = Data<T, RHO_LBase>;
+template <typename T>
+using RHO_H = Data<T, RHO_HBase>;
+template <typename T>
+using ETA_L = Data<T, ETA_LBase>;
+template <typename T>
+using ETA_H = Data<T, ETA_HBase>;
+template <typename T>
+using GRAVITY = Data<T, GRAVITYBase>;
+// --- Field packs (2D) ---
+// Owned by FF2DMgr (computed fields)
+template <typename T>
+using FFFIELDS = TypePack<NORMAL<T>, LAPLACIAN<T>, ACSOURCE<T>,
+                            FORCE_SF<T>, FORCE_Buoy<T>,
+                            FORCE_Visc<T>, FORCE_P<T>>;
 
-struct GravityBase : public FieldBase<1> {};
-struct BetaBase : public FieldBase<1> {};
-struct KappaBase : public FieldBase<1> {};
-struct RhoLBase : public FieldBase<1> {};
-struct RhoHBase : public FieldBase<1> {};
-struct EtaLBase : public FieldBase<1> {};
-struct EtaHBase : public FieldBase<1> {};
-
-// ===================================================================
-//  Section 2: Self-Owned Field Type Aliases
-// ===================================================================
+// Referenced from PFLattice/NSLattice
+template <typename T>
+using REFLBMFIELDS = TypePack<PHI<T>, GRAD<T>, CHEMICALPOTENTIAL<T>,
+                              RHO_L<T>, RHO_H<T>,
+                              ETA_L<T>, ETA_H<T>, GRAVITY<T>,
+                              RHO<T>, PRESSURE<T>,
+                              FORCE<T, 2>, VELOCITY<T, 2>>;
 
 template <typename T>
-using LAPLACIAN = GenericField<GenericArray<T>, LaplacianBase>;
+using FIELDPACK = TypePack<FFFIELDS<T>, REFLBMFIELDS<T>>;
 
 template <typename T>
-using CHEMICALPOTENTIAL = GenericField<GenericArray<T>, ChemPotentialBase>;
+using ALLFIELDS = typename ExtractFieldPack<FIELDPACK<T>>::mergedpack;
 
-template <typename T>
-using GRAVITY = Data<T, GravityBase>;
-
-template <typename T>
-using BETA = Data<T, BetaBase>;
-
-template <typename T>
-using KAPPA = Data<T, KappaBase>;
-
-template <typename T>
-using RHO_L = Data<T, RhoLBase>;
-
-template <typename T>
-using RHO_H = Data<T, RhoHBase>;
-
-template <typename T>
-using ETA_L = Data<T, EtaLBase>;
-
-template <typename T>
-using ETA_H = Data<T, EtaHBase>;
-
-// ===================================================================
-//  Section 3: Field Packs (self-owned + external, cf. CAFIELDS + REFFIELDS)
-// ===================================================================
-
-template <typename T>
-using FFFIELDS = TypePack<LAPLACIAN<T>, CHEMICALPOTENTIAL<T>,
-                          GRAVITY<T>, BETA<T>, KAPPA<T>,
-                          RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>>;
-
-template <typename T, unsigned int D>
-using FFEXTERNALFIELDS = TypePack<PHI<T>, GRAD<T, D>, NORMAL<T, D>, INTERFACEWIDTH<T>>;
-
-template <typename T, unsigned int D>
-using FFFIELDPACK = TypePack<FFFIELDS<T>, FFEXTERNALFIELDS<T, D>>;
-
-template <typename T, unsigned int D>
-using ALLFF_FIELDS = typename ExtractFieldPack<FFFIELDPACK<T, D>>::mergedpack;
-
-// ===================================================================
-//  Section 4: Functor Declarations
-// ===================================================================
-
+// --- Allen-Cahn source scheme ---
+// Discrete source term: S_i = w_i · (c_i · V)
+//   V = (4φ(1-φ)/W)·n — pre-computed by FF2DBlock::computeACSource()
 template <typename CELL>
-struct FF2D {
+struct PhaseFieldSource {
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
-  using GenericRho = typename CELL::GenericRho;
-  __any__ static void apply(CELL& cell);
+  static constexpr unsigned int scalardir = 0;
+
+  __any__ static void apply(const Vector<T, LatSet::d>& u,
+                            const Vector<T, LatSet::d>& V,
+                            std::array<T, LatSet::q>& Si) {
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T cdotV = T{0};
+      for (unsigned int l = 0; l < LatSet::d; ++l)
+        cdotV += latset::c<LatSet>(i)[l] * V[l];
+      Si[i] = latset::w<LatSet>(i) * cdotV;
+    }
+  }
+
+  __any__ static auto& getForce(CELL& cell) {
+    return cell.template get<ACSOURCE<T>>();
+  }
 };
 
-template <typename CELL>
-struct FF3D {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  using GenericRho = typename CELL::GenericRho;
-  __any__ static void apply(CELL& cell);
+/// Single-block FF2D: computes per-block phase-field quantities
+template <typename T, typename LatSet>
+class FF2DBlock : public BlockLatticeBase<T, LatSet, ALLFIELDS<T>> {
+ private:
+  PhaseFieldConverter<T>& _conv;
+
+ public:
+  template <typename... FIELDPTRS>
+  FF2DBlock(Block<T, 2>& geo, PhaseFieldConverter<T>& conv,
+            std::tuple<FIELDPTRS...> fieldptrs);
+
+  void computeGradient();
+  void computeLaplacian();
+  void computeChemicalPotential();
+  void computeACSource();
+  void computeForceSF();
+  void computeForceBuoy();
+  void computeForceVisc();
+  void computeForceP();
+  void computeForceTotal();
+  void apply();
+
+  AbstractConverter<T>& converter() { return _conv; }
+  const AbstractConverter<T>& converter() const { return _conv; }
 };
 
-template <typename CELL>
-struct FFLaplacian2D {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  using GenericRho = typename CELL::GenericRho;
-  __any__ static void apply(CELL& cell);
+/// Multi-block FF2D manager
+template <typename T, typename LatSet>
+class FF2DManager : public BlockLatticeManagerBase<T, LatSet, FIELDPACK<T>> {
+ private:
+  PhaseFieldConverter<T>& _conv;
+  std::vector<FF2DBlock<T, LatSet>> _blocks;
+
+ public:
+  template <typename INITVALUEPACK, typename... FIELDPTRTYPES>
+  FF2DManager(BlockGeometry<T, 2>& blockgeo, PhaseFieldConverter<T>& conv,
+              INITVALUEPACK& initvalues, FIELDPTRTYPES*... fieldptrs);
+
+  void Init(BlockGeometryHelper<T, 2>& GeoHelper);
+  void computeGradient();
+  void computeLaplacian();
+  void computeChemicalPotential();
+  void computeACSource();
+  void computeForceSF();
+  void computeForceBuoy();
+  void computeForceVisc();
+  void computeForceP();
+  void computeForceTotal();
+  void apply();
+  void Communicate();
 };
-
-template <typename CELL>
-struct FFChemPotential2D {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  using GenericRho = typename CELL::GenericRho;
-  __any__ static void apply(CELL& cell);
-};
-
-template <typename CELL>
-struct FFChemPotentialGradient2D {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  __any__ static void apply(CELL& cell);
-};
-
-template <typename PFCELL, typename NSCELL>
-struct FFSurfaceTension2D {
-  using T = typename PFCELL::FloatType;
-  using LatSet = typename PFCELL::LatticeSet;
-  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
-};
-
-template <typename PFCELL, typename NSCELL>
-struct FFGravityForce2D {
-  using T = typename PFCELL::FloatType;
-  using LatSet = typename NSCELL::LatticeSet;
-  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
-};
-
-template <typename PFCELL, typename NSCELL>
-struct FFRhoOmegaUpdate2D {
-  using T = typename PFCELL::FloatType;
-  using LatSet = typename NSCELL::LatticeSet;
-  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
-};
-
-// ===================================================================
-//  Section 5: Communication Functions for Self-Owned Fields
-//  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())
-//
-//  GenericField<GenericArray<T>> (per-cell, ghost cells):
-//    CommunicateAllSelfFields — ghost sync each time step (CHEMICALPOTENTIAL)
-//
-//  Data<T> (block-level constant, same mechanism as CONSTFORCE/CONSTRHO):
-//    BroadcastAllParams — MPI_Bcast from rank 0, called once after construction.
-//    Data fields have no ghost cells (isField=false), no Communicate() needed.
-//    Broadcast covers environments where non-root ranks cannot read the INI file.
-// ===================================================================
-
-template <typename T, typename LATTICE>
-void CommunicateLAPLACIAN(LATTICE& lattice) {
-  lattice.template getField<LAPLACIAN<T>>().Communicate();
-}
-
-template <typename T, typename LATTICE>
-void CommunicateCHEMICALPOTENTIAL(LATTICE& lattice) {
-  lattice.template getField<CHEMICALPOTENTIAL<T>>().Communicate();
-}
-
-// Batch communicate Type A self-owned fields that need ghost sync.
-template <typename T, typename LATTICE>
-void CommunicateAllSelfFields(LATTICE& lattice) {
-  lattice.template getField<CHEMICALPOTENTIAL<T>>().Communicate();
-  // LAPLACIAN: not needed — FFChemPotential2D reads from same cell only
-}
-
-// Broadcast Type B params from rank 0 and set all uniform fields.
-// Must be called once after lattice construction (before the main loop).
-template <typename T, typename LATTICE>
-void BroadcastAllParams(LATTICE& lattice,
-                        T& rho_l, T& rho_h, T& eta_l, T& eta_h,
-                        T& gravity, T& Beta, T& Kappa) {
-#ifdef MPI_ENABLED
-  mpi().bCast(rho_l, 0);
-  mpi().bCast(rho_h, 0);
-  mpi().bCast(eta_l, 0);
-  mpi().bCast(eta_h, 0);
-  mpi().bCast(gravity, 0);
-  mpi().bCast(Beta, 0);
-  mpi().bCast(Kappa, 0);
-#endif
-  lattice.template getField<RHO_L<T>>().InitValue(rho_l);
-  lattice.template getField<RHO_H<T>>().InitValue(rho_h);
-  lattice.template getField<ETA_L<T>>().InitValue(eta_l);
-  lattice.template getField<ETA_H<T>>().InitValue(eta_h);
-  lattice.template getField<GRAVITY<T>>().InitValue(gravity);
-  lattice.template getField<BETA<T>>().InitValue(Beta);
-  lattice.template getField<KAPPA<T>>().InitValue(Kappa);
-}
 
 }  // namespace ff
 

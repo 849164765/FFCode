@@ -152,8 +152,7 @@ struct CONSTRHOBase : public FieldBase<1> {};
 struct CONSTUBase : public FieldBase<1> {};
 struct StrainRateMagBase : public FieldBase<1> {};
 struct PHASEBase : public FieldBase<1> {};
-struct GRADBase : public FieldBase<1> {};
-struct NORMALBase : public FieldBase<1> {};
+struct PRESSUREBase : public FieldBase<1> {};
 struct WidthBase : public FieldBase<1> {};
 
 struct RHOINITBase : public FieldBase<1> {};
@@ -181,16 +180,14 @@ namespace cudev {
 template <typename T>
 using RHO = GenericField<GenericArray<T>, RHOBase>;
 template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
+template <typename T>
 using TEMP = GenericField<GenericArray<T>, TEMPBase>;
 template <typename T>
 using CONC = GenericField<GenericArray<T>, CONCBase>;
 template <typename T, unsigned int D>
 using VELOCITY = GenericField<GenericArray<Vector<T, D>>, VELOCITYBase>;
 
-template <typename T, unsigned int D>
-using GRAD = GenericField<GenericArray<Vector<T, D>>, GRADBase>;
-template <typename T, unsigned int D>
-using NORMAL = GenericField<GenericArray<Vector<T, D>>, NORMALBase>;
 template <typename T>
 using PHI = GenericField<GenericArray<T>, PHIBase>;
 template <typename T>
@@ -254,16 +251,14 @@ using PL_m = Data<T, PL_mBase>;
 template <typename T>
 using RHO = GenericField<GenericArray<T>, RHOBase>;
 template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
+template <typename T>
 using TEMP = GenericField<GenericArray<T>, TEMPBase>;
 template <typename T>
 using CONC = GenericField<GenericArray<T>, CONCBase>;
 template <typename T>
 using PHI = GenericField<GenericArray<T>, PHIBase>;
 
-template <typename T, unsigned int D>
-using GRAD = GenericField<GenericArray<Vector<T, D>>, GRADBase>;
-template <typename T, unsigned int D>
-using NORMAL = GenericField<GenericArray<Vector<T, D>>, NORMALBase>;
 template <typename T>
 using INTERFACEWIDTH = GenericField<GenericArray<T>, WidthBase>;
 

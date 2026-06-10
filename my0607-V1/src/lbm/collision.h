@@ -150,20 +150,6 @@ struct BounceBackMovingWall {
 };
 
 // PeriodicBoundary: no-op collision operator for periodic boundary cells
-//
-// Design rationale:
-// - Periodic boundary cells should NOT be modified during the collision phase
-// - Their distribution function values are determined by:
-//   1. The streaming step (populations move to neighbors)
-//   2. FixedPeriodicBoundaryManager::Apply() (copies data from opposite side)
-// - If collision modifies these cells (e.g., local swap = BounceBack),
-//   it would corrupt the distribution functions and cause artifacts
-//
-// Usage:
-//   using PeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision::PeriodicBoundary<CELL>>;
-//   using TaskCollection = tmp::TupleWrapper<BulkTask, PeriodicTask>;
-//
-// Must be used together with FixedPeriodicBoundaryManager for actual data transfer
 
 template <typename CELLTYPE>
 struct PeriodicBoundary {
@@ -175,137 +161,80 @@ struct PeriodicBoundary {
   __any__ static void apply(CELL& cell) {
     moment::template rho<CELL, true>::apply(cell);
   }
-
 };
 
-
-
-
-template <typename EquilibriumScheme,typename INTERFACEWIDTH, bool WriteToField = false>
-struct BGKSourceWithInterface {
-  using CELL = typename EquilibriumScheme::CELLTYPE;
+// ===================================================================
+// Phase-field BGK collision (pure collision, no moment computation)
+//
+// g_i* = ω·g_i^eq(φ,u) + (1-ω)·g_i + (1-ω/2)·S_i
+//
+//   φ  from PHI field (updated separately after streaming)
+//   u  from VELOCITY field (NS coupling)
+//   S_i computed by SourceScheme::apply(u, V, Si)
+//
+template <typename EquilibriumScheme, typename SourceScheme>
+struct PhaseFieldBGKSource {
+  using CELL = typename EquilibriumScheme::CELL;
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
-  using equilibriumscheme = EquilibriumScheme;
-  using GenericRho = typename CELL::GenericRho;
+
   __any__ static void apply(CELL& cell) {
-    T phi = T{0};
+    const T phi = cell.template get<typename CELL::GenericRho>();
     const Vector<T, LatSet::d>& u = cell.template get<VELOCITY<T, LatSet::d>>();
-    moment::template rho<CELL,WriteToField>::apply(cell);
+    const auto& V = SourceScheme::getForce(cell);
 
-    Vector<T, LatSet::d> grad;
-    Vector<T, LatSet::d> n;
+    std::array<T, LatSet::q> si{};
+    SourceScheme::apply(u, V, si);
 
-    if (LatSet::d == 3){
-      grad[0] = T{0};
-      grad[1] = T{0};
-      grad[2] = T{0};
-
-      for (unsigned int k = 0; k < LatSet::q; ++k) {
-        const auto& neighbor_pos = cell.getNeighbor(k);
-        const auto& neighbor_neg = cell.getNeighbor(LatSet::opp[k]);
-        T phi_pos = neighbor_pos.template get<GenericRho>();
-        T phi_neg = neighbor_neg.template get<GenericRho>();
-
-        T wk = latset::w<LatSet>(k);
-        const auto& ck = latset::c<LatSet>(k);
-
-        grad[0] += wk * (phi_pos - phi_neg) * ck[0] / (2 * LatSet::cs2);
-        grad[1] += wk * (phi_pos - phi_neg) * ck[1] / (2 * LatSet::cs2);
-        grad[2] += wk * (phi_pos - phi_neg) * ck[2] / (2 * LatSet::cs2);
-      }
-
-      cell.template get<GRAD<T, LatSet::d>>() = grad;
-
-      T grad_mag = grad.getnorm();
-      T epsilon = T(1e-10);
-      if (grad_mag > epsilon) {
-        n[0] = grad[0] / (grad_mag + epsilon);
-        n[1] = grad[1] / (grad_mag + epsilon);
-        n[2] = grad[2] / (grad_mag + epsilon);
-      } else {
-        n[0] = T{0};
-        n[1] = T{0};
-        n[2] = T{0};
-      }
-    }else if (LatSet::d == 2){
-      grad[0] = T{0};
-      grad[1] = T{0};
-
-      for (unsigned int k = 0; k < LatSet::q; ++k) {
-        const auto& neighbor_pos = cell.getNeighbor(k);
-        const auto& neighbor_neg = cell.getNeighbor(LatSet::opp[k]);
-        T phi_pos = neighbor_pos.template get<GenericRho>();
-        T phi_neg = neighbor_neg.template get<GenericRho>();
-
-        T wk = latset::w<LatSet>(k);
-        const auto& ck = latset::c<LatSet>(k);
-
-        grad[0] += wk * (phi_pos - phi_neg) * ck[0] / (2 * LatSet::cs2);
-        grad[1] += wk * (phi_pos - phi_neg) * ck[1] / (2 * LatSet::cs2);
-      }
-      cell.template get<GRAD<T, LatSet::d>>() = grad;
-
-      T grad_mag = grad.getnorm();
-      T epsilon = T(1e-10);
-      Vector<T, LatSet::d> n;
-      if (grad_mag > epsilon) {
-        n[0] = grad[0] / (grad_mag + epsilon);
-        n[1] = grad[1] / (grad_mag + epsilon);
-      } else {
-        n[0] = T{0};
-        n[1] = T{0};
-      }
-    }
-
-    phi = cell.template get<GenericRho>();
-    std::array<T, LatSet::q> feq;
+    std::array<T, LatSet::q> feq{};
     EquilibriumScheme::apply(feq, phi, u);
-    T omega_phi = cell.getOmega();
-    T _omega_phi = cell.get_Omega();
-    T factor = cell.getfOmega();
-    T interfacewidth = cell.template get<INTERFACEWIDTH>();
+
+    const T omega = cell.getOmega();
+    const T _omega = T{1} - omega;
+    const T fomega = cell.getfOmega();
+
     for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T en = T{};
-      Vector<T, LatSet::d> c = latset::c<LatSet>(i);
-      for (unsigned int d = 0; d < LatSet::d; ++d) {
-        en += c[d] * n[d];
-      } 
-      T source = factor * (latset::w<LatSet>(i) * en * (T{4} * phi *(T{1} - phi) )) / interfacewidth;
-      cell[i] = omega_phi * feq[i] + _omega_phi * cell[i] + source;
+      cell[i] = omega * feq[i] + _omega * cell[i] + fomega * si[i];
     }
   }
 };
 
-template <typename EquilibriumScheme, typename NORMAL, bool WriteToField = false>
-struct BGKSource {
+// ===================================================================
+// NS BGK collision with force (pure collision, no moment computation)
+//
+// f_i* = ω·f_i^eq(ρ,u) + (1-ω)·f_i + (1-ω/2)·G_i
+//
+//   ρ  from RHO field (updated separately after streaming)
+//   u  from VELOCITY field
+//   G_i computed by ForceScheme::apply(u, F, Gi)
+//
+template <typename EquilibriumScheme, typename ForceScheme>
+struct NSBGKForce {
   using CELL = typename EquilibriumScheme::CELLTYPE;
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
-  using equilibriumscheme = EquilibriumScheme;
-  using GenericRho = typename CELL::GenericRho;
-  __any__ static void apply(CELL& cell) {
-    const Vector<T, LatSet::d>& u = cell.template get<VELOCITY<T, LatSet::d>>();
-    const Vector<T, LatSet::d>& n = cell.template get<NORMAL>();
 
-    T phi = cell.template get<GenericRho>();
-    std::array<T, LatSet::q> feq;
-    EquilibriumScheme::apply(feq, phi, u);
-    T omega_phi = cell.getOmega();
-    T _omega_phi = cell.get_Omega();
-    T factor = cell.getfOmega();
-    T interfacewidth = cell.template get<INTERFACEWIDTH<T>>();
+  __any__ static void apply(CELL& cell) {
+    const T rho = cell.template get<typename CELL::GenericRho>();
+    const Vector<T, LatSet::d>& u = cell.template get<VELOCITY<T, LatSet::d>>();
+    const auto& F = ForceScheme::getForce(cell);
+
+    std::array<T, LatSet::q> fi{};
+    ForceScheme::apply(u, F, fi);
+
+    std::array<T, LatSet::q> feq{};
+    EquilibriumScheme::apply(feq, rho, u);
+
+    const T omega = cell.getOmega();
+    const T _omega = T{1} - omega;
+    const T fomega = cell.getfOmega();
+
     for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T en = T{};
-      Vector<T, LatSet::d> c = latset::c<LatSet>(i);
-      for (unsigned int d = 0; d < LatSet::d; ++d) {
-        en += c[d] * n[d];
-      } 
-      T source = factor * (latset::w<LatSet>(i) * en * (T{4} * phi *(T{1} - phi) )) / interfacewidth;
-      cell[i] = omega_phi * feq[i] + _omega_phi * cell[i] + source;
+      cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];
     }
   }
 };
+
 
 }  // namespace collision
 

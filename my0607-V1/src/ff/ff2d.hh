@@ -1,169 +1,440 @@
 #pragma once
 
+#include <vector>
 #include "ff/ff2d.h"
 
 namespace ff {
 
-template <typename CELL>
-__any__ void FF2D<CELL>::apply(CELL& cell) {
-  Vector<T, LatSet::d> grad;
-  grad[0] = T{0};
-  grad[1] = T{0};
+// ===================================================================
+// FF2DBlock implementations
+// ===================================================================
 
-  for (unsigned int i = 1; i < LatSet::q; ++i) {
-    T phi_i = cell.getNeighbor(i).template get<GenericRho>();
-    T wi = latset::w<LatSet>(i);
-    const auto& ci = latset::c<LatSet>(i);
-    grad[0] += wi * ci[0] * phi_i;
-    grad[1] += wi * ci[1] * phi_i;
+template <typename T, typename LatSet>
+template <typename... FIELDPTRS>
+FF2DBlock<T, LatSet>::FF2DBlock(Block<T, 2>& geo,
+                                PhaseFieldConverter<T>& conv,
+                                std::tuple<FIELDPTRS...> fieldptrs)
+    : BlockLatticeBase<T, LatSet, ALLFIELDS<T>>(geo, fieldptrs),
+      _conv(conv) {}
+
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeGradient() {
+  // writes to GRAD (referenced from PFLattice), NORMAL (owned)
+  auto& gradField = this->template getField<GRAD<T>>();
+  auto& normalField = this->template getField<NORMAL<T>>();
+  auto& phiField = this->template getField<PHI<T>>();
+
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+
+      Vector<T, LatSet::d> grad;
+      grad[0] = T{0};
+      grad[1] = T{0};
+
+      for (unsigned int k = 1; k < LatSet::q; ++k) {
+        std::size_t nid = id + this->Delta_Index[k];
+        T phi_k = phiField.get(nid);
+        T wk = latset::w<LatSet>(k);
+        const auto& ck = latset::c<LatSet>(k);
+        grad[0] += wk * ck[0] * phi_k;
+        grad[1] += wk * ck[1] * phi_k;
+      }
+      grad[0] /= LatSet::cs2;
+      grad[1] /= LatSet::cs2;
+
+      gradField.SetField(id, grad);
+
+      T gradMag = grad.getnorm();
+      T delta = T(0.005);
+      Vector<T, LatSet::d> n;
+      if (gradMag < delta) {
+        n[0] = T{0};
+        n[1] = T{0};
+      } else {
+        n[0] = grad[0] / gradMag;
+        n[1] = grad[1] / gradMag;
+      }
+      normalField.SetField(id, n);
+    }
   }
-  grad[0] /= LatSet::cs2;
-  grad[1] /= LatSet::cs2;
+}
 
-  cell.template get<GRAD<T, LatSet::d>>() = grad;
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeLaplacian() {
+  auto& laplacianField = this->template getField<LAPLACIAN<T>>();
+  auto& phiField = this->template getField<PHI<T>>();
 
-  T grad_mag = grad.getnorm();
-  // ε threshold for noise suppression: bulk regions have |∇φ| << 0.005
-  // At the interface center: |∇φ| ≈ 1/W ≈ 0.33 (W=3) >> 0.005
-  // This filters out noise-driven source terms while keeping interface dynamics
-  T delta = T(0.005); 
-  Vector<T, LatSet::d> n;
-  if (grad_mag < delta) {
-    n[0] = T{0};
-    n[1] = T{0};
-  } else {
-    n[0] = grad[0] / grad_mag;
-    n[1] = grad[1] / grad_mag;
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      T phi_self = phiField.get(id);
+      T laplacian = T{0};
+
+      for (unsigned int k = 0; k < LatSet::q; ++k) {
+        std::size_t nid = id + this->Delta_Index[k];
+        T phi_k = phiField.get(nid);
+        T wk = latset::w<LatSet>(k);
+        laplacian += wk * (phi_k - phi_self);
+      }
+      laplacian *= T{2} / LatSet::cs2;
+
+      laplacianField.SetField(id, laplacian);
+    }
   }
-  cell.template get<NORMAL<T, LatSet::d>>() = n;
 }
 
-// ---- FFLaplacian2D ----
-// ∇²φ = (2/(cs²*Δt²)) * Σ_{α=0}^{8} w_α * [φ(x+e_α) - φ(x)]
-// For lattice units (Δt=1, Δx=1): factor = 2/cs²
-template <typename CELL>
-__any__ void FFLaplacian2D<CELL>::apply(CELL& cell) {
-  T phi_self = cell.template get<GenericRho>();
-  T laplacian = T{0};
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeChemicalPotential() {
+  // λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ
+  // writes to CHEMICALPOTENTIAL (referenced from PFLattice)
+  auto& chemPotField = this->template getField<CHEMICALPOTENTIAL<T>>();
+  auto& phiField = this->template getField<PHI<T>>();
+  auto& lapField = this->template getField<LAPLACIAN<T>>();
 
-  for (unsigned int k = 0; k < LatSet::q; ++k) {
-    T phi_k = cell.getNeighbor(k).template get<GenericRho>();
-    T wk = latset::w<LatSet>(k);
-    // sum w_k * (phi_neighbor - phi_self)
-    laplacian += wk * (phi_k - phi_self);
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      T phi = phiField.get(id);
+      T laplacian = lapField.get(id);
+
+      T double_well = phi * (phi - T{1}) * (phi - T{0.5});
+      T chem_pot = T{4} * _conv.getLatticeBeta() * double_well
+                    - _conv.getLatticeKappa() * laplacian;
+
+      chemPotField.SetField(id, chem_pot);
+    }
   }
-  // factor 2/cs² for lattice units
-  laplacian *= T{2} / LatSet::cs2;
-
-  cell.template get<LAPLACIAN<T>>() = laplacian;
 }
 
-// ---- FFChemPotential2D ----
-// λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ
-template <typename CELL>
-__any__ void FFChemPotential2D<CELL>::apply(CELL& cell) {
-  T phi = cell.template get<GenericRho>();
-  T laplacian = cell.template get<LAPLACIAN<T>>();
-  T beta = cell.template get<BETA<T>>();
-  T kappa = cell.template get<KAPPA<T>>();
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeACSource() {
+  // ACSOURCE = (4φ(1-φ)/W) · NORMAL  (Allen-Cahn source vector)
+  auto& acSource = this->template getField<ACSOURCE<T>>();
+  auto& phiField = this->template getField<PHI<T>>();
+  auto& normalField = this->template getField<NORMAL<T>>();
 
-  // φ*(φ-1)*(φ-0.5)
-  T double_well = phi * (phi - T{1}) * (phi - T{0.5});
-  T chem_potential = T{4} * beta * double_well - kappa * laplacian;
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
 
-  cell.template get<CHEMICALPOTENTIAL<T>>() = chem_potential;
-}
+  T W = _conv.getLatticeW();
+  std::cout << "[computeACSource] W=" << W << std::endl;
 
-// ---- FFChemPotentialGradient2D ----
-// ∇λ via isotropically centered FD, written to NORMAL (overwriting n=∇φ/|∇φ|)
-// BGKSource then uses ∇λ (via NORMAL) as the Cahn-Hilliard source
-// source_i = fomega * w_i * (c_i·∇λ) * 4φ(1-φ)/W
-// The 4φ(1-φ) factor localizes the source to the interface; ∇λ provides the
-// correct driving force from both phase separation and surface tension.
-template <typename CELL>
-__any__ void FFChemPotentialGradient2D<CELL>::apply(CELL& cell) {
-  Vector<T, LatSet::d> grad_lambda;
-  grad_lambda[0] = T{0};
-  grad_lambda[1] = T{0};
-
-  for (unsigned int i = 1; i < LatSet::q; ++i) {
-    T lambda_i = cell.getNeighbor(i).template get<CHEMICALPOTENTIAL<T>>();
-    T wi = latset::w<LatSet>(i);
-    const auto& ci = latset::c<LatSet>(i);
-    grad_lambda[0] += wi * ci[0] * lambda_i;
-    grad_lambda[1] += wi * ci[1] * lambda_i;
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      T phi = phiField.get(id);
+      T S = T{4} * phi * (T{1} - phi) / W;
+      const Vector<T, LatSet::d>& n = normalField.get(id);
+      acSource.SetField(id, n * S);
+    }
   }
-  grad_lambda[0] /= LatSet::cs2;
-  grad_lambda[1] /= LatSet::cs2;
-
-  // Store in NORMAL (replaces interface normal, used by BGKSource as source field)
-  cell.template get<NORMAL<T, LatSet::d>>() = grad_lambda;
 }
 
-// ---- FFSurfaceTension2D ----
-// F_s = λ * ∇φ  → added to ns_cell FORCE
-template <typename PFCELL, typename NSCELL>
-__any__ void FFSurfaceTension2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-  T chem_potential = pf_cell.template get<CHEMICALPOTENTIAL<T>>();
-  const Vector<T, LatSet::d>& grad = pf_cell.template get<GRAD<T, LatSet::d>>();
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeForceSF() {
+  // Surface tension force: F_s = λ · ∇φ
+  auto& forceSF = this->template getField<FORCE_SF<T>>();
+  auto& chemField = this->template getField<CHEMICALPOTENTIAL<T>>();
+  auto& gradField = this->template getField<GRAD<T>>();
 
-  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
-  ns_force[0] += chem_potential * grad[0];
-  ns_force[1] += chem_potential * grad[1];
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      T lambda = chemField.get(id);
+      const Vector<T, LatSet::d>& grad = gradField.get(id);
+      forceSF.SetField(id, grad * lambda);
+    }
+  }
 }
 
-// ---- FFGravityForce2D ----
-// F_b[1] = -|gravity| * ρ(φ)  where ρ(φ) = ρ_l + φ*(ρ_h-ρ_l)
-template <typename PFCELL, typename NSCELL>
-__any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
-  T rho_l = pf_cell.template get<RHO_L<T>>();
-  T rho_h = pf_cell.template get<RHO_H<T>>();
-  T g = pf_cell.template get<GRAVITY<T>>();
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeForceP() {
+  // Pressure gradient force: F_p = -∇p = -cs²·∇ρ = -cs²·(ρ_h-ρ_l)·∇φ
+  auto& forceP = this->template getField<FORCE_P<T>>();
+  auto& gradField = this->template getField<GRAD<T>>();
+  auto& rhoL = this->template getField<RHO_L<T>>();
+  auto& rhoH = this->template getField<RHO_H<T>>();
+  auto& rhoField = this->template getField<RHO<T>>();
+  auto& pressureField = this->template getField<PRESSURE<T>>();
 
-  // g is negative (downward), so |g| = -g
-  T rho = rho_l + phi * (rho_h - rho_l);
-  // F_b in y-direction. Gravity points downward (negative y).
-  // Since g is negative: buoyancy = rho*g (negative * negative = positive upward force if rho_l < rho_h)
-  // Wait: F_b = ρ * G_y where G_y is the gravitational acceleration.
-  // For bubble rising, the bubble is lighter (ρ_l << ρ_h), so light fluid rises.
-  // F_b[1] = rho * g where g is negative (pointing down).
-  // The NS solver handles the sign convention.
-  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_h) * g;
+  T rho_l = rhoL.get(0);
+  T rho_h = rhoH.get(0);
+  T coeff = (rho_h - rho_l);
+
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      forceP.SetField(id, -coeff * pressureField.get(id) * gradField.get(id) / rhoField.get(id));
+    }
+  }
 }
 
-// ---- FFRhoOmegaUpdate2D ----
-// WARNING: Cell::getOmega() returns the block-level scalar (from converter),
-// NOT the per-cell OMEGA<T> field. So per-cell omega updates have NO effect on
-// the collision. For variable viscosity, modify the collision operator to call
-// getOmegaf() instead of getOmega(). See src/data_struct/cell.h:168.
-//
-// ρ = ρ_l + φ*(ρ_h - ρ_l)
-// ν = η/ρ, τ = 0.5 + ν/cs², omega = 1/τ
-template <typename PFCELL, typename NSCELL>
-__any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
-  T rho_l = pf_cell.template get<RHO_L<T>>();
-  T rho_h = pf_cell.template get<RHO_H<T>>();
-  T eta_l = pf_cell.template get<ETA_L<T>>();
-  T eta_h = pf_cell.template get<ETA_H<T>>();
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeForceBuoy() {
+  // F_b = (ρ(φ) - ρ_h) · g
+  // ρ(φ) = ρ_l + φ·(ρ_h-ρ_l),  g = (0, g_y) in lattice units
+  auto& forceBuoy = this->template getField<FORCE_Buoy<T>>();
+  auto& phiField = this->template getField<PHI<T>>();
+  auto& rhoL = this->template getField<RHO_L<T>>();
+  auto& rhoH = this->template getField<RHO_H<T>>();
+  auto& gravField = this->template getField<GRAVITY<T>>();
 
-  // Interpolate rho
-  T rho = rho_l + phi * (rho_h - rho_l);
-  ns_cell.template get<typename NSCELL::GenericRho>() = rho;
+  T rho_l = rhoL.get(0);
+  T rho_h = rhoH.get(0);
+  T g = gravField.get(0);
+  T drho = rho_h - rho_l;
 
-  // Interpolate eta (dynamic viscosity)
-  T eta = eta_l + phi * (eta_h - eta_l);
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
 
-  // Compute kinematic viscosity and omega
-  T nu = eta / rho;
-  T tau = T{0.5} + nu / LatSet::cs2;
-  // Clamp omega to avoid instability
-  T omega = T{1} / tau;
-  if (omega > T{1.95}) omega = T{1.95};
-  if (omega < T{0.01}) omega = T{0.01};
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      T phi = phiField.get(id);
+      T rho = rho_l + phi * drho;
+      forceBuoy.SetField(id, Vector<T, LatSet::d>{T{0}, (rho - rho_h) * g});
+    }
+  }
+}
 
-  ns_cell.template get<OMEGA<T>>() = omega;
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeForceVisc() {
+  // F_v = ∇·[η(φ)·(∇u + ∇u^T)]
+  //
+  // Two-pass isotropic FD:
+  //   Pass 1: compute stress T = η·(∇u+∇u^T) at each interior cell
+  //   Pass 2: compute F_v = ∇·T via isotropic FD divergence
+  auto& forceVisc = this->template getField<FORCE_Visc<T>>();
+  auto& velField = this->template getField<VELOCITY<T, 2>>();
+  auto& phiField = this->template getField<PHI<T>>();
+  auto& etaL = this->template getField<ETA_L<T>>();
+  auto& etaH = this->template getField<ETA_H<T>>();
+
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+  std::size_t Ntotal = this->getN();
+
+  T eta_l = etaL.get(0);
+  T eta_h = etaH.get(0);
+  T invCs2 = T{1} / LatSet::cs2;
+
+  // Temporary storage for stress tensor components
+  std::vector<T> Txx(Ntotal, T{0});
+  std::vector<T> Txy(Ntotal, T{0});
+  std::vector<T> Tyy(Ntotal, T{0});
+
+  // Pass 1: T = η(φ)·(∇u + ∇u^T)  [isotropic FD for ∇u]
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+
+      T phi = phiField.get(id);
+      T eta = eta_l + phi * (eta_h - eta_l);
+
+      T duxdx = T{0}, duxdy = T{0};
+      T duydx = T{0}, duydy = T{0};
+
+      for (unsigned int k = 1; k < LatSet::q; ++k) {
+        std::size_t nid = id + this->Delta_Index[k];
+        const auto& un = velField.get(nid);
+        T wk = latset::w<LatSet>(k);
+        const auto& ck = latset::c<LatSet>(k);
+        duxdx += wk * ck[0] * un[0];
+        duxdy += wk * ck[1] * un[0];
+        duydx += wk * ck[0] * un[1];
+        duydy += wk * ck[1] * un[1];
+      }
+
+      Txx[id] = eta * T{2} * duxdx * invCs2;
+      Txy[id] = eta * (duxdy + duydx) * invCs2;
+      Tyy[id] = eta * T{2} * duydy * invCs2;
+    }
+  }
+
+  // Pass 2: F_v = ∇·T  [isotropic FD for tensor divergence]
+  for (int j = overlap + 1; j < Ny - overlap - 1; ++j) {
+    for (int i = overlap + 1; i < Nx - overlap - 1; ++i) {
+      std::size_t id = i + j * Nx;
+
+      T Fx = T{0}, Fy = T{0};
+      for (unsigned int k = 1; k < LatSet::q; ++k) {
+        std::size_t nid = id + this->Delta_Index[k];
+        T wk = latset::w<LatSet>(k);
+        const auto& ck = latset::c<LatSet>(k);
+        Fx += wk * (ck[0] * Txx[nid] + ck[1] * Txy[nid]);
+        Fy += wk * (ck[0] * Txy[nid] + ck[1] * Tyy[nid]);
+      }
+      Fx *= invCs2;
+      Fy *= invCs2;
+
+      forceVisc.SetField(id, Vector<T, LatSet::d>{Fx, Fy});
+    }
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::computeForceTotal() {
+  // F_total = F_s + F_g + F_b + F_v → NS FORCE field
+  auto& forceTotal = this->template getField<FORCE<T, 2>>();
+  auto& forceSF = this->template getField<FORCE_SF<T>>();
+  auto& forceBuoy = this->template getField<FORCE_Buoy<T>>();
+  auto& forceVisc = this->template getField<FORCE_Visc<T>>();
+  auto& forceP = this->template getField<FORCE_P<T>>();
+
+  int overlap = this->getOverlap();
+  int Nx = this->getNx();
+  int Ny = this->getNy();
+  for (int j = overlap; j < Ny - overlap; ++j) {
+    for (int i = overlap; i < Nx - overlap; ++i) {
+      std::size_t id = i + j * Nx;
+      forceTotal.SetField(id, forceSF.get(id)
+               + forceBuoy.get(id) + forceVisc.get(id) + forceP.get(id));
+    }
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DBlock<T, LatSet>::apply() {
+  computeGradient();
+  computeLaplacian();
+  computeChemicalPotential();
+  computeACSource();
+  computeForceSF();
+  computeForceP();
+  computeForceBuoy();
+  computeForceVisc();
+  computeForceTotal();
+}
+
+// ===================================================================
+// FF2DManager implementations
+// ===================================================================
+
+template <typename T, typename LatSet>
+template <typename INITVALUEPACK, typename... FIELDPTRTYPES>
+FF2DManager<T, LatSet>::FF2DManager(BlockGeometry<T, 2>& blockgeo,
+                                    PhaseFieldConverter<T>& conv,
+                                    INITVALUEPACK& initvalues,
+                                    FIELDPTRTYPES*... fieldptrs)
+    : BlockLatticeManagerBase<T, LatSet, FIELDPACK<T>>(blockgeo, initvalues,
+                                                        fieldptrs...),
+      _conv(conv) {
+  for (int i = 0; i < this->BlockGeo.getBlockNum(); ++i) {
+    _blocks.emplace_back(
+        this->BlockGeo.getBlock(i), _conv,
+        ExtractFieldPtrs<T, LatSet, FIELDPACK<T>>::getFieldPtrTuple(
+            i, this->Fields, this->FieldPtrs));
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::Init(BlockGeometryHelper<T, 2>& GeoHelper) {
+  // Fields already created by base constructor with init values.
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeGradient() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) {
+    block.computeGradient();
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeLaplacian() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) {
+    block.computeLaplacian();
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeChemicalPotential() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) {
+    block.computeChemicalPotential();
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeACSource() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) {
+    block.computeACSource();
+  }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeForceSF() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) { block.computeForceSF(); }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeForceP() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) { block.computeForceP(); }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeForceBuoy() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) { block.computeForceBuoy(); }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeForceVisc() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) { block.computeForceVisc(); }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::computeForceTotal() {
+#pragma omp parallel for num_threads(Thread_Num)
+  for (auto& block : _blocks) { block.computeForceTotal(); }
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::apply() {
+  computeGradient();
+  computeLaplacian();
+  computeChemicalPotential();
+  computeACSource();
+  computeForceSF();
+  computeForceP();
+  computeForceBuoy();
+  computeForceVisc();
+  computeForceTotal();
+}
+
+template <typename T, typename LatSet>
+void FF2DManager<T, LatSet>::Communicate() {
+  this->template getField<NORMAL<T>>().NormalCommunicate();
+  this->template getField<LAPLACIAN<T>>().NormalCommunicate();
 }
 
 }  // namespace ff
