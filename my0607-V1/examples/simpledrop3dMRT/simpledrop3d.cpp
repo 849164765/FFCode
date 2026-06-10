@@ -34,12 +34,8 @@ Vector<T, LatSet::d> Droplet_Velocity;
 T Droplet_Velocity_Mag;
 
 T Mobility;
-T Kappa;
-T Beta;
 T Sigma;
 T Interface_Width;
-T Tau_phi;
-T Omega_phi;
 T epsilon = T(1e-6);
 int MaxStep;
 int OutputStep;
@@ -68,13 +64,7 @@ void readParam() {
   Interface_Width = param_reader.getValue<T>("Phase_Field", "Interface_Width");
   Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
   Sigma = param_reader.getValue<T>("Phase_Field", "Sigma");
-  Kappa = T(3.0) * Interface_Width * Sigma * T(0.5);
-  Beta = T(12.0) * Sigma / Interface_Width;
-
-  T Gamma = Mobility;
-  T cs2 = LatSet::cs2;
-  Tau_phi = T(0.5) + Gamma / cs2;
-  Omega_phi = T(1.0) / Tau_phi;
+  // Beta, Kappa, Tau_phi, Omega_phi will be computed by Converter in main()
 
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
   TestCase_Global = param_reader.getValue<std::string>("Simulation_Settings", "TestCase");
@@ -120,10 +110,7 @@ void readParam() {
     std::cout << "  Interface Width:  " << Interface_Width << " lu" << std::endl;
     std::cout << "  Mobility:         " << Mobility << std::endl;
     std::cout << "  Sigma:            " << Sigma << std::endl;
-    std::cout << "  Kappa:            " << Kappa << std::endl;
-    std::cout << "  Beta:             " << Beta << std::endl;
-    std::cout << "  Tau_phi:          " << Tau_phi << std::endl;
-    std::cout << "  Omega_phi:        " << Omega_phi << std::endl;
+    std::cout << "  (tau/omega/beta/kappa from Converter in main())" << std::endl;
     std::cout << "[Simulation_Settings]:\n"
               << "  TotalStep:        " << MaxStep << "\n"
               << "  OutputStep:       " << OutputStep << "\n"
@@ -158,16 +145,26 @@ int main(int argc, char* argv[]) {
   readParam();
 
   Droplet_Velocity_Global = Droplet_Velocity;
-  Beta_Global = Beta;
-  Kappa_Global = Kappa;
   Mobility_Global = Mobility;
-  Omega_phi_Global = Omega_phi;
 
-  BaseConverter<T> dummyConv(LatSet::cs2);
-  dummyConv.Converter(T(1), T(1), T(1), T(Nx), T(1), T(0.1));
-  PhaseFieldConverter<T> phiConv(dummyConv);
-  dummyConv.ConvertFromRT(1.0, Tau_phi, 1.0, 100, 0.01, 0.001);
-  phiConv.Converter(4.0, 0.01, 0.072);
+  BaseConverter<T> BaseConv(LatSet::cs2);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), T(1), T(Nx), T(1), T(0.1));
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, Sigma);
+
+  Beta_Global = PhaseConv.getLatticeBeta();
+  Kappa_Global = PhaseConv.getLatticeKappa();
+  Omega_phi_Global = PhaseConv.getOMEGA();
+
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
+  ConvManager.Check_and_Print();
+
+  MPI_RANK(0) {
+    std::cout << "  [Converter]: tau_phi=" << PhaseConv.getLattice_RT()
+              << "  omega=" << PhaseConv.getOMEGA()
+              << "  beta=" << PhaseConv.getLatticeBeta()
+              << "  kappa=" << PhaseConv.getLatticeKappa() << std::endl;
+  }
 
   AABB<T, 3> domain(Vector<T, 3>(T(0), T(0), T(0)),
                     Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(Nz * Cell_Len)));
@@ -301,7 +298,7 @@ int main(int argc, char* argv[]) {
 
   ValuePack InitValues(T{}, T{}, T{}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, Interface_Width);
 
-  BlockLatticeManager<T, LatSet, FIELDS> DropletLattice(Geo, InitValues, dummyConv);
+  BlockLatticeManager<T, LatSet, FIELDS> DropletLattice(Geo, InitValues, PhaseConv);
 
   auto& phiField = DropletLattice.getField<PHI<T>>();
   T d = static_cast<T>(Nx) * Cell_Len;
@@ -608,7 +605,7 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Simple 3D Droplet Simulation (MRT) Complete!"));
   MainWriter.WriteBinary(MainLoopTimer());
   MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
-  Printer::Print("Total PhysTime", dummyConv.getPhysTime(MainLoopTimer()));
+  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
   Printer::Endl();
 
   T l2_sum = T(0);

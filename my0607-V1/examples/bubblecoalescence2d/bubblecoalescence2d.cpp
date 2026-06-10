@@ -35,9 +35,6 @@ T Initial_Gap;
 // phase field parameters
 T Interface_Width;
 T Mobility;
-T Tau_phi;
-T Kappa;
-T Beta;
 
 // two-phase parameters
 T rho_l, rho_h;
@@ -45,7 +42,6 @@ T eta_l, eta_h;
 T sigma;
 T gravity;
 T Eo, Re, U_g;
-T Tau_ns;
 
 // simulation
 int MaxStep;
@@ -98,12 +94,7 @@ void readParam() {
   T DeltaRho = rho_h - rho_l;
   sigma = DeltaRho * g_abs * D * D / Eo;
 
-  // Phase field: kappa = 1.5*W*sigma, beta = 12*sigma/W
-  Kappa = T(1.5) * Interface_Width * sigma;
-  Beta = T(12.0) * sigma / Interface_Width;
-  Tau_phi = T(0.5) + Mobility / LatSet::cs2;
-
-  Tau_ns = T(0.5) + nu / LatSet::cs2;
+  // Note: Beta, Kappa, Tau_phi, Tau_ns will be computed by Converter in main()
 
   T cs = std::sqrt(LatSet::cs2);
   T CFL = U_g + cs;
@@ -121,9 +112,8 @@ void readParam() {
               << "  Lower: (" << Bubble2_Center[0] << "," << Bubble2_Center[1] << ")\n"
               << "[Design]: U_g=" << U_g << " (Ma=" << Ma << ")\n"
               << "  g=" << gravity << "  nu=" << nu << "  sigma=" << sigma << "\n"
-              << "[Phase]: W=" << Interface_Width << "  M=" << Mobility
-              << "  kappa=" << Kappa << "  beta=" << Beta << "\n"
-              << "[Flow]: tau_ns=" << Tau_ns << "  tau_phi=" << Tau_phi << "\n"
+              << "[Phase]: W=" << Interface_Width << "  M=" << Mobility << "\n"
+              << " (Converter-derived tau/beta/kappa printed in main())\n"
               << "[Scaling]: Re=" << Re << "  Eo=" << Eo
               << "  Mo=" << Mo << "  Ca=" << Ca << "\n"
               << "[CFL]: " << CFL << (CFL < T(1.2) ? "  OK" : "  WARN")
@@ -134,12 +124,9 @@ void readParam() {
               << std::endl;
   }
 
-  if (CFL >= T(1.2) || Tau_ns > T(1.5)) {
+  if (CFL >= T(1.2)) {
     MPI_RANK(0) {
-      if (CFL >= T(1.2))
-        std::cerr << "[ERROR] CFL=" << CFL << " > 1.2! Reduce U_g.\n";
-      if (Tau_ns > T(1.5))
-        std::cerr << "[ERROR] tau_ns=" << Tau_ns << " > 1.5! Increase Re.\n";
+      std::cerr << "[ERROR] CFL=" << CFL << " > 1.2! Reduce U_g.\n";
     }
     exit(1);
   }
@@ -157,14 +144,48 @@ int main(int argc, char* argv[]) {
   readParam();
 
   // ------------------ converters ------------------
+  T D = T(2.0) * Bubble1_Radius;
+
+  // NS BaseConverter: ConvertFromTimeStep auto-computes Tau_ns = 0.5 + nu/(cs2*dx²)*dt
+  // dx=1, dt=1 (standard LBM), charU=U_g for correct Lattice_charU stability check
   BaseConverter<T> BaseConv(LatSet::cs2);
-  BaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_ns);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), rho_h, D, U_g, nu);
 
-  BaseConverter<T> PFBaseConv(LatSet::cs2);
-  PFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
+  // PhaseFieldConverter: auto-computes beta, kappa, tau_phi, omega_phi
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, sigma);  // tau_phi computed internally
 
-  UnitConvManager<T> ConvManager(&BaseConv);
+  // Register both converters for validation
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
   ConvManager.Check_and_Print();
+
+  // ----- Converter-derived parameters -----
+  T Tau_ns   = BaseConv.getLattice_RT();
+  T Omega_ns = BaseConv.getOMEGA();
+  T Tau_phi  = PhaseConv.getLattice_RT();
+  T Omega_phi = PhaseConv.getOMEGA();
+  T Beta     = PhaseConv.getLatticeBeta();
+  T Kappa    = PhaseConv.getLatticeKappa();
+
+  // Validate Tau_ns from converter
+  if (Tau_ns > T(1.5)) {
+    MPI_RANK(0) {
+      std::cerr << "[ERROR] tau_ns=" << Tau_ns << " > 1.5! Increase Re.\n";
+    }
+    exit(1);
+  }
+
+  MPI_RANK(0) {
+    std::cout << "\n=== Converter-Derived Lattice Parameters ===\n";
+    std::cout << "[NS]:  tau=" << Tau_ns   << "  omega=" << Omega_ns << "\n";
+    std::cout << "[PF]:  tau=" << Tau_phi  << "  omega=" << Omega_phi << "\n";
+    std::cout << "[PF]:  W="    << PhaseConv.getLatticeW()
+              << "  M="         << PhaseConv.getLatticeMphi()
+              << "  sigma="     << PhaseConv.getLatticeSigma() << "\n";
+    std::cout << "[PF]:  beta=" << Beta   << "  kappa=" << Kappa << "\n";
+    std::cout << "[Design]: Re=" << Re << "  Eo=" << Eo << "\n";
+    std::cout << "=============================================\n\n";
+  }
 
   // ------------------ geometry ------------------
   AABB<T, 2> domain(Vector<T, 2>(T(0), T(0)),
@@ -211,12 +232,14 @@ int main(int argc, char* argv[]) {
                          gravity, Beta, Kappa, rho_l, rho_h, eta_l, eta_h);
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
-      Geo, PFInitValues, PFBaseConv,
+      Geo, PFInitValues, PhaseConv,
       &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
   ff::BroadcastAllParams<T>(PFLattice,
                             rho_l, rho_h, eta_l, eta_h,
-                            gravity, Beta, Kappa);
+                            gravity,
+                            PhaseConv.getLatticeBeta(),
+                            PhaseConv.getLatticeKappa());
 
   // ---- Initialize PHI field: two bubbles ----
   // phi = 0 inside bubble (light fluid), phi = 1 outside (heavy fluid)

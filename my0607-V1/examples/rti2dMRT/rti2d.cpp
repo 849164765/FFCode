@@ -44,15 +44,11 @@ T rho_l;
 T rho_h;
 T gravity;
 T nu;
-T Tau_ns;
 
 // phase field parameters
 T Interface_Width;
 T sigma;
 T Mobility;
-T Tau_phi;
-T Kappa;
-T Beta;
 
 // perturbation
 T Pert_Amp;
@@ -75,14 +71,10 @@ void readParam() {
   rho_h = param_reader.getValue<T>("Fluid", "Rho_Heavy");
   gravity = param_reader.getValue<T>("Fluid", "Gravity");
   nu = param_reader.getValue<T>("Fluid", "Kinematic_Viscosity");
-  Tau_ns = T(0.5) + nu / LatSet::cs2;
 
   Interface_Width = param_reader.getValue<T>("Phase_Field", "Interface_Width");
   sigma = param_reader.getValue<T>("Phase_Field", "Surface_Tension");
   Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
-  Kappa = T(1.5) * Interface_Width * sigma;
-  Beta = T(12.0) * sigma / Interface_Width;
-  Tau_phi = T(0.5) + Mobility / LatSet::cs2;
 
   Pert_Amp = param_reader.getValue<T>("Perturbation", "Amplitude");
   WaveNumber = param_reader.getValue<int>("Perturbation", "WaveNumber");
@@ -102,9 +94,7 @@ void readParam() {
               << " A=" << Atwood << " nu=" << nu << "\n"
               << "[Gravity]: " << gravity << "\n"
               << "[Phase]: W=" << Interface_Width << " sigma=" << sigma
-              << " kappa=" << Kappa << " beta=" << Beta
-              << " Mobility=" << Mobility << " tau_phi=" << Tau_phi << "\n"
-              << "[NS]: tau_ns=" << Tau_ns << " omega=" << (T(1)/Tau_ns) << "\n"
+              << " Mobility=" << Mobility << "\n"
               << "[Perturbation]: h0=" << Pert_Amp << " k=" << WaveNumber
               << " h0/lambda=" << (Pert_Amp * WaveNumber / (Ni * Cell_Len))
               << " h0/W=" << (Pert_Amp / Interface_Width) << "\n"
@@ -112,6 +102,7 @@ void readParam() {
               << " alpha_sq=" << alpha_sq
               << (alpha_sq > 0 ? " UNSTABLE" : " stable") << "\n"
               << "[MRT]: NS=MRTForce  PF=MRTSource\n"
+              << " (Converter-derived tau/beta/kappa printed in main())\n"
               << "[Sim]: MaxStep=" << MaxStep << " OutputStep=" << OutputStep << "\n"
               << "=====================================\n"
               << std::endl;
@@ -135,15 +126,38 @@ int main(int argc, char* argv[]) {
 
   // ===================================================================
   // Converters (lattice units: dx=1, dt=1)
+  // ConvertFromTimeStep auto-computes Tau_ns = 0.5 + nu/(cs2*dx²)*dt
+  // PhaseFieldConverter auto-computes beta, kappa, tau_phi, omega_phi
   // ===================================================================
-  BaseConverter<T> NSConv(LatSet::cs2);
-  NSConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_ns);
+  T charU = std::sqrt(std::abs(gravity) * T(Ni));  // characteristic velocity from gravity
+  BaseConverter<T> BaseConv(LatSet::cs2);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), T(1), T(Ni), charU, nu);
 
-  BaseConverter<T> PFConv(LatSet::cs2);
-  PFConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, sigma);  // tau_phi computed internally
 
-  UnitConvManager<T> ConvManager(&NSConv);
+  // Register both converters for validation
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
   ConvManager.Check_and_Print();
+
+  // ----- Converter-derived parameters -----
+  T Tau_ns   = BaseConv.getLattice_RT();
+  T Omega_ns = BaseConv.getOMEGA();
+  T Tau_phi  = PhaseConv.getLattice_RT();
+  T Omega_phi = PhaseConv.getOMEGA();
+  T Beta     = PhaseConv.getLatticeBeta();
+  T Kappa    = PhaseConv.getLatticeKappa();
+
+  MPI_RANK(0) {
+    std::cout << "\n=== Converter-Derived Lattice Parameters ===\n";
+    std::cout << "[NS]:  tau=" << Tau_ns   << "  omega=" << Omega_ns << "\n";
+    std::cout << "[PF]:  tau=" << Tau_phi  << "  omega=" << Omega_phi << "\n";
+    std::cout << "[PF]:  W="    << PhaseConv.getLatticeW()
+              << "  M="         << PhaseConv.getLatticeMphi()
+              << "  sigma="     << PhaseConv.getLatticeSigma() << "\n";
+    std::cout << "[PF]:  beta=" << Beta   << "  kappa=" << Kappa << "\n";
+    std::cout << "==========================================\n\n";
+  }
 
   // ===================================================================
   // Geometry (periodic in X, no-slip walls in Y)
@@ -183,14 +197,14 @@ int main(int argc, char* argv[]) {
   // ===================================================================
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
                             FORCE<T, LatSet::d>>;
-  ValuePack NSInitValues(NSConv.getLatRhoInit(),
+  ValuePack NSInitValues(BaseConv.getLatRhoInit(),
                          Vector<T, 2>{T{0}, T{0}},
                          T{},
                          Vector<T, 2>{T{0}, T{0}});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
-  BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, NSConv);
+  BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
-  T ns_rho_init = NSConv.getLatRhoInit();
+  T ns_rho_init = BaseConv.getLatRhoInit();
   for (int bid = 0; bid < Geo.getBlockNum(); ++bid) {
     const auto& block = Geo.getBlock(bid);
     const auto& proj = block.getProjection();
@@ -225,13 +239,15 @@ int main(int argc, char* argv[]) {
 
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
-      Geo, PFInitValues, PFConv,
+      Geo, PFInitValues, PhaseConv,
       &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
   T eta_unused = T(0);
   ff::BroadcastAllParams<T>(PFLattice, rho_l, rho_h,
                             eta_unused, eta_unused,
-                            gravity, Beta, Kappa);
+                            gravity,
+                            PhaseConv.getLatticeBeta(),
+                            PhaseConv.getLatticeKappa());
 
   // ===================================================================
   // Initialize phase field
@@ -465,7 +481,7 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner("RTI 2D MRT Calculation Complete!");
   MainWriter.WriteBinary(MainLoopTimer());
   MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
-  Printer::Print("Total PhysTime", NSConv.getPhysTime(MainLoopTimer()));
+  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
   Printer::Endl();
 
   return 0;

@@ -25,22 +25,18 @@ Vector<T, LatSet::d> Bubble_Center;
 // phase field parameters
 T Interface_Width;
 T Mobility;
-T Tau_phi;
-T Omega_phi;
-T Kappa;
-T Beta;
 
 // two-phase parameters
 T rho_l;
 T rho_h;
 T eta_l;
 T eta_h;
-T sigma;
-T gravity;
-T Eo;
-T Re;
-T U_g;       // characteristic lattice velocity
-T Tau_ns;
+T sigma;      // surface tension (lattice units)
+T gravity;    // gravitational acceleration (lattice units)
+T Re;         // Reynolds number
+T Eo;         // Eotvos number
+T U_g;        // CFL reference velocity (lattice units)
+T nu;         // kinematic viscosity (lattice units)
 
 // simulation
 int MaxStep;
@@ -67,52 +63,32 @@ void readParam() {
 
   rho_l = param_reader.getValue<T>("Two_Phase", "rho_l");
   rho_h = param_reader.getValue<T>("Two_Phase", "rho_h");
-  Eo = param_reader.getValue<T>("Two_Phase", "Eo");
   Re = param_reader.getValue<T>("Two_Phase", "Re");
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
+  Eo = param_reader.getValue<T>("Two_Phase", "Eo");
+  T viscosity_ratio = param_reader.getValue<T>("Two_Phase", "viscosity_ratio");
 
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
 
-  // ===== 5-step parameter design =====
-  // Step 1: bubble diameter in lattice units
   T D = T(2.0) * Bubble_Radius;
-
-  // Step 2: characteristic lattice velocity (Ma ~ U_g/cs << 1 for incompressible)
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
-  // validate: U_g should be in [0.02, 0.08] for LBM stability
-  if (U_g < T(0.01) || U_g > T(0.15)) {
-    if (mpi().getRank() == 0) {
-      std::cerr << "[Warning] U_g=" << U_g << " out of [0.01, 0.15] range\n";
-    }
-  }
-
-  // Step 3: gravity from characteristic velocity  g = U_g² / D
-  T g_abs = U_g * U_g / D;
-  gravity = -g_abs;
-
-  // Step 4: kinematic viscosity from Re  ν = U_g * D / Re
-  //         dynamic viscosity  η_h = ν * ρ_h,  η_l = η_h / 10
-  T nu = U_g * D / Re;
-  eta_h = nu * rho_h;
-  eta_l = eta_h / T(10);
-
-  // Step 5: surface tension from Eo  σ = Δρ * g * D² / Eo
   T DeltaRho = rho_h - rho_l;
-  sigma = DeltaRho * g_abs * D * D / Eo;
-
-  // derived from sigma: Eq.(14) β=12σ/W, κ=3Wσ/2
-  Kappa = T(3.0) * Interface_Width * sigma * T(0.5);
-  Beta = T(12.0) * sigma / Interface_Width;
-  Tau_phi = T(0.5) + Mobility / LatSet::cs2;
-  Omega_phi = T(1.0) / Tau_phi;
-
-  // NS relaxation time  τ = 0.5 + ν/cs²
-  Tau_ns = T(0.5) + nu / LatSet::cs2;
-
-  // CFL check: (U_g + cs) * dt / dx
   T cs = std::sqrt(LatSet::cs2);
-  T CFL = U_g + cs;  // dx=1, dt=1 in SimplifiedConverter
+  // --- Dimensionless design: Re, Eo, U_g → g, nu, sigma ---
+  U_g     = param_reader.getValue<T>("Two_Phase", "U_g");
+  T g_abs = U_g * U_g / D;
+  nu      = U_g * D / Re;
+  gravity = -g_abs;
+  sigma   = DeltaRho * g_abs * D * D / Eo;
+  eta_h   = nu * rho_h;
+  eta_l   = eta_h / viscosity_ratio;
+
+  // Derived dimensionless numbers (overwrite globals for converter output)
+  T g_abs_print = std::abs(gravity);
+  Re = U_g * D / nu;
+  Eo = DeltaRho * g_abs_print * D * D / sigma;
+
+  // CFL check
+  T CFL = U_g + cs;
   bool cfl_ok = (CFL < T(1.2));
 
   MPI_RANK(0) {
@@ -120,26 +96,14 @@ void readParam() {
     std::cout << "[Mesh]: " << Ni << "x" << Nj << "  BlockCellLen=" << BlockCellLen << "\n";
     std::cout << "[Bubble]: R=" << Bubble_Radius << " D=" << D
               << "  Center=(" << Bubble_Center[0] << "," << Bubble_Center[1] << ")\n";
-    std::cout << "[Design] Step1: D = " << D << "\n";
-    std::cout << "[Design] Step2: U_g = " << U_g << " (Ma=" << U_g/cs << ")\n";
-    std::cout << "[Design] Step3: g = U_g^2/D = " << gravity << "\n";
-    std::cout << "[Design] Step4: nu = U_g*D/Re = " << nu
-              << "  eta_h = " << eta_h << "  eta_l = " << eta_l << "\n";
-    std::cout << "[Design] Step5: sigma = DeltaRho*g*D^2/Eo = " << sigma << "\n";
-    std::cout << "[Phase]: W=" << Interface_Width << " M=" << Mobility
-              << " beta=" << Beta << " kappa=" << Kappa
-              << " tau_phi=" << Tau_phi << "\n";
-    std::cout << "[Flow]: tau_ns=" << Tau_ns << "  omega=" << (T(1)/Tau_ns)
+    std::cout << "[Params]: nu=" << nu << "  g=" << gravity
+              << "  sigma=" << sigma << "\n";
+    std::cout << "[Params]: rho_l=" << rho_l << "  rho_h=" << rho_h
+              << "  eta_h=" << eta_h << "  eta_l=" << eta_l << "\n";
+    std::cout << "[Ref]:   U_g=" << U_g << " (Ma=" << U_g/cs << ")"
               << "  Re=" << Re << "  Eo=" << Eo << "\n";
     std::cout << "[CFL]: (U_g+cs)*dt/dx = " << CFL
               << (cfl_ok ? "  OK" : "  WARNING: >1.2!") << "\n";
-    std::cout << "[Simulation]: MaxStep=" << MaxStep << "  OutputStep=" << OutputStep << "\n";
-#ifdef _OPENMP
-    std::cout << "[Parallel]: " << Thread_Num << " threads\n";
-#endif
-#ifdef MPI_ENABLED
-    std::cout << "[Parallel]: " << mpi().getSize() << " MPI processes\n";
-#endif
     std::cout << "--------------------------------------------\n";
   }
 
@@ -165,14 +129,41 @@ int main(int argc, char* argv[]) {
   readParam();
 
   // ------------------ define converters ------------------
+  T D = T(2.0) * Bubble_Radius;
+
+  // NS BaseConverter: ConvertFromTimeStep auto-computes Tau_ns = 0.5 + nu/(cs2*dx²)*dt
+  // dx=1, dt=1 (standard LBM), charU=U_g for correct Lattice_charU stability check
   BaseConverter<T> BaseConv(LatSet::cs2);
-  BaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_ns);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), rho_h, D, U_g, nu);
 
-  BaseConverter<T> PFBaseConv(LatSet::cs2);
-  PFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
+  // PhaseFieldConverter: auto-computes beta, kappa, tau_phi, omega_phi
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, sigma);  // tau_phi computed internally
 
-  UnitConvManager<T> ConvManager(&BaseConv);
+  // Register both converters for validation
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
   ConvManager.Check_and_Print();
+
+  // ----- Converter-derived parameters -----
+  T Tau_ns   = BaseConv.getLattice_RT();
+  T Omega_ns = BaseConv.getOMEGA();
+  T Tau_phi  = PhaseConv.getLattice_RT();
+  T Omega_phi = PhaseConv.getOMEGA();
+  T Beta     = PhaseConv.getLatticeBeta();
+  T Kappa    = PhaseConv.getLatticeKappa();
+
+  IF_MPI_RANK(0) {
+    std::cout << "\n=== Converter-Derived Lattice Parameters ===\n";
+    std::cout << "[NS]:  tau=" << Tau_ns   << "  omega=" << Omega_ns << "\n";
+    std::cout << "[PF]:  tau=" << Tau_phi  << "  omega=" << Omega_phi << "\n";
+    std::cout << "[PF]:  W="    << PhaseConv.getLatticeW()
+              << "  M="         << PhaseConv.getLatticeMphi()
+              << "  sigma="     << PhaseConv.getLatticeSigma() << "\n";
+    std::cout << "[PF]:  beta=" << Beta   << "  kappa=" << Kappa << "\n";
+    std::cout << "[Design]: Re=" << Re << "  Eo=" << Eo
+              << "  U_g=" << U_g << "\n";
+    std::cout << "=============================================\n\n";
+  }
 
   // ------------------ define geometry ------------------
   AABB<T, 2> domain(Vector<T, 2>(T(0), T(0)),
@@ -221,7 +212,7 @@ int main(int argc, char* argv[]) {
                          gravity, Beta, Kappa, rho_l, rho_h, eta_l, eta_h);
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
-    Geo, PFInitValues, PFBaseConv, &NSLattice.getField<VELOCITY<T, LatSet::d>>());
+    Geo, PFInitValues, PhaseConv, &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
   // Type B params: broadcast from rank 0 to all ranks (MPI-safe)
   ff::BroadcastAllParams<T>(PFLattice,
@@ -241,7 +232,6 @@ int main(int argc, char* argv[]) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
     auto& blockPhi = phiField.getBlockField(blockid);
-    auto& blockLat = PFLattice.getBlockLat(blockid);
     T voxelSize = block.getVoxelSize();
     int overlap = 0;
     for (int j = overlap; j < block.getNy() - overlap; ++j) {
@@ -320,14 +310,21 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: BGKForce with Force vector field
-  using NSBulkTask = tmp::Key_TypePair<
+  // NS collision: pure BGK formula f* = ω·f_eq + (1-ω)·f + (1-ω/2)·F_source
+  // WriteToField=false: rho/u computed for EDF but NOT stored to fields
+  using NSCollisionTask = tmp::Key_TypePair<
     BulkFlag,
     collision::BGKForce<
-      moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
+      moment::forcerhoU<NSCELL, force::Force<NSCELL>, false>,
       equilibrium::SecondOrder<NSCELL>,
       force::Force<NSCELL>>>;
-  using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
+  using NSCollisionTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSCollisionTask>;
+
+  // NS macro update (after streaming): ρ = Σf_i, u = (Σc·f + 0.5F)/ρ
+  using NSMacroTask = tmp::Key_TypePair<
+    BulkFlag,
+    moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>>;
+  using NSMacroTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSMacroTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
   using FFNormalTask =
@@ -387,14 +384,47 @@ int main(int argc, char* argv[]) {
   
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
+
+  // --- Initialize PF macro quantities (grad, chem potential) for first step ---
+  // Reference: sheardrop2.f90 initHydroMacroVars computes phi, nablaphi, chpoten before loop
+  PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
+  PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
+  PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
+  ff::CommunicateAllSelfFields<T>(PFLattice);
+
   MainWriter.WriteBinary(MainLoopTimer());
 
-  std::cout << "gravity = " << gravity << " kappa = " << Kappa << std::endl;
+  std::cout << "gravity = " << gravity
+            << "  kappa = " << PhaseConv.getLatticeKappa() << std::endl;
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   while (MainLoopTimer() < MaxStep) {
-    // ---- Phase field pre-processing ----
-    // Step 1: Update PHI by summing populations (block iteration, like simpledrop2d)
+    // ---- Phase 1: Force computation (must precede all collision) ----
+    // Reference: sheardrop2.f90 computes ALL forces before collision/stream/macro
+    NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
+    STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
+    GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // ---- Phase 2: Collision (pure BGK formulas, no macro field writes) ----
+    // PF collision: g* = ω·g_eq + (1-ω)·g + source, reads NORMAL and VELOCITY ref
+    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    // NS collision: f* = ω·f_eq + (1-ω)·f + (1-ω/2)·F_source, reads FORCE field
+    NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
+
+    // ---- Phase 3: Streaming (PF first, then NS) ----
+    PF_BB.Apply(MainLoopTimer());
+    PFLattice.Stream();
+    PFLattice.NormalCommunicate();
+
+    NS_BB.Apply(MainLoopTimer());
+    NSLattice.Stream();
+    NSLattice.NormalCommunicate();
+
+    // ---- Phase 4: Macro update (after streaming, half-force correction) ----
+    // NS: ρ = Σf_i,  u = (Σc_i·f_i + 0.5·F) / ρ
+    NSLattice.template ApplyCellDynamics<NSMacroTaskSelector>(FlagFM);
+
+    // PF: φ ← Σg (sum post-stream populations)
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -411,7 +441,6 @@ int main(int argc, char* argv[]) {
             for (unsigned int k = 0; k < LatSet::q; ++k) {
               phi_new += cell[k];
             }
-            // clamp phi to [0, 1] to suppress numerical noise
             if (phi_new < T{0}) phi_new = T{0};
             if (phi_new > T{1}) phi_new = T{1};
             blockPhi.get(id) = phi_new;
@@ -421,46 +450,11 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
+    // PF: ∇φ, ∇²φ, λ (for next step's force and collision source)
     PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
-
-    // NOTE: FFChemPotentialGradient2D (∇λ→NORMAL) is available but NOT used here.
-    // The Allen-Cahn n=∇φ/|∇φ| source + higher ε threshold proves more stable
-    // than the ∇λ-based Cahn-Hilliard source for 2D D2Q9 bubble dynamics.
-    // Uncomment below to switch to CH source if needed:
-    // PFLattice.template ApplyCellDynamics<FFChemPotGradSel>(FlagFM);
-    // PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
-
-    // ---- NS force accumulation ----
-    // Step 3: Clear NS FORCE
-    NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
-
-    // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
-    STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // Step 5: Gravity/buoyancy force F_b → NS FORCE
-    GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
-    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
-    NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
-    NS_BB.Apply(MainLoopTimer());
-    NSLattice.Stream();
-    NSLattice.NormalCommunicate();
-
-    // ---- PF collision and streaming ----
-    // Step 8: PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
-    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
-
-    // Step 9: PF BCs + Stream + Communicate
-    PF_BB.Apply(MainLoopTimer());
-    PFLattice.Stream();
-    PFLattice.NormalCommunicate();
 
     ++MainLoopTimer;
     ++OutputTimer;

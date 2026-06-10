@@ -31,11 +31,7 @@ T Droplet_Velocity_Mag;
 
 // phase field parameters
 T Mobility;          // mobility M
-T Kappa;             // gradient energy coefficient κ
-T Beta;              // double-well potential coefficient β
-T Interface_Width;   // interface width ξ
-T Tau_phi;           // phase field relaxation time τ_φ
-T Omega_phi;         // relaxation frequency ω_φ = 1/τ_φ
+T Interface_Width;   // interface width W
 // numerical parameters
 T epsilon = T(1e-6); // prevent division by zero
 // Simulation settings
@@ -67,13 +63,7 @@ void readParam() {
   // phase field parameters
   Interface_Width = param_reader.getValue<T>("Phase_Field", "Interface_Width");
   Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
-  Kappa = T(3.0) * Interface_Width * 0.072 * T(0.5);
-  Beta = T(12.0) * 0.072 / (Interface_Width);
-
-  T Gamma = Mobility;
-  T cs2 = LatSet::cs2;
-  Tau_phi = T(0.5) + Gamma / cs2;
-  Omega_phi = T(1.0) / Tau_phi;
+  // Beta, Kappa, Tau_phi, Omega_phi will be computed by Converter in main()
   // Simulation settings
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
@@ -82,10 +72,7 @@ void readParam() {
     std::cout << "[Phase Field Parameters]:" << std::endl;
     std::cout << "  Interface Width:  " << Interface_Width << " lu" << std::endl;
     std::cout << "  Mobility:         " << Mobility << std::endl;
-    std::cout << "  Kappa:            " << Kappa << std::endl;
-    std::cout << "  Beta:             " << Beta << std::endl;
-    std::cout << "  Tau_phi:          " << Tau_phi << std::endl;
-    std::cout << "  Omega_phi:        " << Omega_phi << std::endl;
+    std::cout << "  (tau/omega/beta/kappa from Converter in main())" << std::endl;
     std::cout << "[Simulation_Settings]:\n"
               << "  TotalStep:        " << MaxStep << "\n"
               << "  OutputStep:       " << OutputStep << "\n"
@@ -126,31 +113,27 @@ int main(int argc, char* argv[]) {
   
   // 设置全局变量
   Droplet_Velocity_Global = Droplet_Velocity;
-  Beta_Global = Beta;
-  Kappa_Global = Kappa;
   Mobility_Global = Mobility;
-  Omega_phi_Global = Omega_phi;
 
-  BaseConverter<T> dummyConv(LatSet::cs2);
-  dummyConv.Converter(T(1), T(1), T(1), T(Nx), T(1), T(0.1));
-  PhaseFieldConverter<T> phiConv(dummyConv);
-    // 初始化单位转换器
-  dummyConv.ConvertFromRT(
-    1.0,  // deltaX (mm)
-    0.5 + 0.001 / (1.0/3.0),  // 粘性扩散系数
-    1.0,  // rho (g/mm^3)
-    100,  // charL (mm)
-    0.01,  // charU (mm/s)
-    0.001  // VisKine (mm^2/s)
-  );
-  
-  // 初始化相场转换器
-  phiConv.Converter(
-    4.0, // W (mm)
-    0.01,        // Mphi (dimensionless)
-    0.072       // σ (mN/mm)
-  );
-  
+  T sigma_lat = T(0.072);
+  BaseConverter<T> BaseConv(LatSet::cs2);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), T(1), T(Nx), T(1), T(0.1));
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, sigma_lat);
+
+  Beta_Global = PhaseConv.getLatticeBeta();
+  Kappa_Global = PhaseConv.getLatticeKappa();
+  Omega_phi_Global = PhaseConv.getOMEGA();
+
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
+  ConvManager.Check_and_Print();
+
+  MPI_RANK(0) {
+    std::cout << "  [Converter]: tau_phi=" << PhaseConv.getLattice_RT()
+              << "  omega=" << PhaseConv.getOMEGA()
+              << "  beta=" << PhaseConv.getLatticeBeta()
+              << "  kappa=" << PhaseConv.getLatticeKappa() << std::endl;
+  }
 
   // ------------------ define geometry -----------------
   // 使用周期性边界条件
@@ -212,7 +195,7 @@ int main(int argc, char* argv[]) {
   ValuePack InitValues(T{}, T{}, T{}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, T{});
   
   // 创建格子
-  BlockLatticeManager<T, LatSet, FIELDS> DropletLattice(Geo, InitValues, dummyConv);
+  BlockLatticeManager<T, LatSet, FIELDS> DropletLattice(Geo, InitValues, PhaseConv);
 
   DropletLattice.getField<VELOCITY<T, LatSet::d>>().forEach(
     domain, FlagFM, BulkFlag,
@@ -354,7 +337,7 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Simple 3D Droplet Simulation Complete!"));
   MainWriter.WriteBinary(MainLoopTimer());
   MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
-  Printer::Print("Total PhysTime", dummyConv.getPhysTime(MainLoopTimer()));
+  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
   Printer::Endl();
 
 

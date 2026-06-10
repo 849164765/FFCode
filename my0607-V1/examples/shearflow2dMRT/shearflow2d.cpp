@@ -36,18 +36,12 @@ T Shear_Rate;              // gamma = 2*U_wall/H
 // fluid parameters
 T rho0;
 T nu;
-T Tau_ns;
-T Omega_ns;
 T Viscosity_Ratio;
 
 // phase field parameters
 T Interface_Width;
 T sigma;
 T Mobility;
-T Tau_phi;
-T Omega_phi;
-T Kappa;
-T Beta;
 
 // simulation control
 int MaxStep;
@@ -80,16 +74,6 @@ void readParam() {
   sigma = param_reader.getValue<T>("Phase_Field", "Surface_Tension");
   Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
 
-  // Phase field: sigma → κ = 1.5*W*σ, β = 12*σ/W
-  Kappa = T(1.5) * Interface_Width * sigma;
-  Beta = T(12.0) * sigma / Interface_Width;
-
-  // Relaxation times
-  Tau_ns = T(0.5) + nu / LatSet::cs2;
-  Omega_ns = T(1.0) / Tau_ns;
-  Tau_phi = T(0.5) + Mobility / LatSet::cs2;
-  Omega_phi = T(1.0) / Tau_phi;
-
   // Dimensionless numbers
   Ca = rho0 * nu * Shear_Rate * Droplet_Radius / sigma;
   Re = rho0 * Shear_Rate * Droplet_Radius * Droplet_Radius / nu;
@@ -107,11 +91,10 @@ void readParam() {
               << "[Shear]: U_wall=" << Wall_Velocity
               << "  gamma=" << Shear_Rate
               << "  Ma=" << Ma << "\n"
-              << "[Fluid]: rho=" << rho0 << "  nu=" << nu
-              << "  tau_ns=" << Tau_ns << "  omega_ns=" << Omega_ns << "\n"
+              << "[Fluid]: rho=" << rho0 << "  nu=" << nu << "\n"
               << "[Phase]: W=" << Interface_Width << "  sigma=" << sigma
-              << "  M=" << Mobility << "  tau_phi=" << Tau_phi
-              << "\n  kappa=" << Kappa << "  beta=" << Beta << "\n"
+              << "  M=" << Mobility << "\n"
+              << " (Converter-derived tau/beta/kappa printed in main())\n"
               << "[Dimensionless]: Ca=" << Ca << "  Re=" << Re << "\n"
               << "[Simulation]: MaxStep=" << MaxStep
               << "  OutputStep=" << OutputStep << "\n";
@@ -145,16 +128,38 @@ int main(int argc, char* argv[]) {
   readParam();
 
   // ===================================================================
-  // Converters
+  // Converters (lattice units: dx=1, dt=1)
+  // ConvertFromTimeStep auto-computes Tau_ns = 0.5 + nu/(cs2*dx²)*dt
+  // PhaseFieldConverter auto-computes beta, kappa, tau_phi, omega_phi
   // ===================================================================
-  BaseConverter<T> NSConv(LatSet::cs2);
-  NSConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_ns);
+  BaseConverter<T> BaseConv(LatSet::cs2);
+  BaseConv.ConvertFromTimeStep(T(1), T(1), T(1), T(Ni), Wall_Velocity, nu);
 
-  BaseConverter<T> PFConv(LatSet::cs2);
-  PFConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
+  PhaseFieldConverter<T> PhaseConv(BaseConv, LatSet::cs2);
+  PhaseConv.fromLattice(Interface_Width, Mobility, sigma);  // tau_phi computed internally
 
-  UnitConvManager<T> ConvManager(&NSConv);
+  // Register both converters for validation
+  UnitConvManager<T> ConvManager(&BaseConv, &PhaseConv);
   ConvManager.Check_and_Print();
+
+  // ----- Converter-derived parameters -----
+  T Tau_ns   = BaseConv.getLattice_RT();
+  T Omega_ns = BaseConv.getOMEGA();
+  T Tau_phi  = PhaseConv.getLattice_RT();
+  T Omega_phi = PhaseConv.getOMEGA();
+  T Beta     = PhaseConv.getLatticeBeta();
+  T Kappa    = PhaseConv.getLatticeKappa();
+
+  MPI_RANK(0) {
+    std::cout << "\n=== Converter-Derived Lattice Parameters ===\n";
+    std::cout << "[NS]:  tau=" << Tau_ns   << "  omega=" << Omega_ns << "\n";
+    std::cout << "[PF]:  tau=" << Tau_phi  << "  omega=" << Omega_phi << "\n";
+    std::cout << "[PF]:  W="    << PhaseConv.getLatticeW()
+              << "  M="         << PhaseConv.getLatticeMphi()
+              << "  sigma="     << PhaseConv.getLatticeSigma() << "\n";
+    std::cout << "[PF]:  beta=" << Beta   << "  kappa=" << Kappa << "\n";
+    std::cout << "==========================================\n\n";
+  }
 
   // ===================================================================
   // Geometry: domain + periodic ghosts (left/right)
@@ -203,12 +208,12 @@ int main(int argc, char* argv[]) {
   // ===================================================================
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
                             FORCE<T, LatSet::d>>;
-  ValuePack NSInitValues(NSConv.getLatRhoInit(),
+  ValuePack NSInitValues(BaseConv.getLatRhoInit(),
                          Vector<T, 2>{T{0}, T{0}},
                          T{},
                          Vector<T, 2>{T{0}, T{0}});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
-  BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, NSConv);
+  BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
   // ===================================================================
   // PF Lattice (Cahn-Hilliard)
@@ -229,7 +234,7 @@ int main(int argc, char* argv[]) {
 
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
-      Geo, PFInitValues, PFConv,
+      Geo, PFInitValues, PhaseConv,
       &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
   // Broadcast phase-field parameters (rho_l=rho_h=rho0 for Boussinesq)
@@ -237,7 +242,9 @@ int main(int argc, char* argv[]) {
   T eta_unused = nu * rho0;  // uniform viscosity for now
   ff::BroadcastAllParams<T>(PFLattice, rho0, rho0,
                             eta_unused, eta_unused,
-                            gravity_zero, Beta, Kappa);
+                            gravity_zero,
+                            PhaseConv.getLatticeBeta(),
+                            PhaseConv.getLatticeKappa());
 
   // ===================================================================
   // Initialize phase field: circular droplet, phi=1 inside, 0 outside
@@ -293,7 +300,7 @@ int main(int argc, char* argv[]) {
   //   u_x(y) = U_wall * (2*y/H - 1)
   //   Populations: equilibrium with this velocity
   // ===================================================================
-  T ns_rho_init = NSConv.getLatRhoInit();
+  T ns_rho_init = BaseConv.getLatRhoInit();
   auto& nsVelField = NSLattice.getField<VELOCITY<T, 2>>();
 
   for (int bid = 0; bid < Geo.getBlockNum(); ++bid) {
@@ -576,7 +583,7 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner("Shear Flow Droplet Simulation Complete!");
   MainWriter.WriteBinary(MainLoopTimer());
   MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
-  Printer::Print("Total PhysTime", NSConv.getPhysTime(MainLoopTimer()));
+  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
   Printer::Endl();
 
   return 0;
