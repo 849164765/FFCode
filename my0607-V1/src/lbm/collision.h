@@ -35,7 +35,7 @@ struct BGK {
 
 };
 
-template <typename MomentaScheme, typename EquilibriumScheme, typename ForceScheme>
+template <typename EquilibriumScheme, typename ForceScheme>
 struct BGKForce {
   using CELL = typename EquilibriumScheme::CELLTYPE;
   using T = typename CELL::FloatType;
@@ -44,21 +44,26 @@ struct BGKForce {
   using GenericRho = typename CELL::GenericRho;
 
   __any__ static void apply(CELL& cell) {
-    // update macroscopic variables
-    T rho{};
-    Vector<T, LatSet::d> u{};
+    T rho = cell.template get<GenericRho>();
+    Vector<T, LatSet::d> u = cell.template get<VELOCITY<T, LatSet::d>>();
     const auto force = ForceScheme::getForce(cell);
-    MomentaScheme::apply(cell, force, rho, u);
     // compute force term
     std::array<T, LatSet::q> fi{};
     ForceScheme::apply(u, force, fi);
     // equilibrium distribution function
     std::array<T, LatSet::q> feq{};
     EquilibriumScheme::apply(feq, rho, u);
-    // BGK collision
-    const T omega = cell.getOmega();
-    const T _omega = cell.get_Omega();
-    const T fomega = cell.getfOmega();
+    // BGK collision: per-cell omega for variable viscosity, block-level fallback
+    T omega, _omega, fomega;
+    if constexpr (CELL::template hasField<OMEGA<T>>()) {
+      omega = cell.template get<OMEGA<T>>();
+      _omega = T(1) - omega;
+      fomega = T(1) - T(0.5) * omega;
+    } else {
+      omega = cell.getOmega();
+      _omega = cell.get_Omega();
+      fomega = cell.getfOmega();
+    }
 
     for (unsigned int i = 0; i < LatSet::q; ++i) {
       cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];

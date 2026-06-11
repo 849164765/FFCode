@@ -171,6 +171,9 @@ int main(int argc, char* argv[]) {
   BaseConverter<T> PFBaseConv(LatSet::cs2);
   PFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
 
+  PhaseFieldConverter<T> PFConv(BaseConv);
+  PFConv.Converter(Interface_Width, Mobility, sigma);
+
   UnitConvManager<T> ConvManager(&BaseConv);
   ConvManager.Check_and_Print();
 
@@ -201,9 +204,9 @@ int main(int argc, char* argv[]) {
   // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
   // Actual density variation enters via the FORCE field
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>>;
+                            FORCE<T, LatSet::d>, OMEGA<T>, PRESSURE<T>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, T(1) / Tau_ns, T{});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -234,7 +237,7 @@ int main(int argc, char* argv[]) {
   T R_phys = Bubble_Radius * Cell_Len;
   T xc_phys = Bubble_Center[0] * Cell_Len;
   T yc_phys = Bubble_Center[1] * Cell_Len;
-  T W_phys = Interface_Width * Cell_Len;
+  T W_phys = PFConv.getLatticeW();
 
   auto& phiField = PFLattice.getField<PHI<T>>();
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -324,10 +327,17 @@ int main(int argc, char* argv[]) {
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
     collision::BGKForce<
-      moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
       equilibrium::SecondOrder<NSCELL>,
       force::Force<NSCELL>>>;
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
+  using NSUupdate = tmp::Key_TypePair<
+    BulkFlag,
+    moment::forcerhoU<NSCELL,force::Force<NSCELL>,true>>;
+  using NSUupdateSelector = TaskSelector<std::uint8_t, NSCELL, NSUupdate>;
+  // pressure: p = cs2 * rho (computed after rho update)
+  using NSPressureTask = tmp::Key_TypePair<BulkFlag,
+    moment::PressureFromRho<NSCELL,true>>;
+  using NSPressureTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSPressureTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
   using FFNormalTask =
@@ -368,6 +378,17 @@ int main(int argc, char* argv[]) {
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravForceTask>;
   BlockLatManagerCoupling GravCoupling(PFLattice, NSLattice);
 
+  using PressForceTask=
+    tmp::Key_TypePair<BulkFlag, ff::FFPressForce2D<PFCELL, NSCELL>>;
+  using PressForceTaskSelector=
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PressForceTask>;
+  BlockLatManagerCoupling PressCoupling(PFLattice, NSLattice);
+
+  using FFRhoOmegaUpdateTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFRhoOmegaUpdate2D<PFCELL, NSCELL>>;
+  using FFRhoOmegaUpdateSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, FFRhoOmegaUpdateTask>;
+  BlockLatManagerCoupling FFRhoOmegaUpdateCoupling(PFLattice, NSLattice);
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
@@ -375,10 +396,11 @@ int main(int argc, char* argv[]) {
   vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
   vtmo::ScalarWriter RhoWriter("Rho", NSLattice.getField<RHO<T>>());
   vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
+  vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
   MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, RhoWriter, ForceWriter);
+                          VecWriter, RhoWriter, ForceWriter, PressureWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
@@ -444,6 +466,9 @@ int main(int argc, char* argv[]) {
     // Step 5: Gravity/buoyancy force F_b → NS FORCE
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
+    // Step 6: Pressure force F_p → NS FORCE
+    PressCoupling.ApplyCellDynamics<PressForceTaskSelector>(MainLoopTimer(), FlagFM);
+
     // ---- NS collision and streaming ----
     // Step 6: NS BGKForce collision
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
@@ -462,6 +487,12 @@ int main(int argc, char* argv[]) {
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
 
+    FFRhoOmegaUpdateCoupling.ApplyCellDynamics<FFRhoOmegaUpdateSelector>(MainLoopTimer(), FlagFM);
+    //更新速度和密度
+    NSLattice.template ApplyCellDynamics<NSUupdateSelector>(FlagFM);
+    // 更新压力
+    NSLattice.template ApplyCellDynamics<NSPressureTaskSelector>(FlagFM);
+
     ++MainLoopTimer;
     ++OutputTimer;
 
@@ -470,6 +501,7 @@ int main(int argc, char* argv[]) {
       PFLattice.getField<PHI<T>>().Communicate();
       NSLattice.getField<VELOCITY<T, 2>>().Communicate();
       NSLattice.getField<RHO<T>>().Communicate();
+      NSLattice.getField<PRESSURE<T>>().Communicate();
 
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();

@@ -132,6 +132,59 @@ __any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
   ns_cell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_h) * g;
 }
 
+
+template <typename PFCELL, typename NSCELL>
+__any__ void FFPressForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T press = ns_cell.template get<PRESSURE<T>>();
+  T rho = ns_cell.template get<typename NSCELL::GenericRho>();
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+  const Vector<T, LatSet::d>& grad = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T temp = -press * (rho_h - rho_l)  / rho; // F = -∇p/ρ, grad is ∇p
+
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += temp * grad[0];
+  ns_force[1] += temp * grad[1];
+}
+
+template <typename PFCELL, typename NSCELL>
+__any__ void FFVisForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T dux_dx = T{};
+  T dux_dy = T{};
+  T duy_dx = T{};
+  T duy_dy = T{};
+  T dphi_dx = T{};
+  T dphi_dy = T{};
+  for (unsigned int i = 1; i < LatSet::q; ++i) {
+    const auto& ci = latset::c<LatSet>(i);
+    T wi = latset::w<LatSet>(i);
+    T ux_i = ns_cell.getNeighbor(i).template get<VELOCITY<T, LatSet::d>>()[0];
+    T uy_i = ns_cell.getNeighbor(i).template get<VELOCITY<T, LatSet::d>>()[1];
+    T phi_i = pf_cell.getNeighbor(i).template get<typename PFCELL::GenericRho>();
+    dux_dx += wi * ci[0] * ux_i;
+    dux_dy += wi * ci[1] * ux_i;
+    duy_dx += wi * ci[0] * uy_i;
+    duy_dy += wi * ci[1] * uy_i;
+    dphi_dx += wi * ci[0] * phi_i;
+    dphi_dy += wi * ci[1] * phi_i;
+  }
+  dux_dx /= LatSet::cs2;
+  dux_dy /= LatSet::cs2;
+  duy_dx /= LatSet::cs2;
+  duy_dy /= LatSet::cs2;
+  dphi_dx /= LatSet::cs2;
+  dphi_dy /= LatSet::cs2;
+  T omega = ns_cell.template get<OMEGA<T>>();                         
+  T nu = LatSet::cs2 * (T(1) / omega - T(0.5));
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += nu * (rho_h - rho_l) * (dux_dx * dphi_dx + (dux_dy + duy_dx) * dphi_dy);
+  ns_force[1] += nu * (rho_h - rho_l) * (duy_dx * dphi_dx + (duy_dx + dux_dy) * dphi_dy);
+
+}
+
 // ---- FFRhoOmegaUpdate2D ----
 // WARNING: Cell::getOmega() returns the block-level scalar (from converter),
 // NOT the per-cell OMEGA<T> field. So per-cell omega updates have NO effect on

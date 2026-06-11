@@ -642,6 +642,23 @@ struct shearRateMag {
 };
 
 
+// Pressure from density: p = cs^2 * rho
+// WriteToField=true writes to PRESSURE<T> field
+template <typename CELLTYPE, bool WriteToField = false>
+struct PressureFromRho {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static void apply(CELL& cell) {
+    T rho = cell.template get<RHO<T>>();
+    T momentTemp = {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) momentTemp += cell[i];
+    T pressure = LatSet::cs2 * rho * momentTemp;
+    if constexpr (WriteToField) cell.template get<PRESSURE<T>>() = pressure;
+  }
+};
+
 // a tuple containing multiple momenta
 template <typename... Momenta>
 struct MomentaTuple {

@@ -133,6 +133,19 @@ struct FFGravityForce2D {
 };
 
 template <typename PFCELL, typename NSCELL>
+struct FFVisForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL, typename NSCELL>
+struct FFPressForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+template <typename PFCELL, typename NSCELL>
 struct FFRhoOmegaUpdate2D {
   using T = typename PFCELL::FloatType;
   using LatSet = typename NSCELL::LatticeSet;

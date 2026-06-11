@@ -139,6 +139,7 @@ using PopulationField = GenericFieldBase<CyclicArray<T>, q>;
 
 // specific field name for access by Cell interface, not alias
 struct RHOBase : public FieldBase<1> {};
+struct PRESSUREBase : public FieldBase<1> {};
 struct TEMPBase : public FieldBase<1> {};
 struct CONCBase : public FieldBase<1> {};
 struct PHIBase : public FieldBase<1> {};
@@ -180,6 +181,8 @@ namespace cudev {
 #ifdef __CUDACC__
 template <typename T>
 using RHO = GenericField<GenericArray<T>, RHOBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
 template <typename T>
 using TEMP = GenericField<GenericArray<T>, TEMPBase>;
 template <typename T>
@@ -253,6 +256,8 @@ using PL_m = Data<T, PL_mBase>;
 
 template <typename T>
 using RHO = GenericField<GenericArray<T>, RHOBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
 template <typename T>
 using TEMP = GenericField<GenericArray<T>, TEMPBase>;
 template <typename T>
