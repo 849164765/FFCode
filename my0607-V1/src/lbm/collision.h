@@ -312,6 +312,50 @@ struct BGKSource {
   }
 };
 
+// Velocity-based BGK collision for NS momentum lattice.
+// Uses paper Eq.(31) equilibrium with p/(ρcs²) as zeroth moment.
+// Eq.(35) and Eq.(36) macro updates are handled separately.
+// Force discretization reuses Guo scheme (identical to paper Eq.(32)).
+template <typename EquilibriumScheme, typename ForceScheme>
+struct BGKVelocityBased {
+  using CELL = typename EquilibriumScheme::CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using equilibriumscheme = EquilibriumScheme;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static void apply(CELL& cell) {
+    T p = cell.template get<PRESSURE<T>>();
+    T rho = cell.template get<GenericRho>();
+    Vector<T, LatSet::d> u = cell.template get<VELOCITY<T, LatSet::d>>();
+    const auto force = ForceScheme::getForce(cell);
+
+    // Force term via Guo scheme (Eq.32)
+    std::array<T, LatSet::q> Fi{};
+    ForceScheme::apply(u, force, Fi);
+
+    // Velocity-based equilibrium (Eq.31)
+    std::array<T, LatSet::q> feq{};
+    EquilibriumScheme::apply(feq, p, rho, u);
+
+    // BGK collision with per-cell omega for variable viscosity
+    T omega, _omega, fomega;
+    if constexpr (CELL::template hasField<OMEGA<T>>()) {
+      omega = cell.template get<OMEGA<T>>();
+      _omega = T(1) - omega;
+      fomega = T(1) - T(0.5) * omega;
+    } else {
+      omega = cell.getOmega();
+      _omega = cell.get_Omega();
+      fomega = cell.getfOmega();
+    }
+
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      cell[i] = omega * feq[i] + _omega * cell[i] + fomega * Fi[i];
+    }
+  }
+};
+
 }  // namespace collision
 
 // old version of BGK collision

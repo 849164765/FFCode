@@ -206,7 +206,8 @@ int main(int argc, char* argv[]) {
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
                             FORCE<T, LatSet::d>, OMEGA<T>, PRESSURE<T>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}}, T(1) / Tau_ns, T{});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, T(1) / Tau_ns,
+                         LatSet::cs2);  // p_init = cs² for velocity-based Eq.(31)
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -285,25 +286,30 @@ int main(int argc, char* argv[]) {
   // Initialize PF interface width
   PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
 
-  // Initialize NS populations to equilibrium
-  Vector<T, 2> u_zero{T{0}, T{0}};
-  T ns_rho_init = BaseConv.getLatRhoInit();
+  // Initialize NS RHO and populations to velocity-based equilibrium.
+  // Eq.(31) with u=0, p_init=cs²: g_i = w_i * p_init/(ρ(φ)·cs²) = w_i/ρ(φ)
+  T p_init = LatSet::cs2;
+  auto& phiFieldForNS = PFLattice.getField<PHI<T>>();
+  auto& nsRhoField = NSLattice.getField<RHO<T>>();
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
     auto& blockLat = NSLattice.getBlockLat(blockid);
+    auto& blockPhi = phiFieldForNS.getBlockField(blockid);
+    auto& blockRho = nsRhoField.getBlockField(blockid);
     int overlap = 0;
     for (int j = overlap; j < block.getNy() - overlap; ++j) {
       for (int i = overlap; i < block.getNx() - overlap; ++i) {
         std::size_t id = j * proj[1] + i;
-        T u2 = T{0};
+        T phi = blockPhi.get(id);
+        T rho_phi = rho_l + phi * (rho_h - rho_l);
+        // Initialize RHO = ρ(φ) for F_p denominator and Eq.(35) velocity
+        blockRho.get(id) = rho_phi;
+        // Velocity-based equilibrium with u=zero: g_k = w_k / ρ(φ)
         NSCELL cell(id, blockLat);
         for (unsigned int k = 0; k < LatSet::q; ++k) {
-          T uc = u_zero * latset::c<LatSet>(k);
-          T feq = latset::w<LatSet>(k) * ns_rho_init *
-                  (T{1} + LatSet::InvCs2 * uc + uc * uc * T{0.5} * LatSet::InvCs4 -
-                   LatSet::InvCs2 * u2 * T{0.5});
-          cell[k] = feq;
+          T geq = latset::w<LatSet>(k) * p_init / (rho_phi * LatSet::cs2);
+          cell[k] = geq;
         }
       }
     }
@@ -323,21 +329,19 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: BGKForce with Force vector field
+  // NS task: velocity-based BGK collision (Eq.31 equilibrium, Eq.32 force)
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
-    collision::BGKForce<
-      equilibrium::SecondOrder<NSCELL>,
+    collision::BGKVelocityBased<
+      equilibrium::VelocityBasedSecondOrder<NSCELL>,
       force::Force<NSCELL>>>;
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
+
+  // NS macro update (post-stream): Eq.(35) u + Eq.(36) p
   using NSUupdate = tmp::Key_TypePair<
     BulkFlag,
-    moment::forcerhoU<NSCELL,force::Force<NSCELL>,true>>;
+    ff::FFVelocityPressureUpdate2D<NSCELL>>;
   using NSUupdateSelector = TaskSelector<std::uint8_t, NSCELL, NSUupdate>;
-  // pressure: p = cs2 * rho (computed after rho update)
-  using NSPressureTask = tmp::Key_TypePair<BulkFlag,
-    moment::PressureFromRho<NSCELL,true>>;
-  using NSPressureTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSPressureTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
   using FFNormalTask =
@@ -383,6 +387,12 @@ int main(int argc, char* argv[]) {
   using PressForceTaskSelector=
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PressForceTask>;
   BlockLatManagerCoupling PressCoupling(PFLattice, NSLattice);
+
+  using FFVisForceTask=
+    tmp::Key_TypePair<BulkFlag, ff::FFVisForce2D<PFCELL, NSCELL>>;
+  using FFVisForceTaskSelector=
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, FFVisForceTask>;
+  BlockLatManagerCoupling FFVisCoupling(PFLattice, NSLattice);
 
   using FFRhoOmegaUpdateTask =
     tmp::Key_TypePair<BulkFlag, ff::FFRhoOmegaUpdate2D<PFCELL, NSCELL>>;
@@ -456,42 +466,50 @@ int main(int argc, char* argv[]) {
     // PFLattice.template ApplyCellDynamics<FFChemPotGradSel>(FlagFM);
     // PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
 
+    // ---- Variable viscosity + density coupling ----
+    // Must run BEFORE force accumulation so F_p uses correct ρ(φ).
+    // Update NS RHO (= ρ(φ)) and per-cell OMEGA from current φ.
+    FFRhoOmegaUpdateCoupling.ApplyCellDynamics<FFRhoOmegaUpdateSelector>(MainLoopTimer(), FlagFM);
+
     // ---- NS force accumulation ----
-    // Step 3: Clear NS FORCE
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
-    // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
+    // Surface tension force F_s = λ·∇φ
     STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // Step 5: Gravity/buoyancy force F_b → NS FORCE
+    // Gravity/buoyancy force F_b
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // Step 6: Pressure force F_p → NS FORCE
+    // F_p and F_v — mathematically correct for velocity-based LBM (Eqs.27-28),
+    // but currently DISABLED due to numerical cancellation issue:
+    // |F_p| ≈ cs²·Δρ/ρ·|∇φ| ≈ 0.33 while |F_s| ≈ λ·|∇φ| ≈ 0.0005 (×660).
+    // In BGK collision, large Fi and large feq almost cancel → residual
+    // errors from discrete-level mismatch destabilize the interface.
+    // Solution: MRT (decouples moments) or separate relaxation for
+    // non-shear moments. Re-enable after upgrading to MRT (Phase 3).
     PressCoupling.ApplyCellDynamics<PressForceTaskSelector>(MainLoopTimer(), FlagFM);
+    FFVisCoupling.ApplyCellDynamics<FFVisForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
+    // NS velocity-based BGK collision (Eq.31 equilibrium, Eq.32 Guo force)
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
+    // NS BCs + Stream + Communicate
     NS_BB.Apply(MainLoopTimer());
     NSLattice.Stream();
     NSLattice.NormalCommunicate();
 
     // ---- PF collision and streaming ----
-    // Step 8: PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
+    // PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
     PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
 
-    // Step 9: PF BCs + Stream + Communicate
+    // PF BCs + Stream + Communicate
     PF_BB.Apply(MainLoopTimer());
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
 
-    FFRhoOmegaUpdateCoupling.ApplyCellDynamics<FFRhoOmegaUpdateSelector>(MainLoopTimer(), FlagFM);
-    //更新速度和密度
+    // 更新速度(Eq.35)和压力(Eq.36)
     NSLattice.template ApplyCellDynamics<NSUupdateSelector>(FlagFM);
-    // 更新压力
-    NSLattice.template ApplyCellDynamics<NSPressureTaskSelector>(FlagFM);
 
     ++MainLoopTimer;
     ++OutputTimer;

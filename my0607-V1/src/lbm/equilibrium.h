@@ -189,4 +189,37 @@ struct PhaseFieldEquilibrium {
 
 
 
+// Velocity-based second-order equilibrium for NS momentum lattice.
+// Eq.(31): g_eq^α = ω_α [p/(ρc_s^2) + e_α·u/c_s^2 + (e_α·u)^2/(2c_s^4) - u^2/(2c_s^2)]
+// Matches the paper's velocity-based LB formulation (Guo et al., 2025).
+// Reads p from PRESSURE<T> field and ρ from GenericRho (= ρ(φ)).
+template <typename CELL>
+struct VelocityBasedSecondOrder {
+  using CELLTYPE = CELL;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline void apply(std::array<T, LatSet::q> &feq,
+                                   T p, T rho,
+                                   const Vector<T, LatSet::d> &u) {
+    T p_rho_cs2 = p / (rho * LatSet::cs2);  // p/(ρcs²)
+    T u2 = u * u;
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      T uc = latset::c<LatSet>(k) * u;
+      feq[k] = latset::w<LatSet>(k) *
+               (p_rho_cs2 + uc * LatSet::InvCs2 +
+                uc * uc * T{0.5} * LatSet::InvCs4 -
+                u2 * T{0.5} * LatSet::InvCs2);
+    }
+  }
+
+  // Convenience overload: reads p, ρ, u from cell fields
+  __any__ static inline void apply(std::array<T, LatSet::q> &feq,
+                                   const CELL &cell) {
+    apply(feq, cell.template get<PRESSURE<T>>(),
+          cell.template get<typename CELL::GenericRho>(),
+          cell.template get<VELOCITY<T, LatSet::d>>());
+  }
+};
+
 }  // namespace equilibrium

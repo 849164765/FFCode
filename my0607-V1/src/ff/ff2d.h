@@ -152,6 +152,19 @@ struct FFRhoOmegaUpdate2D {
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
 
+// Velocity-based macro update for NS lattice (single-cell functor).
+// Eq.(35): u = Σ c_α g_α + dt/(2ρ)·F_total   (dt=1 in lattice units)
+// Eq.(36): p = ρ c_s^2 Σ g_α
+// Reads: POP (post-stream distributions), FORCE, RHO (= ρ(φ))
+// Writes: VELOCITY, PRESSURE
+// Does NOT write RHO — it remains ρ(φ) from FFRhoOmegaUpdate.
+template <typename CELL>
+struct FFVelocityPressureUpdate2D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  __any__ static void apply(CELL& cell);
+};
+
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())

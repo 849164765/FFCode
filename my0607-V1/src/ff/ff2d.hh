@@ -123,6 +123,7 @@ __any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
 
   // g is negative (downward), so |g| = -g
   T rho = rho_l + phi * (rho_h - rho_l);
+
   // F_b in y-direction. Gravity points downward (negative y).
   // Since g is negative: buoyancy = rho*g (negative * negative = positive upward force if rho_l < rho_h)
   // Wait: F_b = ρ * G_y where G_y is the gravitational acceleration.
@@ -180,18 +181,17 @@ __any__ void FFVisForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cel
   T rho_l = pf_cell.template get<RHO_L<T>>();
 
   auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
-  ns_force[0] += nu * (rho_h - rho_l) * (dux_dx * dphi_dx + (dux_dy + duy_dx) * dphi_dy);
-  ns_force[1] += nu * (rho_h - rho_l) * (duy_dx * dphi_dx + (duy_dx + dux_dy) * dphi_dy);
+  // Eq.(27): F_ν = ν (∇u + u∇) · ∇ρ
+  // F_ν,x = ν(ρ_h-ρ_l) · [2·∂_xu_x·∂_xφ + (∂_yu_x+∂_xu_y)·∂_yφ]
+  ns_force[0] += nu * (rho_h - rho_l) * (T{2} * dux_dx * dphi_dx + (dux_dy + duy_dx) * dphi_dy);
+  ns_force[1] += nu * (rho_h - rho_l) * (T{2} * duy_dy * dphi_dy + (duy_dx + dux_dy) * dphi_dx);
 
 }
 
 // ---- FFRhoOmegaUpdate2D ----
-// WARNING: Cell::getOmega() returns the block-level scalar (from converter),
-// NOT the per-cell OMEGA<T> field. So per-cell omega updates have NO effect on
-// the collision. For variable viscosity, modify the collision operator to call
-// getOmegaf() instead of getOmega(). See src/data_struct/cell.h:168.
-//
-// ρ = ρ_l + φ*(ρ_h - ρ_l)
+// For velocity-based LBM: interpolates ρ(φ) and ν(φ) from PF φ field.
+// Writes: NS RHO = ρ_l + φ*(ρ_h-ρ_l) — used in Eq.(35) u = Σge + F/(2ρ)
+//         NS OMEGA = 1/(0.5 + ν/cs²) — per-cell variable viscosity in BGK collision.
 // ν = η/ρ, τ = 0.5 + ν/cs², omega = 1/τ
 template <typename PFCELL, typename NSCELL>
 __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
@@ -201,7 +201,7 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T eta_l = pf_cell.template get<ETA_L<T>>();
   T eta_h = pf_cell.template get<ETA_H<T>>();
 
-  // Interpolate rho
+  // Interpolate rho and write to NS field (for Eq.35 denominator)
   T rho = rho_l + phi * (rho_h - rho_l);
   ns_cell.template get<typename NSCELL::GenericRho>() = rho;
 
@@ -217,6 +217,38 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   if (omega < T{0.01}) omega = T{0.01};
 
   ns_cell.template get<OMEGA<T>>() = omega;
+}
+
+// ---- FFVelocityPressureUpdate2D ----
+// Velocity-based NS macro update from post-stream populations.
+// Eq.(35): u = Σ e_α g_α + F/(2ρ)    (ρ = ρ(φ) from RHO field)
+// Eq.(36): p = ρ c_s^2 Σ g_α
+// Reads: POP (post-stream), FORCE, RHO (= ρ(φ))
+// Writes: VELOCITY, PRESSURE.  Does NOT touch RHO.
+template <typename CELL>
+__any__ void FFVelocityPressureUpdate2D<CELL>::apply(CELL& cell) {
+  T g_sum = T{};
+  Vector<T, LatSet::d> momentum{};
+  for (unsigned int k = 0; k < LatSet::q; ++k) {
+    T gk = cell[k];
+    g_sum += gk;
+    const auto& ck = latset::c<LatSet>(k);
+    for (unsigned int d = 0; d < LatSet::d; ++d) {
+      momentum[d] += gk * static_cast<T>(ck[d]);
+    }
+  }
+  const auto& force = cell.template get<FORCE<T, LatSet::d>>();
+  T rho = cell.template get<typename CELL::GenericRho>();  // ρ(φ)
+
+  // Eq.(35): u = Σ e_α g_α + F/(2ρ) — momentum IS already velocity,
+  // only the force correction gets divided by ρ.
+  auto& vel = cell.template get<VELOCITY<T, LatSet::d>>();
+  for (unsigned int d = 0; d < LatSet::d; ++d) {
+    vel[d] = momentum[d] + force[d] * T{0.5} / rho;
+  }
+
+  // Eq.(36): p = ρ c_s^2 Σ g_α
+  cell.template get<PRESSURE<T>>() = rho * LatSet::cs2 * g_sum;
 }
 
 }  // namespace ff
