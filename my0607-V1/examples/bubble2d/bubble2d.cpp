@@ -320,53 +320,7 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: BGKForce with Force vector field
-  using NSBulkTask = tmp::Key_TypePair<
-    BulkFlag,
-    collision::BGKForce<
-      moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
-      equilibrium::SecondOrder<NSCELL>,
-      force::Force<NSCELL>>>;
-  using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
-
-  // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
-  using FFNormalTask =
-    tmp::Key_TypePair<BulkFlag, ff::FF2D<PFCELL>>;
-  using FFLaplacianTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFLaplacian2D<PFCELL>>;
-  using FFChemPotTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFChemPotential2D<PFCELL>>;
-  using PFFFTaskCollection = tmp::TupleWrapper<FFNormalTask, FFLaplacianTask, FFChemPotTask>;
-  using PFFFTaskSelector = tmp::TaskSelector<PFFFTaskCollection, std::uint8_t, PFCELL>;
-
-  // Chem potential gradient (∇λ): must run AFTER all λ values are computed and communicated
-  // Overwrites NORMAL with ∇λ, turning BGKSource into Cahn-Hilliard source
-  using FFChemPotGradTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFChemPotentialGradient2D<PFCELL>>;
-  using FFChemPotGradSel = TaskSelector<std::uint8_t, PFCELL, FFChemPotGradTask>;
-
-  // PF collision: BGKSource with NORMAL (= ∇φ/|∇φ|) as Allen-Cahn source
-  // ε=0.005 threshold in FF2D suppresses source activation by bulk noise
-  using PFCollisionTask = tmp::Key_TypePair<
-    BulkFlag,
-    collision::BGKSource<
-      equilibrium::SecondOrder<PFCELL>,
-      NORMAL<T, LatSet::d>,
-      true>>;
-  using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
-
-  // ---- Coupling tasks (PF → NS) ----
-  using STForceTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFSurfaceTension2D<PFCELL, NSCELL>>;
-  using STForceTaskSelector =
-    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, STForceTask>;
-  BlockLatManagerCoupling STCoupling(PFLattice, NSLattice);
-
-  using GravForceTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFGravityForce2D<PFCELL, NSCELL>>;
-  using GravForceTaskSelector =
-    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravForceTask>;
-  BlockLatManagerCoupling GravCoupling(PFLattice, NSLattice);
+  // TODO: Task definitions will be redesigned for the refactored LBM/FF modules
 
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
@@ -382,104 +336,15 @@ int main(int argc, char* argv[]) {
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
-  Timer OutputTimer;
 
-  
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
   MainWriter.WriteBinary(MainLoopTimer());
 
-  std::cout << "gravity = " << gravity << " kappa = " << Kappa << std::endl;
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
-  while (MainLoopTimer() < MaxStep) {
-    // ---- Phase field pre-processing ----
-    // Step 1: Update PHI by summing populations (block iteration, like simpledrop2d)
-    {
-      auto& phiField = PFLattice.getField<PHI<T>>();
-      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-        const auto& block = Geo.getBlock(blockid);
-        const auto& proj = block.getProjection();
-        auto& blockPhi = phiField.getBlockField(blockid);
-        auto& blockLat = PFLattice.getBlockLat(blockid);
-        int overlap = block.getOverlap();
-        for (int j = overlap; j < block.getNy() - overlap; ++j) {
-          for (int i = overlap; i < block.getNx() - overlap; ++i) {
-            std::size_t id = j * proj[1] + i;
-            PFCELL cell(id, blockLat);
-            T phi_new = T(0);
-            for (unsigned int k = 0; k < LatSet::q; ++k) {
-              phi_new += cell[k];
-            }
-            // clamp phi to [0, 1] to suppress numerical noise
-            if (phi_new < T{0}) phi_new = T{0};
-            if (phi_new > T{1}) phi_new = T{1};
-            blockPhi.get(id) = phi_new;
-          }
-        }
-      }
-    }
-    PFLattice.getField<PHI<T>>().Communicate();
-
-    // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
-    PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
-    PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
-    PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
-    ff::CommunicateAllSelfFields<T>(PFLattice);
-
-    // NOTE: FFChemPotentialGradient2D (∇λ→NORMAL) is available but NOT used here.
-    // The Allen-Cahn n=∇φ/|∇φ| source + higher ε threshold proves more stable
-    // than the ∇λ-based Cahn-Hilliard source for 2D D2Q9 bubble dynamics.
-    // Uncomment below to switch to CH source if needed:
-    // PFLattice.template ApplyCellDynamics<FFChemPotGradSel>(FlagFM);
-    // PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
-
-    // ---- NS force accumulation ----
-    // Step 3: Clear NS FORCE
-    NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
-
-    // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
-    STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // Step 5: Gravity/buoyancy force F_b → NS FORCE
-    GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
-    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
-    NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
-    NS_BB.Apply(MainLoopTimer());
-    NSLattice.Stream();
-    NSLattice.NormalCommunicate();
-
-    // ---- PF collision and streaming ----
-    // Step 8: PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
-    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
-
-    // Step 9: PF BCs + Stream + Communicate
-    PF_BB.Apply(MainLoopTimer());
-    PFLattice.Stream();
-    PFLattice.NormalCommunicate();
-
-    ++MainLoopTimer;
-    ++OutputTimer;
-
-    if (MainLoopTimer() % OutputStep == 0) {
-      PFLattice.getField<GRAD<T, 2>>().Communicate();
-      PFLattice.getField<PHI<T>>().Communicate();
-      NSLattice.getField<VELOCITY<T, 2>>().Communicate();
-      NSLattice.getField<RHO<T>>().Communicate();
-
-      OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
-      Printer::Endl();
-      MainWriter.WriteBinary(MainLoopTimer());
-    }
-  }
+  // TODO: Main simulation loop will be re-implemented after LBM/FF refactoring
 
   Printer::Print_BigBanner(std::string("Calculation Complete!"));
-  MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
-  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
-  Printer::Endl();
   return 0;
 }
