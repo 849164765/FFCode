@@ -244,7 +244,7 @@ __any__ void FFDensityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
   duy_dx *= inv_cs2;
   duy_dy *= inv_cs2;
 
-  // ---- F_p = -cs² · ∇ρ ----
+  // ---- F_p = -cs² · ∇ρ   Eq.(28), p/ρ = cs² in standard LBM EOS ----
   Vector<T, LatSet::d> fp;
   fp[0] = -LatSet::cs2 * grad_rho[0];
   fp[1] = -LatSet::cs2 * grad_rho[1];
@@ -305,6 +305,41 @@ __any__ void FFVelocityCompute2D<CELL>::apply(CELL& cell) {
   u_val /= rho_val;
 
   cell.template get<VELOCITY<T, LatSet::d>>() = u_val;
+}
+
+// ---- FFVelocityPressureCompute2D ----
+// Velocity + Pressure per Guo et al. Eqs.(35)-(36):
+//   u = Σ_α g_α e_α + (dt/(2ρ)) F_total   (Eq.35, dt=1)
+//   p = ρ · cs² · Σ_α g_α                  (Eq.36)
+// Reads NS distributions (cell[i]), RHO (= ρ(φ)), FORCE.
+// Writes VELOCITY and PRESSURE.
+template <typename CELL>
+__any__ void FFVelocityPressureCompute2D<CELL>::apply(CELL& cell) {
+  T rho_sum = T{};
+  Vector<T, LatSet::d> momentum{};
+
+  for (unsigned int i = 0; i < LatSet::q; ++i) {
+    rho_sum += cell[i];
+    momentum += latset::c<LatSet>(i) * cell[i];
+  }
+
+  const T rho_phi = cell.template get<RHO<T>>();
+  const auto& force = cell.template get<FORCE<T, LatSet::d>>();
+
+  // Eq.(35): u = (Σ g_i·e_i) + F/(2ρ)
+  // In paper: Σg ≈ 1, so Σg·e = velocity directly
+  // In our code: Σg = ρ, Σg·e = ρu* (momentum), must divide by Σg to get velocity
+  Vector<T, LatSet::d> vel;
+  if (rho_sum > T{1e-12}) {
+    vel = momentum  + force * (T{0.5} / rho_phi);
+  } else {
+    vel = Vector<T, LatSet::d>{T{0}, T{0}};
+  }
+  cell.template get<VELOCITY<T, LatSet::d>>() = vel;
+
+  // Eq.(36): p = ρ(φ) · cs² · Σ g_i
+  T pres = rho_phi * LatSet::cs2 * rho_sum;
+  cell.template get<PRESSURE<T>>() = pres;
 }
 
 }  // namespace ff

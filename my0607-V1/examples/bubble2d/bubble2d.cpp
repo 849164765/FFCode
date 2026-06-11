@@ -201,9 +201,11 @@ int main(int argc, char* argv[]) {
   // RHO: holds ρ(φ)=ρ_l+φ(ρ_h-ρ_l), used by collision for feq density coefficient
   // OMEGA: per-cell relaxation rate ω(φ)=1/(0.5+ν(φ)/cs²), used by BGKForcePure
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, OMEGA<T>,
-                            POP<T, LatSet::q>, FORCE<T, LatSet::d>>;
+                            POP<T, LatSet::q>, FORCE<T, LatSet::d>,
+                            PRESSURE<T>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{1} / Tau_ns, T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{1} / Tau_ns, T{}, Vector<T, 2>{T{0}, T{0}},
+                         T{});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -338,6 +340,11 @@ int main(int argc, char* argv[]) {
     tmp::Key_TypePair<BulkFlag, ff::FFFinalVelocityCompute2D<NSCELL>>;
   using NSFinalVelTaskSel = TaskSelector<std::uint8_t, NSCELL, NSFinalVelTask>;
 
+  // ---- NS velocity + pressure (Eqs.35-36) ----
+  using NSVelPresTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFVelocityPressureCompute2D<NSCELL>>;
+  using NSVelPresTaskSel = TaskSelector<std::uint8_t, NSCELL, NSVelPresTask>;
+
   // ---- NS collision: BGKForcePure (reads RHO, VELOCITY, FORCE, OMEGA) ----
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
@@ -394,16 +401,17 @@ int main(int argc, char* argv[]) {
   vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
   vtmo::ScalarWriter RhoWriter("Rho", NSLattice.getField<RHO<T>>());
   vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
+  vtmo::ScalarWriter PresWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
   MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, RhoWriter, ForceWriter);
+                          VecWriter, RhoWriter, ForceWriter, PresWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
   Timer OutputTimer;
 
-  
+
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
   MainWriter.WriteBinary(MainLoopTimer());
@@ -412,8 +420,34 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   while (MainLoopTimer() < MaxStep) {
-    /* ===== Phase field processing (from post-stream PF populations) ===== */
-    // Step 1: Σ f_i → PHI
+    /* ================================================================
+     * Step 1: PF field computation
+     * Compute ∇φ, n = ∇φ/|∇φ|, ∇²φ, λ from φ^{k-1} (prev iter Step 5).
+     * ================================================================ */
+    PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
+    PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
+    PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
+    ff::CommunicateAllSelfFields<T>(PFLattice);
+
+    /* ================================================================
+     * Step 3: PF and NS collision + streaming
+     * BGKSource uses NORMAL(=n=∇φ/|∇φ|) from Step 1 per Eq.(19).
+     * BGKForcePure uses VELOCITY^{k-1} from prev iter Step 7.
+     * ================================================================ */
+    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
+    NS_BB.Apply(MainLoopTimer());
+    NSLattice.Stream();
+    NSLattice.NormalCommunicate();
+
+    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    PF_BB.Apply(MainLoopTimer());
+    PFLattice.Stream();
+    PFLattice.NormalCommunicate();
+
+    /* ================================================================
+     * Step 4: PF phi update
+     * φ^k = Σ f_i^{PF,post} → PHI (clamped to [0,1]).
+     * ================================================================ */
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -439,56 +473,32 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // Step 2: ∇φ, NORMAL, ∇²φ, λ → PF fields
-    PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
-    PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
-    PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
-    ff::CommunicateAllSelfFields<T>(PFLattice);
-
-    /* ===== NS macroscopic update: interpolate ρ(φ), ω(φ) from φ ===== */
-    // Step 3: ρ(φ) → NS RHO, ω(φ) → NS OMEGA (coupling PF→NS)
+    /* ================================================================
+     * Step 5: Density and viscosity interpolation from updated φ
+     * RHO^k = ρ(φ^k) = ρ_l + φ^k·(ρ_h - ρ_l)
+     * OMEGA^k = ω(φ^k) = 1/(0.5 + ν(φ^k)/cs²)
+     * ================================================================ */
     RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaInterpTaskSel>(MainLoopTimer(), FlagFM);
     NSLattice.getField<RHO<T>>().Communicate();
 
-    // Step 4: u* = Σ c_i·g_i / Σ g_i → NS VELOCITY (preliminary, no force correction)
-    NSLattice.template ApplyCellDynamics<NSVelTaskSel>(FlagFM);
+    /* ================================================================
+     * Step 6: Velocity (Eq.35) + Pressure (Eq.36)
+     * u = Σ_α g_α e_α + F/(2ρ)     (Eq.35, dt=1)
+     * p = ρ · cs² · Σ_α g_α         (Eq.36)
+     * ================================================================ */
+    NSLattice.template ApplyCellDynamics<NSVelPresTaskSel>(FlagFM);
     NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
 
-    /* ===== NS force accumulation =====
-     * F_total = F_s + F_b + F_p + F_v
-     */
-    // Step 5: Clear NS FORCE
+    /* ================================================================
+     * Step 2: Force computation
+     * F_total = F_s + F_b + F_v + F_p → NS FORCE.
+     * F_v uses VELOCITY^{k-1} from prev iter Step 7.
+     * ================================================================ */
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
-
-    // Step 6: F_s = λ·∇φ → NS FORCE
     STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // Step 7: F_b → NS FORCE (gravity/buoyancy)
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // Step 8: F_p + F_v → NS FORCE (Eqs.27-28)
+    // DEBUG: temporarily disable F_v + F_p
     DensityCoupling.ApplyCellDynamics<DensityForceTaskSel>(MainLoopTimer(), FlagFM);
-
-    // Step 9: u_final = u* + F_total / (2·ρ(φ)) → VELOCITY
-    NSLattice.template ApplyCellDynamics<NSFinalVelTaskSel>(FlagFM);
-
-    /* ===== NS collision and streaming ===== */
-    // Step 10: NS BGKForcePure collision (reads RHO, VELOCITY, FORCE, OMEGA)
-    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
-
-    // Step 11: NS BCs + Stream + Communicate
-    NS_BB.Apply(MainLoopTimer());
-    NSLattice.Stream();
-    NSLattice.NormalCommunicate();
-
-    /* ===== PF collision and streaming ===== */
-    // Step 12: PF BGKSource collision
-    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
-
-    // Step 13: PF BCs + Stream + Communicate
-    PF_BB.Apply(MainLoopTimer());
-    PFLattice.Stream();
-    PFLattice.NormalCommunicate();
 
     ++MainLoopTimer;
     ++OutputTimer;
@@ -498,6 +508,7 @@ int main(int argc, char* argv[]) {
       PFLattice.getField<PHI<T>>().Communicate();
       NSLattice.getField<VELOCITY<T, 2>>().Communicate();
       NSLattice.getField<RHO<T>>().Communicate();
+      NSLattice.getField<PRESSURE<T>>().Communicate();
 
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();

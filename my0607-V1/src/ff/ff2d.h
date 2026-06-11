@@ -187,6 +187,17 @@ struct FFVelocityCompute2D {
   __any__ static void apply(CELL& cell);
 };
 
+// Velocity + Pressure per Guo et al. Eqs.(35)-(36)
+//  u = Σ c_i·g_i + F/(2·RHO)                  (Eq.35)
+//  p = RHO * cs² * Σ g_i                      (Eq.36)
+// Reads NS POP, RHO(=ρ(φ)), FORCE; writes VELOCITY and PRESSURE.
+template <typename CELL>
+struct FFVelocityPressureCompute2D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  __any__ static void apply(CELL& cell);
+};
+
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())

@@ -165,6 +165,7 @@ struct POPBase : public FieldBase<q> {};
 
 struct SMAGORINSKYBase : public FieldBase<1> {};
 struct OMEGABase : public FieldBase<1> {};
+struct PRESSUREBase : public FieldBase<1> {};
 
 // non-newtonian
 struct MinShearRateBase : public FieldBase<1> {};
@@ -231,6 +232,9 @@ using SMAGORINSKY = Data<T, SMAGORINSKYBase>;
 
 template <typename T>
 using OMEGA = GenericField<GenericArray<T>, OMEGABase>;
+
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
 
 template <typename T>
 using MinShearRate = Data<T, MinShearRateBase>;
@@ -322,6 +326,9 @@ using SMAGORINSKY = Data<T, SMAGORINSKYBase>;
 
 template <typename T>
 using OMEGA = GenericField<GenericArray<T>, OMEGABase>;
+
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
 
 template <typename T>
 using MinShearRate = Data<T, MinShearRateBase>;
