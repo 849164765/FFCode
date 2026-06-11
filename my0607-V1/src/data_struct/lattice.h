@@ -8,7 +8,6 @@
 #include "lbm/unit_converter.h"
 #include "lbm/collision.h"
 #include "lbm/moment.h"
-#include "lbm/force.h"
 #include "utils/alias.h"
 
 // TODO: use a unified geometry reference like BasicBlock

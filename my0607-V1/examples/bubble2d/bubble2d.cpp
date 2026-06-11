@@ -37,9 +37,6 @@ T eta_l;
 T eta_h;
 T sigma;
 T gravity;
-T Eo;
-T Re;
-T U_g;       // characteristic lattice velocity
 T Tau_ns;
 
 // simulation
@@ -67,37 +64,25 @@ void readParam() {
 
   rho_l = param_reader.getValue<T>("Two_Phase", "rho_l");
   rho_h = param_reader.getValue<T>("Two_Phase", "rho_h");
-  Eo = param_reader.getValue<T>("Two_Phase", "Eo");
-  Re = param_reader.getValue<T>("Two_Phase", "Re");
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
+  eta_l = param_reader.getValue<T>("Two_Phase", "eta_l");
+  eta_h = param_reader.getValue<T>("Two_Phase", "eta_h");
+  T Re = param_reader.getValue<T>("Two_Phase", "Re");
+  T Eo = param_reader.getValue<T>("Two_Phase", "Eo");
 
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
 
-  // ===== 5-step parameter design =====
-  // Step 1: bubble diameter in lattice units
   T D = T(2.0) * Bubble_Radius;
 
-  // Step 2: characteristic lattice velocity (Ma ~ U_g/cs << 1 for incompressible)
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
-  // validate: U_g should be in [0.02, 0.08] for LBM stability
-  if (U_g < T(0.01) || U_g > T(0.15)) {
-    if (mpi().getRank() == 0) {
-      std::cerr << "[Warning] U_g=" << U_g << " out of [0.01, 0.15] range\n";
-    }
-  }
+  // nu = eta / rho (using heavier fluid as reference)
+  T nu = eta_h / rho_h;
 
-  // Step 3: gravity from characteristic velocity  g = U_g² / D
+  // U = Re * nu / D → g = U² / D
+  T U_g = Re * nu / D;
   T g_abs = U_g * U_g / D;
   gravity = -g_abs;
 
-  // Step 4: kinematic viscosity from Re  ν = U_g * D / Re
-  //         dynamic viscosity  η_h = ν * ρ_h,  η_l = η_h / 10
-  T nu = U_g * D / Re;
-  eta_h = nu * rho_h;
-  eta_l = eta_h / T(10);
-
-  // Step 5: surface tension from Eo  σ = Δρ * g * D² / Eo
+  // sigma = Δρ * g * D² / Eo
   T DeltaRho = rho_h - rho_l;
   sigma = DeltaRho * g_abs * D * D / Eo;
 
@@ -110,29 +95,20 @@ void readParam() {
   // NS relaxation time  τ = 0.5 + ν/cs²
   Tau_ns = T(0.5) + nu / LatSet::cs2;
 
-  // CFL check: (U_g + cs) * dt / dx
-  T cs = std::sqrt(LatSet::cs2);
-  T CFL = U_g + cs;  // dx=1, dt=1 in SimplifiedConverter
-  bool cfl_ok = (CFL < T(1.2));
-
   MPI_RANK(0) {
     std::cout << "----------Bubble Rising Simulation----------\n";
     std::cout << "[Mesh]: " << Ni << "x" << Nj << "  BlockCellLen=" << BlockCellLen << "\n";
     std::cout << "[Bubble]: R=" << Bubble_Radius << " D=" << D
               << "  Center=(" << Bubble_Center[0] << "," << Bubble_Center[1] << ")\n";
-    std::cout << "[Design] Step1: D = " << D << "\n";
-    std::cout << "[Design] Step2: U_g = " << U_g << " (Ma=" << U_g/cs << ")\n";
-    std::cout << "[Design] Step3: g = U_g^2/D = " << gravity << "\n";
-    std::cout << "[Design] Step4: nu = U_g*D/Re = " << nu
-              << "  eta_h = " << eta_h << "  eta_l = " << eta_l << "\n";
-    std::cout << "[Design] Step5: sigma = DeltaRho*g*D^2/Eo = " << sigma << "\n";
+    std::cout << "[TwoPhase]: rho_l=" << rho_l << " rho_h=" << rho_h
+              << " eta_l=" << eta_l << " eta_h=" << eta_h
+              << " Re=" << Re << " Eo=" << Eo << "\n";
+    std::cout << "[Derived]: nu=" << nu << " U_g=" << U_g
+              << " g=" << gravity << " sigma=" << sigma << "\n";
     std::cout << "[Phase]: W=" << Interface_Width << " M=" << Mobility
               << " beta=" << Beta << " kappa=" << Kappa
               << " tau_phi=" << Tau_phi << "\n";
-    std::cout << "[Flow]: tau_ns=" << Tau_ns << "  omega=" << (T(1)/Tau_ns)
-              << "  Re=" << Re << "  Eo=" << Eo << "\n";
-    std::cout << "[CFL]: (U_g+cs)*dt/dx = " << CFL
-              << (cfl_ok ? "  OK" : "  WARNING: >1.2!") << "\n";
+    std::cout << "[Flow]: tau_ns=" << Tau_ns << "  omega=" << (T(1)/Tau_ns) << "\n";
     std::cout << "[Simulation]: MaxStep=" << MaxStep << "  OutputStep=" << OutputStep << "\n";
 #ifdef _OPENMP
     std::cout << "[Parallel]: " << Thread_Num << " threads\n";
@@ -141,13 +117,6 @@ void readParam() {
     std::cout << "[Parallel]: " << mpi().getSize() << " MPI processes\n";
 #endif
     std::cout << "--------------------------------------------\n";
-  }
-
-  if (!cfl_ok) {
-    MPI_RANK(0) {
-      std::cerr << "[ERROR] CFL=" << CFL << " > 1.2! Reduce U_g in ini file.\n";
-    }
-    exit(1);
   }
 
 }
@@ -195,38 +164,34 @@ int main(int argc, char* argv[]) {
   vtmo::ScalarWriter FlagWriter("flag", FlagFM);
   vtmo::vtmWriter<T, 2> GeoWriter("GeoFlag_Bubble", Geo, 1);
   GeoWriter.addWriterSet(FlagWriter);
-  GeoWriter.WriteBinary();
+  // GeoWriter.WriteBinary();
 
   // ------------------ define NS lattice ------------------
-  // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
-  // Actual density variation enters via the FORCE field
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>>;
+                            FORCE<T, LatSet::d>, PHYSICAL_ETA<T>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, T{});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
   // ------------------ define PF lattice ------------------
   using PFFIELDS = TypePack<PHI<T>, POP<T, LatSet::q>, GRAD<T, LatSet::d>,
                             NORMAL<T, LatSet::d>, INTERFACEWIDTH<T>,
-                            ff::LAPLACIAN<T>, ff::CHEMICALPOTENTIAL<T>,
-                            ff::GRAVITY<T>, ff::BETA<T>, ff::KAPPA<T>,
-                            ff::RHO_L<T>, ff::RHO_H<T>, ff::ETA_L<T>, ff::ETA_H<T>>;
+                            RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>>;
   using PFFIELDREFS = TypePack<VELOCITY<T, LatSet::d>>;
   using PFFIELDPACK = TypePack<PFFIELDS, PFFIELDREFS>;
   ValuePack PFInitValues(T{}, T{}, Vector<T, 2>{T{0}, T{0}},
                          Vector<T, 2>{T{0}, T{0}}, Interface_Width,
-                         T{}, T{},
-                         gravity, Beta, Kappa, rho_l, rho_h, eta_l, eta_h);
+                         rho_l, rho_h, eta_l, eta_h);
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
     Geo, PFInitValues, PFBaseConv, &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
-  // Type B params: broadcast from rank 0 to all ranks (MPI-safe)
-  ff::BroadcastAllParams<T>(PFLattice,
-                            rho_l, rho_h, eta_l, eta_h,
-                            gravity, Beta, Kappa);
+  // Initialize block-level constant fields
+  PFLattice.getField<RHO_L<T>>().InitValue(rho_l);
+  PFLattice.getField<RHO_H<T>>().InitValue(rho_h);
+  PFLattice.getField<ETA_L<T>>().InitValue(eta_l);
+  PFLattice.getField<ETA_H<T>>().InitValue(eta_h);
 
   // ---- Initialize PHI and POP fields ----
   // φ = 0 for light fluid (bubble interior), φ = 1 for heavy fluid (outside)
@@ -322,6 +287,11 @@ int main(int argc, char* argv[]) {
   // ------------------ define tasks ------------------
   // TODO: Task definitions will be redesigned for the refactored LBM/FF modules
 
+  using UpdatePhiTask = tmp::Key_TypePair<BulkFlag, moment::PhaseFieldPhi<PFCELL>>;
+  using UpdatePhiNSTaskSelector = TaskSelector<std::uint8_t, PFCELL, UpdatePhiTask>;
+  using UpdatePropTask = tmp::Key_TypePair<BulkFlag, moment::PropertyInterpolation<PFCELL, NSCELL>>;
+  using InterpolationTaskSelector = CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, UpdatePropTask>;
+  BlockLatManagerCoupling InterpolationCoupling(PFLattice, NSLattice);
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
@@ -336,15 +306,62 @@ int main(int argc, char* argv[]) {
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
+  Timer OutputTimer;
 
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
-  MainWriter.WriteBinary(MainLoopTimer());
+  // MainWriter.WriteBinary(MainLoopTimer());
 
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   // TODO: Main simulation loop will be re-implemented after LBM/FF refactoring
 
+  while (MainLoopTimer() < MaxStep) {
+    PFLattice.template ApplyCellDynamics<UpdatePhiNSTaskSelector>(MainLoopTimer(), FlagFM);
+    PFLattice.template getField<PHI<T>>().Communicate();
+
+    InterpolationCoupling.template ApplyCellDynamics<InterpolationTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // --- debug: verify interpolation at sampled cells ---
+    if (MainLoopTimer() <= 3) {
+      if (mpi().getRank() == 0) {
+        auto& debugPhi = PFLattice.getField<PHI<T>>();
+        auto& debugRho = NSLattice.getField<RHO<T>>();
+        auto& debugEta = NSLattice.getField<PHYSICAL_ETA<T>>();
+        std::cout << "\n[Step " << MainLoopTimer() << "] Interpolation check:\n";
+
+        const auto& block0 = Geo.getBlock(0);
+        const auto& proj = block0.getProjection();
+        int overlap = block0.getOverlap();
+        int Nx = proj[1];  // stride per row
+
+        // pick probe points using block-relative grid coordinates
+        // bubble center at (128,128), radius=40
+        std::size_t id_center = (128 + overlap) * Nx + (128 + overlap);   // phi ≈ 0 (inside bubble)
+        std::size_t id_iface  = (128+40 + overlap) * Nx + (128 + overlap); // phi ≈ 0.5 (interface)
+        std::size_t id_bulk   = (240 + overlap) * Nx + (128 + overlap);    // phi ≈ 1 (heavy fluid)
+
+        std::cout << "  Center: phi=" << debugPhi.getBlockField(0).get(id_center)
+                  << " rho=" << debugRho.getBlockField(0).get(id_center)
+                  << " eta=" << debugEta.getBlockField(0).get(id_center) << "\n";
+        std::cout << "  Interface: phi=" << debugPhi.getBlockField(0).get(id_iface)
+                  << " rho=" << debugRho.getBlockField(0).get(id_iface)
+                  << " eta=" << debugEta.getBlockField(0).get(id_iface) << "\n";
+        std::cout << "  Bulk: phi=" << debugPhi.getBlockField(0).get(id_bulk)
+                  << " rho=" << debugRho.getBlockField(0).get(id_bulk)
+                  << " eta=" << debugEta.getBlockField(0).get(id_bulk) << "\n";
+        std::cout << "  Expected: ρ(0)=" << rho_l << " ρ(1)=" << rho_h
+                  << " η(0)=" << eta_l << " η(1)=" << eta_h << "\n";
+      }
+    }
+
+    ++MainLoopTimer;
+    ++OutputTimer;
+    if (MainLoopTimer() % OutputStep == 0) {
+      if (mpi().getRank() == 0)
+      std::cout << "Output Step: " << MainLoopTimer() << "\n";
+    }
+  }
   Printer::Print_BigBanner(std::string("Calculation Complete!"));
   return 0;
 }

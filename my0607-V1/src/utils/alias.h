@@ -160,6 +160,13 @@ struct RHOINITBase : public FieldBase<1> {};
 struct TEMPINITBase : public FieldBase<1> {};
 struct CONCINITBase : public FieldBase<1> {};
 struct GBETABase : public FieldBase<1> {};
+
+// two-phase physical property constants
+struct RhoLBase : public FieldBase<1> {};
+struct RhoHBase : public FieldBase<1> {};
+struct EtaLBase : public FieldBase<1> {};
+struct EtaHBase : public FieldBase<1> {};
+struct PhysicalEtaBase : public FieldBase<1> {};
 template <unsigned int q>
 struct POPBase : public FieldBase<q> {};
 
@@ -337,6 +344,18 @@ template <typename T>
 using PL_k = Data<T, PL_kBase>;
 template <typename T>
 using PL_m = Data<T, PL_mBase>;
+
+// two-phase physical property constants
+template <typename T>
+using RHO_L = Data<T, RhoLBase>;
+template <typename T>
+using RHO_H = Data<T, RhoHBase>;
+template <typename T>
+using ETA_L = Data<T, EtaLBase>;
+template <typename T>
+using ETA_H = Data<T, EtaHBase>;
+template <typename T>
+using PHYSICAL_ETA = GenericField<GenericArray<T>, PhysicalEtaBase>;
 
 // #endif
 
