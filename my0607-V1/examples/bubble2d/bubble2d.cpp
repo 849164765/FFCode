@@ -329,12 +329,12 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: velocity-based BGK collision (Eq.31 equilibrium, Eq.32 force)
+  // NS task: velocity-based MRT collision (Eqs.29+30, Eq.31 equil, Eq.32 force)
+  // MRT decouples moments: s=0 for conserved (ρ,j), s=1.1 for non-hydro (e,ε,q),
+  // per-cell ω for shear (pxx,pxy). Enables stable F_p+F_v at block boundaries.
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
-    collision::BGKVelocityBased<
-      equilibrium::VelocityBasedSecondOrder<NSCELL>,
-      force::Force<NSCELL>>>;
+    collision::MRTVelocityBased<NSCELL>>;
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
 
   // NS macro update (post-stream): Eq.(35) u + Eq.(36) p
@@ -480,13 +480,10 @@ int main(int argc, char* argv[]) {
     // Gravity/buoyancy force F_b
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // F_p and F_v — mathematically correct for velocity-based LBM (Eqs.27-28),
-    // but currently DISABLED due to numerical cancellation issue:
-    // |F_p| ≈ cs²·Δρ/ρ·|∇φ| ≈ 0.33 while |F_s| ≈ λ·|∇φ| ≈ 0.0005 (×660).
-    // In BGK collision, large Fi and large feq almost cancel → residual
-    // errors from discrete-level mismatch destabilize the interface.
-    // Solution: MRT (decouples moments) or separate relaxation for
-    // non-shear moments. Re-enable after upgrading to MRT (Phase 3).
+    // F_p (Eq.27) and F_v (Eq.28) — enabled with MRT collision.
+    // MRT decouples moments: non-hydrodynamic modes (e,ε,q) relax faster (s=1.1)
+    // while shear modes use per-cell ω. This prevents the large-force cancellation
+    // that destabilized BGK (where |F_p|/|F_s| ≈ 660).
     PressCoupling.ApplyCellDynamics<PressForceTaskSelector>(MainLoopTimer(), FlagFM);
     FFVisCoupling.ApplyCellDynamics<FFVisForceTaskSelector>(MainLoopTimer(), FlagFM);
 

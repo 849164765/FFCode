@@ -441,4 +441,93 @@ struct MRTForce {
   }
 };
 
+// Velocity-based MRT collision for NS momentum lattice.
+// Uses paper Eqs.(29)+(30) with velocity-based equilibrium Eq.(31).
+//   m_j     = Σ_i M_ji * g_i                  (moments from populations)
+//   m_eq_j  = Σ_i M_ji * g_eq_i(p,ρ,u)        (equilibrium moments)
+//   F_m_j   = Σ_i M_ji * F_pop_i               (force moments, Guo Eq.32)
+//   g_i_new = g_i - Σ_j M^{-1}_ij * s_j * (m_j - m_eq_j)
+//                 + Σ_j M^{-1}_ij * (1 - s_j/2) * F_m_j
+// Non-hydrodynamic moments (e, ε, qx, qy) use fixed s ≈ 1.1 for stability;
+// shear moments (pxx, pxy) use per-cell OMEGA for variable viscosity;
+// conserved moments (ρ, jx, jy) keep s=0 (no relaxation).
+template <typename CELL>
+struct MRTVelocityBased {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static void apply(CELL& cell) {
+    // Read pre-computed fields
+    T p = cell.template get<PRESSURE<T>>();
+    T rho = cell.template get<typename CELL::GenericRho>();
+    Vector<T, LatSet::d> u = cell.template get<VELOCITY<T, LatSet::d>>();
+    const auto F = cell.template get<FORCE<T, LatSet::d>>();
+
+    // Build relaxation time vector:
+    //   s0,s3,s5 = 0    (conserved: ρ, jx, jy — identity)
+    //   s1,s2,s4,s6 ≈ 1.1  (non-hydrodynamic: e, ε, qx, qy)
+    //   s7,s8 = ω  (shear: pxx, pxy — variable shear viscosity)
+    T rtvec[LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      rtvec[i] = mrt::s<LatSet>(i);
+    if constexpr (CELL::template hasField<OMEGA<T>>()) {
+      T omega = cell.template get<OMEGA<T>>();
+      for (int i = 0; i < mrt::shearIndexes<LatSet>(); ++i)
+        rtvec[mrt::shearViscIndexes<LatSet>(i)] = omega;
+    } else {
+      T omega = cell.getOmega();
+      for (int i = 0; i < mrt::shearIndexes<LatSet>(); ++i)
+        rtvec[mrt::shearViscIndexes<LatSet>(i)] = omega;
+    }
+
+    // Velocity-based equilibrium (Eq.31)
+    // g_eq = w_k * [p/(ρcs²) + c_k·u/cs² + (c_k·u)²/(2cs⁴) - u²/(2cs²)]
+    std::array<T, LatSet::q> feq{};
+    equilibrium::VelocityBasedSecondOrder<CELL>::apply(feq, p, rho, u);
+
+    // Moments from populations: m = M * g
+    T momenta[LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
+
+    // Equilibrium moments: m_eq = M * g_eq
+    T momentaEq[LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momentaEq[i] += mrt::M<LatSet>(i, j) * feq[j];
+
+    // Guo force in population space (Eq.32)
+    // F_pop_i = w_i * [c_i·F/cs² + (c_i·F)(c_i·u)/cs⁴ - u·F/cs²]
+    T uF = u * F;
+    T fi_force[LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T cF = latset::c<LatSet>(i) * F;
+      T cu = latset::c<LatSet>(i) * u;
+      fi_force[i] = latset::w<LatSet>(i) *
+                    (LatSet::InvCs2 * (cF - uF) + LatSet::InvCs4 * cu * cF);
+    }
+
+    // Force in moment space: F_m = M * F_pop
+    T force_m[LatSet::q]{};
+    for (unsigned int j = 0; j < LatSet::q; ++j)
+      for (unsigned int k = 0; k < LatSet::q; ++k)
+        force_m[j] += mrt::M<LatSet>(j, k) * fi_force[k];
+
+    // MRT collision + force source (Eqs.29+30)
+    // g_i_new = g_i - Σ_j M^{-1}_ij * s_j * (m_j - m_eq_j)
+    //                 + Σ_j M^{-1}_ij * (1 - s_j/2) * F_m_j
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{};
+      T source{};
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        T invM_ij = mrt::InvM<LatSet>(i, j);
+        coll += invM_ij * rtvec[j] * (momenta[j] - momentaEq[j]);
+        source += invM_ij * (T{1} - T{0.5} * rtvec[j]) * force_m[j];
+      }
+      cell[i] = cell[i] - coll + source;
+    }
+  }
+};
+
 }
