@@ -361,25 +361,22 @@ int main(int argc, char* argv[]) {
     PFLattice.template getField<GRAD<T, 2>>().Communicate();
     PFLattice.template ApplyCellDynamics<UpdateNormalTaskSelector>(FlagFM);
     PFLattice.template getField<NORMAL<T, 2>>().Communicate();
+
+    // Clear total force before accumulation
+    NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
+    NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
+    NSLattice.template getField<FORCE<T, 2>>().Communicate();
+    
+    NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
+    NS_BB.Apply();
+    NSLattice.Stream();
+    NSLattice.NormalCommunicate();
     
     PFLattice.template ApplyCellDynamics<PhaseCollisionTaskSelector>(FlagFM);
     PF_BB.Apply();
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
 
-    NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
-    NS_BB.Apply();
-    NSLattice.Stream();
-    NSLattice.NormalCommunicate();
-    
-    // Clear total force before accumulation
-    NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
-    NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
-    NSLattice.template getField<FORCE<T, 2>>().Communicate();
-    
-    NSLattice.template ApplyCellDynamics<NSVelPressTaskSelector>(FlagFM);
-    NSLattice.template getField<VELOCITY<T, 2>>().Communicate();
-    NSLattice.template getField<PRESSURE<T>>().Communicate();
 
     ++MainLoopTimer;
     ++OutputTimer;

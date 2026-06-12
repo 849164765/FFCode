@@ -94,10 +94,21 @@ struct VelocityBGK {
   using GenericRho = typename CELL::GenericRho;
 
   __any__ static void apply(CELL& cell) {
-    // --- macroscopic from fields (computed by VelocityMomenta task) ---
-    T p = cell.template get<PRESSURE<T>>();
-    const Vector<T, LatSet::d>& u = cell.template get<VELOCITY<T, LatSet::d>>();
-    T rho = cell.template get<GenericRho>();
+    // --- macroscopic from g_α (merged from VelocityMomenta) ---
+    const T rho = cell.template get<GenericRho>();
+    T sum = T{0};
+    Vector<T, LatSet::d> u_star = T{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      sum += cell[i];
+      u_star += latset::c<LatSet>(i) * cell[i];
+    }
+    const auto& F = cell.template get<FORCE<T, LatSet::d>>();
+    Vector<T, LatSet::d> u = u_star + F * T{0.5} / rho;
+    T p = rho * LatSet::cs2 * sum;
+
+    // --- write back to fields ---
+    cell.template get<VELOCITY<T, LatSet::d>>() = u;
+    cell.template get<PRESSURE<T>>() = p;
 
     // --- equilibrium ---
     std::array<T, LatSet::q> geq;
