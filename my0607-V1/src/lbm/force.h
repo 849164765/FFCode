@@ -96,7 +96,6 @@ struct Gravity {
     T rho_l = pfcell.template get<RHO_L<T>>();
     T rho_h = pfcell.template get<RHO_H<T>>();
     T g = nscell.template get<CONSTFORCE<T, LatSet::d>>()[1];  // y-component of gravity
-    g = -0.01;
     T rho = rho_l + phi * (rho_h - rho_l);
     nscell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_h) * g;
   }

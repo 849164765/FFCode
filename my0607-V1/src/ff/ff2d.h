@@ -103,4 +103,26 @@ struct NSFieldSource {
  };
   
 };
+                    
+  template <typename T, typename LATTICE>       
+  void BroadcastAllParams(LATTICE& lattice, T& interfaceWidth, T& rho_l, T& rho_h, T&eta_l, T& eta_h, T& gravity, T& Beta, T& Kappa) {                                   
+  #ifdef MPI_ENABLED                            
+    mpi().bCast(interfaceWidth, 0);             
+    mpi().bCast(rho_l, 0);                      
+    mpi().bCast(rho_h, 0);                      
+    mpi().bCast(eta_l, 0);                      
+    mpi().bCast(eta_h, 0);                      
+    mpi().bCast(gravity, 0);                    
+    mpi().bCast(Beta, 0);                       
+    mpi().bCast(Kappa, 0);                      
+  #endif                                        
+    lattice.template getField<INTERFACEWIDTH<T>>().InitValue(interfaceWidth);                 
+    lattice.template getField<RHO_L<T>>().InitValue(rho_l);        
+    lattice.template getField<RHO_H<T>>().InitValue(rho_h);        
+    lattice.template getField<ETA_L<T>>().InitValue(eta_l);        
+    lattice.template getField<ETA_H<T>>().InitValue(eta_h);        
+    lattice.template getField<BETA<T>>().InitValue(Beta);          
+    lattice.template  getField<KAPPA<T>>().InitValue(Kappa);        
+  }
+
 }  // namespace ff

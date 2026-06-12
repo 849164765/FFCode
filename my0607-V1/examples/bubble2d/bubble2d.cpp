@@ -192,11 +192,6 @@ int main(int argc, char* argv[]) {
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
     Geo, PFInitValues, PFBaseConv, &NSLattice.getField<VELOCITY<T, LatSet::d>>());
 
-  // Initialize block-level constant fields
-  PFLattice.getField<RHO_L<T>>().InitValue(rho_l);
-  PFLattice.getField<RHO_H<T>>().InitValue(rho_h);
-  PFLattice.getField<ETA_L<T>>().InitValue(eta_l);
-  PFLattice.getField<ETA_H<T>>().InitValue(eta_h);
 
   // ---- Initialize PHI and POP fields ----
   // φ = 0 for light fluid (bubble interior), φ = 1 for heavy fluid (outside)
@@ -250,8 +245,7 @@ int main(int argc, char* argv[]) {
   }
 
   // Initialize PF interface width
-  PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
-
+  ff::BroadcastAllParams<T>(PFLattice,Interface_Width,rho_l, rho_h, eta_l, eta_h,gravity, Beta, Kappa);
   // Initialize NS populations to equilibrium
   Vector<T, 2> u_zero{T{0}, T{0}};
   T ns_rho_init = BaseConv.getLatRhoInit();
