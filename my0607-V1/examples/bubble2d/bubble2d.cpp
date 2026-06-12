@@ -5,6 +5,7 @@
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
+#include "lbm/force.h"
 
 using T = FLOAT;
 using LatSet = D2Q9<T>;
@@ -168,21 +169,25 @@ int main(int argc, char* argv[]) {
 
   // ------------------ define NS lattice ------------------
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>, PHYSICAL_ETA<T>>;
+                            FORCE<T, LatSet::d>, PHYSICAL_ETA<T>, OMEGA<T>,
+                            PRESSURE<T>, CONSTFORCE<T, LatSet::d>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}}, T{});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, T{}, BaseConv.getOMEGA(),
+                         T{}, Vector<T, 2>{T{0}, gravity});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
   // ------------------ define PF lattice ------------------
   using PFFIELDS = TypePack<PHI<T>, POP<T, LatSet::q>, GRAD<T, LatSet::d>,
                             NORMAL<T, LatSet::d>, INTERFACEWIDTH<T>,
-                            RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>>;
+                            RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>,
+                            BETA<T>, KAPPA<T>>;
   using PFFIELDREFS = TypePack<VELOCITY<T, LatSet::d>>;
   using PFFIELDPACK = TypePack<PFFIELDS, PFFIELDREFS>;
   ValuePack PFInitValues(T{}, T{}, Vector<T, 2>{T{0}, T{0}},
                          Vector<T, 2>{T{0}, T{0}}, Interface_Width,
-                         rho_l, rho_h, eta_l, eta_h);
+                         rho_l, rho_h, eta_l, eta_h,
+                         Beta, Kappa);
   using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFFIELDPACK>::mergedpack>;
   BlockLatticeManager<T, LatSet, PFFIELDPACK> PFLattice(
     Geo, PFInitValues, PFBaseConv, &NSLattice.getField<VELOCITY<T, LatSet::d>>());
@@ -271,6 +276,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
+
+
   // ------------------ define BCs ------------------
   // NS: bounceback on all walls
   BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>,
@@ -285,13 +292,38 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // TODO: Task definitions will be redesigned for the refactored LBM/FF modules
-
   using UpdatePhiTask = tmp::Key_TypePair<BulkFlag, moment::PhaseFieldPhi<PFCELL>>;
   using UpdatePhiNSTaskSelector = TaskSelector<std::uint8_t, PFCELL, UpdatePhiTask>;
   using UpdatePropTask = tmp::Key_TypePair<BulkFlag, moment::PropertyInterpolation<PFCELL, NSCELL>>;
   using InterpolationTaskSelector = CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, UpdatePropTask>;
   BlockLatManagerCoupling InterpolationCoupling(PFLattice, NSLattice);
+
+  using UpdateGradTask = tmp::Key_TypePair<BulkFlag, ff::PhaseFieldGrad<PFCELL>>;
+  using UpdateGradTaskSelector = TaskSelector<std::uint8_t, PFCELL, UpdateGradTask>;
+  using UpdateNormalTask = tmp::Key_TypePair<BulkFlag, ff::PhaseFieldNormal<PFCELL>>;
+  using UpdateNormalTaskSelector = TaskSelector<std::uint8_t, PFCELL, UpdateNormalTask>;
+
+  using PhaseCollisionTask = tmp::Key_TypePair<BulkFlag, PhaseFieldBGK<PFCELL, equilibrium::PhaseFieldEquilibrium<PFCELL>>>;
+  using PhaseCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PhaseCollisionTask>;
+  
+  using NSMomentTask = tmp::Key_TypePair<BulkFlag, moment::VelocityMomenta<NSCELL>>;
+  using NSMomentTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSMomentTask>;
+
+  using NSCollisionTask = tmp::Key_TypePair<BulkFlag, VelocityBGK<NSCELL,equilibrium::NSFieldEquilibrium<NSCELL>>>;
+  using NSCollisionTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSCollisionTask>;
+  
+  using NSVisForceTask = tmp::Key_TypePair<BulkFlag, force::VisForce<PFCELL, NSCELL>>;
+  using NSPressForceTask = tmp::Key_TypePair<BulkFlag, force::PressForce<PFCELL, NSCELL>>;
+  using NSGravityTask = tmp::Key_TypePair<BulkFlag, force::Gravity<PFCELL, NSCELL>>;
+  using NSSurfaceTensionTask = tmp::Key_TypePair<BulkFlag, force::SurfaceTension<PFCELL, NSCELL>>;
+  using NSForceTaskSelector = CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, NSVisForceTask, NSPressForceTask, NSGravityTask, NSSurfaceTensionTask>;
+  BlockLatManagerCoupling NSForceCoupling(PFLattice, NSLattice);
+  
+  using NSVelPressTask = tmp::Key_TypePair<BulkFlag, moment::VelocityMomenta<NSCELL>>;
+  using NSVelPressTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSVelPressTask>;
+
+  // ------------------ writers ------------------
+
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
@@ -317,49 +349,45 @@ int main(int argc, char* argv[]) {
   // TODO: Main simulation loop will be re-implemented after LBM/FF refactoring
 
   while (MainLoopTimer() < MaxStep) {
-    PFLattice.template ApplyCellDynamics<UpdatePhiNSTaskSelector>(MainLoopTimer(), FlagFM);
+    
+    PFLattice.template ApplyInnerCellDynamics<UpdatePhiNSTaskSelector>(FlagFM);
     PFLattice.template getField<PHI<T>>().Communicate();
 
-    InterpolationCoupling.template ApplyCellDynamics<InterpolationTaskSelector>(MainLoopTimer(), FlagFM);
+    InterpolationCoupling.template ApplyInnerCellDynamics<InterpolationTaskSelector>(FlagFM);
+    NSLattice.template getField<RHO<T>>().Communicate();
+    NSLattice.template getField<OMEGA<T>>().Communicate();
 
-    // --- debug: verify interpolation at sampled cells ---
-    if (MainLoopTimer() <= 3) {
-      if (mpi().getRank() == 0) {
-        auto& debugPhi = PFLattice.getField<PHI<T>>();
-        auto& debugRho = NSLattice.getField<RHO<T>>();
-        auto& debugEta = NSLattice.getField<PHYSICAL_ETA<T>>();
-        std::cout << "\n[Step " << MainLoopTimer() << "] Interpolation check:\n";
+    PFLattice.template ApplyInnerCellDynamics<UpdateGradTaskSelector>(FlagFM);
+    PFLattice.template getField<GRAD<T, 2>>().Communicate();
+    PFLattice.template ApplyInnerCellDynamics<UpdateNormalTaskSelector>(FlagFM);
+    PFLattice.template getField<NORMAL<T, 2>>().Communicate();
 
-        const auto& block0 = Geo.getBlock(0);
-        const auto& proj = block0.getProjection();
-        int overlap = block0.getOverlap();
-        int Nx = proj[1];  // stride per row
+    PFLattice.template ApplyCellDynamics<PhaseCollisionTaskSelector>(FlagFM);
+    PFLattice.Stream();
+    PF_BB.Apply();
+    PFLattice.NormalCommunicate();
 
-        // pick probe points using block-relative grid coordinates
-        // bubble center at (128,128), radius=40
-        std::size_t id_center = (128 + overlap) * Nx + (128 + overlap);   // phi ≈ 0 (inside bubble)
-        std::size_t id_iface  = (128+40 + overlap) * Nx + (128 + overlap); // phi ≈ 0.5 (interface)
-        std::size_t id_bulk   = (240 + overlap) * Nx + (128 + overlap);    // phi ≈ 1 (heavy fluid)
+    NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
+    NSLattice.Stream();
+    NS_BB.Apply();
+    NSLattice.NormalCommunicate();
 
-        std::cout << "  Center: phi=" << debugPhi.getBlockField(0).get(id_center)
-                  << " rho=" << debugRho.getBlockField(0).get(id_center)
-                  << " eta=" << debugEta.getBlockField(0).get(id_center) << "\n";
-        std::cout << "  Interface: phi=" << debugPhi.getBlockField(0).get(id_iface)
-                  << " rho=" << debugRho.getBlockField(0).get(id_iface)
-                  << " eta=" << debugEta.getBlockField(0).get(id_iface) << "\n";
-        std::cout << "  Bulk: phi=" << debugPhi.getBlockField(0).get(id_bulk)
-                  << " rho=" << debugRho.getBlockField(0).get(id_bulk)
-                  << " eta=" << debugEta.getBlockField(0).get(id_bulk) << "\n";
-        std::cout << "  Expected: ρ(0)=" << rho_l << " ρ(1)=" << rho_h
-                  << " η(0)=" << eta_l << " η(1)=" << eta_h << "\n";
-      }
-    }
+    // Clear total force before accumulation
+    NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
+    NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
+    NSLattice.template getField<FORCE<T, 2>>().Communicate();
+
+    NSLattice.template ApplyCellDynamics<NSVelPressTaskSelector>(FlagFM);
+    NSLattice.template getField<VELOCITY<T, 2>>().Communicate();
+    NSLattice.template getField<PRESSURE<T>>().Communicate();
+
 
     ++MainLoopTimer;
     ++OutputTimer;
     if (MainLoopTimer() % OutputStep == 0) {
-      if (mpi().getRank() == 0)
-      std::cout << "Output Step: " << MainLoopTimer() << "\n";
+      OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
+      Printer::Endl();
+      MainWriter.WriteBinary(MainLoopTimer());
     }
   }
   Printer::Print_BigBanner(std::string("Calculation Complete!"));

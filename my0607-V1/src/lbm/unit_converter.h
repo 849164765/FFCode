@@ -47,7 +47,7 @@ struct BaseConverter final : public AbstractConverter<T> {
   T Lattice_charU;    // char lattice velocity
   T Lattice_VisKine;  // lattice kinematic viscosity
   T Lattice_Re;       // grid Reynolds number
-  T Lattice_g;        // lattice gravity                 9.8 m / s^2 = 9800 mm / s^2
+  T Lattice_g;        // lattice gravity
 
   T Lattice_RT;  // relaxation time
   T OMEGA;
@@ -127,13 +127,51 @@ struct BaseConverter final : public AbstractConverter<T> {
   }
   // deltaX, deltaT, rho = 1
   void SimplifiedConvertFromViscosity(int Ni_, T charU_, T VisKine_) {
-    Lattice_RT = T(0.5) + VisKine_ / cs2;
-    Converter(T(1), T(1), T(1), static_cast<T>(Ni_), charU_, VisKine_);
+    LatticeUnitMode(Ni_, T(0.5) + VisKine_ / cs2);
+    charU = charU_;
+    Lattice_charU = charU_;
+    Lattice_Re = Lattice_charU / Lattice_VisKine;
+    Re = Lattice_Re;
   }
   // deltaX, deltaT, rho = 1
   void SimplifiedConverterFromRT(int Ni_, T charU_, T LatRT_) {
+    LatticeUnitMode(Ni_, LatRT_);
+    charU = charU_;
+    Lattice_charU = charU_;
+    Lattice_Re = Lattice_charU / Lattice_VisKine;
+    Re = Lattice_Re;
+  }
+
+  /// 格子单位模式：所有转换因子 = 1，输入参数均为格子单位
+  /// @param Ni_ 格子域尺寸（Lattice_charL）
+  /// @param LatRT_ 格子松弛时间 τ (Lattice_RT)
+  void LatticeUnitMode(int Ni_, T LatRT_) {
+    /*-----------base params-------------*/
+    deltaX = T(1);
+    deltaT = T(1);
+    rho = T(1);
+    charL = static_cast<T>(Ni_);
+    charU = T(0);
+    VisKine = (LatRT_ - T(0.5)) * cs2;
+    Re = T(0);
+    /*----------conversion factors (all = 1)----*/
+    Conv_L = T(1);
+    Conv_Time = T(1);
+    Conv_rho = T(1);
+    Conv_U = T(1);
+    Conv_Mass = T(1);
+    Conv_VisKine = T(1);
+    Conv_Force = T(1);
+    Conv_Acc = T(1);
+    Conv_P = T(1);
+    /*-----------lattice param------------*/
+    Lattice_charU = T(0);
+    Lattice_charL = static_cast<T>(Ni_);
+    Lattice_VisKine = VisKine;
+    Lattice_Re = T(0);
+    Lattice_g = T(0);
     Lattice_RT = LatRT_;
-    Converter(T(1), T(1), T(1), static_cast<T>(Ni_), charU_, (LatRT_ - T(0.5)) * cs2);
+    OMEGA = T(1) / LatRT_;
   }
 
   void check(int &check_status);
@@ -509,25 +547,61 @@ struct PhaseFieldConverter final : public AbstractConverter<T> {
 
   PhaseFieldConverter(BaseConverter<T>& baseconv) : BaseConv(baseconv) {}
 
+  /// 物理单位→格子单位转换（保留原始功能）
   void Converter(T W_phys, T M_phi_phys, T sigma_phys) {
     W = W_phys;
     M_phi = M_phi_phys;
     sigma = sigma_phys;
 
-    Conv_W = W / BaseConv.Conv_L; // Lattice unit interface width
+    Conv_W = W / BaseConv.Conv_L;
     Conv_M_phi = M_phi * BaseConv.Conv_Time / (BaseConv.Conv_L * BaseConv.Conv_L);
     Conv_sigma = sigma / (BaseConv.Conv_rho * BaseConv.Conv_U * BaseConv.Conv_U * BaseConv.Conv_L);
 
-    beta = 12 * sigma / W;
-    kappa = 3 * W * sigma / 2;
+    beta = T(12) * sigma / W;
+    kappa = T(3) * W * sigma / T(2);
   }
 
-  T getLattice_RT() const override { return T(0); }
-  T getOMEGA() const override { return T(0); }
+  /// 两相流格子单位模式：从 INI 原始参数推导全部物理量
+  /// 所有输入均为格子单位，同步设置 BaseConv.LatticeUnitMode
+  /// @param Ni_    格子域尺寸
+  /// @param rho_l_ 轻流体密度
+  /// @param rho_h_ 重流体密度
+  /// @param eta_l_ 轻流体动力粘度
+  /// @param eta_h_ 重流体动力粘度
+  /// @param Re_    参考雷诺数
+  /// @param Eo_    Eötvös 数
+  /// @param R_     气泡半径
+  /// @param W_     界面宽度
+  /// @param M_     迁移率
+  void LatticeUnitMode_twoPhase(int Ni_, T rho_l_, T rho_h_, T eta_l_, T eta_h_,
+                                 T Re_, T Eo_, T R_, T W_, T M_) {
+    // -- NS flow parameters (set into BaseConv) --
+    T D = T(2) * R_;
+    T nu = eta_h_ / rho_h_;
+    T U_g = Re_ * nu / D;
+    T g_abs = U_g * U_g / D;
+    T DeltaRho = rho_h_ - rho_l_;
+    sigma = DeltaRho * g_abs * D * D / Eo_;
+    T tau_ns = T(0.5) + nu / BaseConv.cs2;
+    BaseConv.LatticeUnitMode(Ni_, tau_ns);
+    BaseConv.Lattice_g = -g_abs;  // 重力向下
+
+    // -- PF parameters --
+    W = W_;
+    M_phi = M_;
+    Conv_W = W;
+    Conv_M_phi = M_phi;
+    Conv_sigma = sigma;
+    beta = T(12) * sigma / W;
+    kappa = T(3) * W * sigma / T(2);
+  }
+
+  T getLattice_RT() const override { return T(0.5) + M_phi / BaseConv.cs2; }
+  T getOMEGA() const override { return T(1) / getLattice_RT(); }
   T getLatticeRho(T rho_phys) const override { return T(0); }
-  T getLatRhoInit() const override { return T(0); }
+  T getLatRhoInit() const override { return T(1); }
   T getPhysRho(T Lattice_rho) const override { return T(0); }
-  
+
   T getLatticeW() const { return Conv_W; }
   T getLatticeMphi() const { return Conv_M_phi; }
   T getLatticeSigma() const { return Conv_sigma; }

@@ -27,7 +27,7 @@ struct PhaseFieldPhi {
 //  Section 2: Velocity-Based Macroscopic (g_α → p, u*)
 //
 //  p   = ρ·c_s²·Σ_α g_α
-//  u*  = Σ_α g_α·e_α              (without force correction)
+//  u*  = Σ_α g_α·e_α              
 // ===================================================================
 
 template <typename CELL>
@@ -35,15 +35,17 @@ struct VelocityMomenta {
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
 
-  __any__ static inline void apply(const CELL& cell, T& p, Vector<T, LatSet::d>& u_star) {
+  __any__ static inline void apply(CELL& cell) {
     const T rho = cell.template get<typename CELL::GenericRho>();
     T sum = T{0};
-    u_star.clear();
+    Vector<T, LatSet::d> u_star = T{};
+    auto& F = cell.template get<FORCE<T, LatSet::d>>();
     for (unsigned int i = 0; i < LatSet::q; ++i) {
       sum += cell[i];
       u_star += latset::c<LatSet>(i) * cell[i];
     }
-    p = rho * LatSet::cs2 * sum;
+    cell.template get<VELOCITY<T,LatSet::d>>() = u_star + F * T{0.5} / rho;
+    cell.template get<PRESSURE<T>>() = rho * LatSet::cs2 * sum;
   }
 };
 

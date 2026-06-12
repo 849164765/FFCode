@@ -155,6 +155,9 @@ struct PHASEBase : public FieldBase<1> {};
 struct GRADBase : public FieldBase<1> {};
 struct NORMALBase : public FieldBase<1> {};
 struct WidthBase : public FieldBase<1> {};
+struct BetaBase : public FieldBase<1> {};
+struct KappaBase : public FieldBase<1> {};
+struct PressureBase : public FieldBase<1> {};
 
 struct RHOINITBase : public FieldBase<1> {};
 struct TEMPINITBase : public FieldBase<1> {};
@@ -201,7 +204,13 @@ using NORMAL = GenericField<GenericArray<Vector<T, D>>, NORMALBase>;
 template <typename T>
 using PHI = GenericField<GenericArray<T>, PHIBase>;
 template <typename T>
-using INTERFACEWIDTH = GenericField<GenericArray<T>, WidthBase>;
+using INTERFACEWIDTH = Data<T, WidthBase>;
+template <typename T>
+using BETA = Data<T, BetaBase>;
+template <typename T>
+using KAPPA = Data<T, KappaBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PressureBase>;
 
 using FLAG = GenericField<GenericArray<std::uint8_t>, FLAGBase>;
 
@@ -272,7 +281,13 @@ using GRAD = GenericField<GenericArray<Vector<T, D>>, GRADBase>;
 template <typename T, unsigned int D>
 using NORMAL = GenericField<GenericArray<Vector<T, D>>, NORMALBase>;
 template <typename T>
-using INTERFACEWIDTH = GenericField<GenericArray<T>, WidthBase>;
+using INTERFACEWIDTH = Data<T, WidthBase>;
+template <typename T>
+using BETA = Data<T, BetaBase>;
+template <typename T>
+using KAPPA = Data<T, KappaBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PressureBase>;
 
 template <typename T, unsigned int D>
 using VELOCITY = GenericField<GenericArray<Vector<T, D>>, VELOCITYBase>;
