@@ -350,37 +350,36 @@ int main(int argc, char* argv[]) {
 
   while (MainLoopTimer() < MaxStep) {
     
-    PFLattice.template ApplyInnerCellDynamics<UpdatePhiNSTaskSelector>(FlagFM);
+    PFLattice.template ApplyCellDynamics<UpdatePhiNSTaskSelector>(FlagFM);
     PFLattice.template getField<PHI<T>>().Communicate();
-
-    InterpolationCoupling.template ApplyInnerCellDynamics<InterpolationTaskSelector>(FlagFM);
+    
+    InterpolationCoupling.template ApplyCellDynamics<InterpolationTaskSelector>(FlagFM);
     NSLattice.template getField<RHO<T>>().Communicate();
     NSLattice.template getField<OMEGA<T>>().Communicate();
-
-    PFLattice.template ApplyInnerCellDynamics<UpdateGradTaskSelector>(FlagFM);
+    
+    PFLattice.template ApplyCellDynamics<UpdateGradTaskSelector>(FlagFM);
     PFLattice.template getField<GRAD<T, 2>>().Communicate();
-    PFLattice.template ApplyInnerCellDynamics<UpdateNormalTaskSelector>(FlagFM);
+    PFLattice.template ApplyCellDynamics<UpdateNormalTaskSelector>(FlagFM);
     PFLattice.template getField<NORMAL<T, 2>>().Communicate();
-
+    
     PFLattice.template ApplyCellDynamics<PhaseCollisionTaskSelector>(FlagFM);
-    PFLattice.Stream();
     PF_BB.Apply();
+    PFLattice.Stream();
     PFLattice.NormalCommunicate();
 
     NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
-    NSLattice.Stream();
     NS_BB.Apply();
+    NSLattice.Stream();
     NSLattice.NormalCommunicate();
-
+    
     // Clear total force before accumulation
     NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
     NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
     NSLattice.template getField<FORCE<T, 2>>().Communicate();
-
+    
     NSLattice.template ApplyCellDynamics<NSVelPressTaskSelector>(FlagFM);
     NSLattice.template getField<VELOCITY<T, 2>>().Communicate();
     NSLattice.template getField<PRESSURE<T>>().Communicate();
-
 
     ++MainLoopTimer;
     ++OutputTimer;
