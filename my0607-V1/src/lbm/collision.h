@@ -53,15 +53,22 @@ struct BGKForce {
     std::array<T, LatSet::q> fi{};
     ForceScheme::apply(u, force, fi);
     // equilibrium distribution function
+    T p = cell.template get<PRESSURE<T>>();
     std::array<T, LatSet::q> feq{};
-    EquilibriumScheme::apply(feq, rho, u);
+    EquilibriumScheme::apply(feq, rho, p ,u);
     // BGK collision
     const T omega = cell.getOmega();
     const T _omega = cell.get_Omega();
     const T fomega = cell.getfOmega();
 
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];
+    if constexpr (CELL::template hasField<PRESSURE<T>>()) {
+      for (unsigned int i = 0; i < LatSet::q; ++i) {
+        cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];
+      }
+    } else {
+      for (unsigned int i = 0; i < LatSet::q; ++i) {
+        cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];
+      }
     }
   }
 };

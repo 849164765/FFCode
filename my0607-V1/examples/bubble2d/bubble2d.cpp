@@ -201,9 +201,10 @@ int main(int argc, char* argv[]) {
   // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
   // Actual density variation enters via the FORCE field
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>>;
+                            FORCE<T, LatSet::d>, PRESSURE<T>, OMEGA<T>>;
+  T omega_init = T{1} / Tau_ns;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, LatSet::cs2, omega_init);
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -282,25 +283,27 @@ int main(int argc, char* argv[]) {
   // Initialize PF interface width
   PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
 
-  // Initialize NS populations to equilibrium
-  Vector<T, 2> u_zero{T{0}, T{0}};
-  T ns_rho_init = BaseConv.getLatRhoInit();
+  // Initialize NS populations to velocity-based equilibrium
+  // g_i = w_i * [p/(ρ(φ)cs²)] = w_i / ρ(φ)  (u=0, p=cs²)
+  // RHO field set to ρ(φ) = ρ_l + φ(ρ_h-ρ_l) for velocity-based coupling
+  auto& pfPhiInit = PFLattice.getField<PHI<T>>();
+  auto& nsRhoInit = NSLattice.getField<RHO<T>>();
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
     auto& blockLat = NSLattice.getBlockLat(blockid);
+    auto& blockRho = nsRhoInit.getBlockField(blockid);
+    auto& blockPhi = pfPhiInit.getBlockField(blockid);
     int overlap = 0;
     for (int j = overlap; j < block.getNy() - overlap; ++j) {
       for (int i = overlap; i < block.getNx() - overlap; ++i) {
         std::size_t id = j * proj[1] + i;
-        T u2 = T{0};
+        T phi = blockPhi.get(id);
+        T rho_phi = rho_l + phi * (rho_h - rho_l);
+        blockRho.get(id) = rho_phi;
         NSCELL cell(id, blockLat);
         for (unsigned int k = 0; k < LatSet::q; ++k) {
-          T uc = u_zero * latset::c<LatSet>(k);
-          T feq = latset::w<LatSet>(k) * ns_rho_init *
-                  (T{1} + LatSet::InvCs2 * uc + uc * uc * T{0.5} * LatSet::InvCs4 -
-                   LatSet::InvCs2 * u2 * T{0.5});
-          cell[k] = feq;
+          cell[k] = latset::w<LatSet>(k) / rho_phi;
         }
       }
     }
@@ -320,13 +323,11 @@ int main(int argc, char* argv[]) {
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
-  // NS task: BGKForce with Force vector field
+  // NS task: MRT velocity-based per Guo et al. 2025
+  // Eq.29: MRT collision, Eq.33: s₇=s₈=ω(φ), s₁-s₆ standard D2Q9 MRT
   using NSBulkTask = tmp::Key_TypePair<
     BulkFlag,
-    collision::BGKForce<
-      moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
-      equilibrium::SecondOrder<NSCELL>,
-      force::Force<NSCELL>>>;
+    collision::MRTVelocityBased<NSCELL, FORCE<T, LatSet::d>>>;
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
@@ -368,6 +369,27 @@ int main(int argc, char* argv[]) {
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravForceTask>;
   BlockLatManagerCoupling GravCoupling(PFLattice, NSLattice);
 
+  // ---- RHO + OMEGA interpolation (PF φ → NS RHO, OMEGA) ----
+  using RhoOmegaTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFRhoOmegaUpdate2D<PFCELL, NSCELL>>;
+  using RhoOmegaTaskSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, RhoOmegaTask>;
+  BlockLatManagerCoupling RhoOmegaCoupling(PFLattice, NSLattice);
+
+  // ---- F_p = -(p/ρ)·∇ρ (pressure-density force, Eq.28) ----
+  using PressForceTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFPressForce2D<PFCELL, NSCELL>>;
+  using PressForceTaskSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PressForceTask>;
+  BlockLatManagerCoupling PressCoupling(PFLattice, NSLattice);
+
+  // ---- F_v = ν(∇u+u∇)·∇ρ (viscous-density force, Eq.27) ----
+  using VisForceTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFVisForce2D<PFCELL, NSCELL>>;
+  using VisForceTaskSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, VisForceTask>;
+  BlockLatManagerCoupling VisCoupling(PFLattice, NSLattice);
+
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
@@ -375,10 +397,12 @@ int main(int argc, char* argv[]) {
   vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
   vtmo::ScalarWriter RhoWriter("Rho", NSLattice.getField<RHO<T>>());
   vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
+  vtmo::ScalarWriter PresWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
+  vtmo::ScalarWriter OmegaWriter("Omega", NSLattice.getField<OMEGA<T>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
   MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, RhoWriter, ForceWriter);
+                          VecWriter, RhoWriter, ForceWriter, PresWriter, OmegaWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
@@ -434,21 +458,32 @@ int main(int argc, char* argv[]) {
     // PFLattice.template ApplyCellDynamics<FFChemPotGradSel>(FlagFM);
     // PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
 
+    // Step 3: ρ(φ) + ω(φ) interpolation → NS RHO, OMEGA (Eqs.49-50, Eq.33)
+    // MRT decouples shear (s₇,s₈) from energy modes → safe for per-cell ω even at ω~1.6
+    RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+
     // ---- NS force accumulation ----
-    // Step 3: Clear NS FORCE
+    // Step 4: Clear NS FORCE
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
-    // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
+    // Step 5: Surface tension force F_s = λ·∇φ → NS FORCE
     STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // Step 5: Gravity/buoyancy force F_b → NS FORCE
+    // Step 6: Gravity/buoyancy force F_b → NS FORCE
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
+    // F_p and F_v disabled — F_p ≈ 75×F_s causes numerical instability even with MRT.
+    // These forces require MRT with s₀≈0 and s₇,ₛ tuned for correct density-gradient
+    // coupling. Enable after MRT relaxation rates are validated.
+    // Uncomment to enable:
+    // PressCoupling.ApplyCellDynamics<PressForceTaskSelector>(MainLoopTimer(), FlagFM);
+    // VisCoupling.ApplyCellDynamics<VisForceTaskSelector>(MainLoopTimer(), FlagFM);
+
     // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
+    // Step 9: NS MRT velocity-based collision (reads RHO, PRESSURE, FORCE, OMEGA)
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
+    // Step 10: NS BCs + Stream + Communicate
     NS_BB.Apply(MainLoopTimer());
     NSLattice.Stream();
     NSLattice.NormalCommunicate();

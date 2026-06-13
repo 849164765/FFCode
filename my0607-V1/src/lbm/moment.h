@@ -387,17 +387,30 @@ struct forcerhoUImpl {
 
   __any__ static inline void apply(CELL& cell, const Vector<T, LatSet::d>& f_alpha, T& rho_value,
                            Vector<T, LatSet::d>& u_value) {
-    rho_value = T{};
+    T gsum = T{};
     u_value.clear();
     for (unsigned int i = 0; i < LatSet::q; ++i) {
-      rho_value += cell[i];
+      gsum += cell[i];
       u_value += latset::c<LatSet>(i) * cell[i];
     }
-    u_value += f_alpha * T{0.5};
-    u_value /= rho_value;
     if constexpr (WriteToField) {
-      cell.template get<GenericRho>() = rho_value;
-      cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
+      if constexpr (CELL::template hasField<PRESSURE<T>>()) {
+        // Velocity-based per Guo et al. 2025:
+        // Eq.36: p = ρ c_s² Σ g_α
+        // Eq.35: u = Σ e_α g_α + dt/(2ρ)·F_total  (dt=1)
+        const T rho_phi = cell.template get<GenericRho>();
+        rho_value = rho_phi;
+        u_value += f_alpha * T{0.5} / rho_phi;
+        cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
+        cell.template get<PRESSURE<T>>() = rho_phi * LatSet::cs2 * gsum;
+      } else {
+        // Density-based fallback
+        rho_value = gsum;
+        u_value += f_alpha * T{0.5};
+        u_value /= gsum;
+        cell.template get<GenericRho>() = rho_value;
+        cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
+      }
     }
   }
   // for scalar force

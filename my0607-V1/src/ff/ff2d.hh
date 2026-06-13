@@ -166,4 +166,71 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   ns_cell.template get<OMEGA<T>>() = omega;
 }
 
+// ---- FFPressForce2D ----
+// F_p = -(p/ρ)·∇ρ  where ∇ρ = (ρ_h-ρ_l)·∇φ
+template <typename PFCELL, typename NSCELL>
+__any__ void FFPressForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  const auto& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T p = ns_cell.template get<PRESSURE<T>>();
+
+  T rho = rho_l + phi * (rho_h - rho_l);
+  T inv_rho = T{1} / rho;
+  T coeff = -p * inv_rho * (rho_h - rho_l);
+
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += coeff * grad_phi[0];
+  ns_force[1] += coeff * grad_phi[1];
+}
+
+// ---- FFVisForce2D ----
+// F_v = ν(∇u + u∇)·∇ρ    ∇ρ = (ρ_h-ρ_l)·∇φ
+// ∇u computed via D2Q9 isotropic FD on ns_cell neighbor VELOCITY
+template <typename PFCELL, typename NSCELL>
+__any__ void FFVisForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+  T rho_l = pf_cell.template get<RHO_L<T>>();
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T eta_l = pf_cell.template get<ETA_L<T>>();
+  T eta_h = pf_cell.template get<ETA_H<T>>();
+  const auto& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+
+  T rho = rho_l + phi * (rho_h - rho_l);
+  T eta = eta_l + phi * (eta_h - eta_l);
+  T nu = eta / rho;
+
+  // ∇u via isotropic FD using neighbor VELOCITY (D2Q9 stencil)
+  T grad_u[2][2] = {};  // grad_u[a][b] = ∂u_a/∂x_b
+  for (unsigned int k = 1; k < LatSet::q; ++k) {
+    const auto& u_neighbor = ns_cell.getNeighbor(k).template get<VELOCITY<T, LatSet::d>>();
+    T wk = latset::w<LatSet>(k);
+    const auto& ck = latset::c<LatSet>(k);
+    for (unsigned int a = 0; a < 2; ++a) {
+      for (unsigned int b = 0; b < 2; ++b) {
+        grad_u[a][b] += wk * ck[b] * u_neighbor[a];
+      }
+    }
+  }
+  for (unsigned int a = 0; a < 2; ++a)
+    for (unsigned int b = 0; b < 2; ++b)
+      grad_u[a][b] /= LatSet::cs2;
+
+  // ∇ρ = (ρ_h-ρ_l)·∇φ
+  T grad_rho[2];
+  grad_rho[0] = (rho_h - rho_l) * grad_phi[0];
+  grad_rho[1] = (rho_h - rho_l) * grad_phi[1];
+
+  // F_v^a = nu * Σ_b (∂u_a/∂x_b + ∂u_b/∂x_a) * ∂ρ/∂x_b
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  for (unsigned int a = 0; a < 2; ++a) {
+    T fv = T{};
+    for (unsigned int b = 0; b < 2; ++b) {
+      fv += nu * (grad_u[a][b] + grad_u[b][a]) * grad_rho[b];
+    }
+    ns_force[a] += fv;
+  }
+}
+
 }  // namespace ff

@@ -441,4 +441,202 @@ struct MRTForce {
   }
 };
 
+// MRT collision for velocity-based Navier-Stokes per Guo et al. 2025.
+//
+// Eq.29: g̃ = g - M⁻¹·S·M·(g-g_eq) + M⁻¹·(I-S/2)·M·G
+// Eq.33: 1/s₇ = 1/s₈ = η/(ρc²) + 0.5  (per-cell shear omega)
+// Conserved: s₀, s₃, s₅ = 0.  Non-conserved: standard D2Q9 stability values.
+//
+// Requires: OMEGA<T> field for per-cell ω(φ), RHO<T> for ρ(φ),
+//           PRESSURE<T>, FORCE<T,D>, VELOCITY<T,D>.
+template <typename CELL, typename ForceField>
+struct MRTVelocityBased {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static void apply(CELL& cell) {
+    const auto& F = cell.template get<ForceField>();
+
+    // ---- 1. Velocity-based macro update (Eqs.35-36) ----
+    T gsum = T{};
+    Vector<T, LatSet::d> u{};
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      gsum += cell[k];
+      for (unsigned int d = 0; d < LatSet::d; ++d)
+        u[d] += latset::c<LatSet>(k)[d] * cell[k];
+    }
+    const T rho_phi = cell.template get<typename CELL::GenericRho>(); // ρ(φ)
+    Vector<T, LatSet::d> uc = u;
+    for (unsigned int d = 0; d < LatSet::d; ++d)
+      uc[d] += F[d] / (T{2} * rho_phi);          // Eq.35: u = Σe·g + F/(2ρ)
+    T pressure = rho_phi * LatSet::cs2 * gsum;     // Eq.36: p = ρc²·Σg
+    cell.template get<VELOCITY<T, LatSet::d>>() = uc;
+    cell.template get<PRESSURE<T>>() = pressure;
+
+    // ---- 2. Relaxation rate vector (standard D2Q9 MRT + uniform omega) ----
+    // Using block-level omega for shear to avoid force imbalance from
+    // per-cell ω variation: (1-s₇/2) must be uniform for consistent F/ρ.
+    // Per-cell ω(φ) (Eq.33) can be enabled after force-term renormalization.
+    T omega_sh = cell.getOmega();
+
+    T rtvec[LatSet::q] {};
+    rtvec[0] = T{0};                              // s₀: conserved (density)
+    rtvec[1] = T{1.2};                            // s₁: energy
+    rtvec[2] = T{1.4};                            // s₂: energy square
+    rtvec[3] = T{0};                              // s₃: conserved (momentum x)
+    rtvec[4] = T{1.2};                            // s₄: energy flux x
+    rtvec[5] = T{0};                              // s₅: conserved (momentum y)
+    rtvec[6] = T{1.2};                            // s₆: energy flux y
+    rtvec[7] = omega_sh;                          // s₇: shear (xx stress)
+    rtvec[8] = omega_sh;                          // s₈: shear (xy stress)
+
+    // ---- 3. Population moments m = M·g ----
+    T m[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        m[i] += mrt::M<LatSet>(i, j) * cell[j];
+
+    // ---- 4. Equilibrium moments m_eq = M·g_eq (Eq.31) ----
+    std::array<T, LatSet::q> feq{};
+    equilibrium::NSFieldEquilibrium<CELL>::apply(feq, rho_phi, pressure, uc);
+    T mEq[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        mEq[i] += mrt::M<LatSet>(i, j) * feq[j];
+
+    // ---- 5. Guo force in population space (Eq.32), divide by ρ (Eq.25) ----
+    T uF = uc[0] * F[0] + uc[1] * F[1];
+    T invRho = T{1} / rho_phi;
+    T G_pop[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T cF = T{}, cu = T{};
+      for (unsigned int d = 0; d < LatSet::d; ++d) {
+        cF += latset::c<LatSet>(i)[d] * F[d];
+        cu += latset::c<LatSet>(i)[d] * uc[d];
+      }
+      G_pop[i] = latset::w<LatSet>(i)
+                * (LatSet::InvCs2 * (cF - uF) + LatSet::InvCs4 * cu * cF)
+                * invRho;
+    }
+    // ---- 6. Force in moment space: F_m = M·G_pop ----
+    T F_m[LatSet::q] {};
+    for (unsigned int j = 0; j < LatSet::q; ++j)
+      for (unsigned int k = 0; k < LatSet::q; ++k)
+        F_m[j] += mrt::M<LatSet>(j, k) * G_pop[k];
+
+    // ---- 7. MRT collision + force: Eq.29 ----
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll = T{}, src = T{};
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        T invM_ij = mrt::InvM<LatSet>(i, j);
+        coll += invM_ij * rtvec[j] * (m[j] - mEq[j]);
+        src  += invM_ij * (T{1} - rtvec[j] / T{2}) * F_m[j];
+      }
+      cell[i] = cell[i] - coll + src;
+    }
+
+    // ---- 8. Light pressure relaxation (zeroth moment only) ----
+    // s₀=0 conserves Σg, but streaming across interface mixes 1/ρ from
+    // neighboring cells with different φ, creating Σg ≠ 1/ρ(φ_local).
+    // MRT separation allows this without disturbing shear modes.
+    {
+      T gsum2 = T{};
+      for (unsigned int i = 0; i < LatSet::q; ++i) gsum2 += cell[i];
+      T g_target = T{1} / rho_phi;
+      T delta = gsum2 - g_target;
+      constexpr T omega_p = T{0.1};
+      for (unsigned int i = 0; i < LatSet::q; ++i)
+        cell[i] -= omega_p * latset::w<LatSet>(i) * delta;
+      cell.template get<PRESSURE<T>>() = rho_phi * LatSet::cs2 * (gsum2 - omega_p * delta);
+    }
+  }
+};
+
+// ===== Simplified variant: all s = omega (BGK-equivalent MRT) =====
+template <typename CELL, typename ForceField>
+struct MRTVelocityBasedBGK {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static void apply(CELL& cell) {
+    T omega;
+    if constexpr (CELL::template hasField<OMEGA<T>>()) {
+      omega = cell.template get<OMEGA<T>>();
+    } else {
+      omega = cell.getOmega();
+    }
+    const auto& F = cell.template get<ForceField>();
+
+    // Macro update (velocity-based)
+    T gsum = T{};
+    Vector<T, LatSet::d> u{};
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      gsum += cell[k];
+      for (unsigned int d = 0; d < LatSet::d; ++d)
+        u[d] += latset::c<LatSet>(k)[d] * cell[k];
+    }
+    const T rho_phi = cell.template get<typename CELL::GenericRho>();
+    Vector<T, LatSet::d> uc = u;
+    for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho_phi);
+    T pressure = rho_phi * LatSet::cs2 * gsum;
+    cell.template get<VELOCITY<T, LatSet::d>>() = uc;
+    cell.template get<PRESSURE<T>>() = pressure;
+
+    // MRT with all s = omega (equivalent to BGK in moment space)
+    T rtvec[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
+
+    T momenta[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
+
+    std::array<T, LatSet::q> feq{};
+    equilibrium::NSFieldEquilibrium<CELL>::apply(feq, rho_phi, pressure, uc);
+    T momentaEq[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        momentaEq[i] += mrt::M<LatSet>(i, j) * feq[j];
+
+    T invRho_bgk = T{1} / rho_phi;
+    T uF_dot = uc[0] * F[0] + uc[1] * F[1];
+    T fi_force[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T cF = T{}, cu = T{};
+      for (unsigned int d = 0; d < LatSet::d; ++d) {
+        cF += latset::c<LatSet>(i)[d] * F[d];
+        cu += latset::c<LatSet>(i)[d] * uc[d];
+      }
+      fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF_dot)
+                     + LatSet::InvCs4 * cu * cF) * invRho_bgk;
+    }
+    T force_m[LatSet::q] {};
+    for (unsigned int j = 0; j < LatSet::q; ++j)
+      for (unsigned int k = 0; k < LatSet::q; ++k)
+        force_m[j] += mrt::M<LatSet>(j, k) * fi_force[k];
+
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{}, source{};
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        T invM_ij = mrt::InvM<LatSet>(i, j);
+        coll += invM_ij * rtvec[j] * (momenta[j] - momentaEq[j]);
+        source += invM_ij * (T{1} - rtvec[j] / T{2}) * force_m[j];
+      }
+      cell[i] = cell[i] - coll + source;
+    }
+
+    // Pressure relaxation
+    {
+      T gsum2{};
+      for (unsigned int i = 0; i < LatSet::q; ++i) gsum2 += cell[i];
+      T gsum_target = T{1} / rho_phi;
+      T delta = gsum2 - gsum_target;
+      constexpr T omega_p = T{0.05};
+      for (unsigned int i = 0; i < LatSet::q; ++i)
+        cell[i] -= omega_p * latset::w<LatSet>(i) * delta;
+      cell.template get<PRESSURE<T>>() = rho_phi * LatSet::cs2 * (gsum2 - omega_p * delta);
+    }
+  }
+};
+
 }

@@ -186,6 +186,25 @@ struct PhaseFieldEquilibrium {
     apply(feq, phi, u);
   }
 };
+template <typename CELL>
+struct NSFieldEquilibrium {            
+  using CELLTYPE = CELL;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline void apply(std::array<T, LatSet::q>& feq, T rho, T p,
+                                   const Vector<T, LatSet::d>& u) {
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      T edotu = T{};
+      for (unsigned int l = 0; l < LatSet::d; ++l) {
+        edotu += latset::c<LatSet>(k)[l] * u[l];
+      }
+      feq[k] = latset::w<LatSet>(k) *
+           (p * LatSet::InvCs2 / rho + LatSet::InvCs2 * edotu + edotu * edotu * T{0.5} * LatSet::InvCs4 -
+            LatSet::InvCs2 * u * u * T{0.5});
+    }
+  }
+};
 
 
 

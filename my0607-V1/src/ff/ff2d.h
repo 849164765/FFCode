@@ -139,6 +139,24 @@ struct FFRhoOmegaUpdate2D {
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
 
+// F_p = -(p/ρ)·∇ρ per Eq.(28).  Requires MRT to avoid numerical cancellation.
+// p = PRESSURE from NS, ∇ρ = (ρ_h-ρ_l)·∇φ from PF.
+template <typename PFCELL, typename NSCELL>
+struct FFPressForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// F_v = ν(∇u + u∇)·∇ρ per Eq.(27).  Requires MRT to avoid numerical cancellation.
+// ν = η(φ)/ρ(φ), ∇ρ = (ρ_h-ρ_l)·∇φ.  ∇u computed via FD stencil from NS VELOCITY.
+template <typename PFCELL, typename NSCELL>
+struct FFVisForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())
