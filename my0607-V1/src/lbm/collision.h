@@ -55,10 +55,16 @@ struct BGKForce {
     // equilibrium distribution function
     std::array<T, LatSet::q> feq{};
     EquilibriumScheme::apply(feq, rho, u);
-    // BGK collision
-    const T omega = cell.getOmega();
-    const T _omega = cell.get_Omega();
-    const T fomega = cell.getfOmega();
+    // BGK collision: use per-cell OMEGA if available, otherwise block-level scalar
+    const T omega = [&]() {
+      if constexpr (CELL::template hasField<OMEGA<T>>()) {
+        return cell.template get<OMEGA<T>>();
+      } else {
+        return cell.getOmega();
+      }
+    }();
+    const T _omega = T(1) - omega;
+    const T fomega = T(1) - omega / T(2);
 
     for (unsigned int i = 0; i < LatSet::q; ++i) {
       cell[i] = omega * feq[i] + _omega * cell[i] + fomega * fi[i];

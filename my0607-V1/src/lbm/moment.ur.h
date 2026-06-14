@@ -551,6 +551,22 @@ if constexpr (WriteToField) {cell.template get<GenericRho>() = rho_value; cell.t
 }
 };
 
+// variable-density D2Q9: rho from field, do NOT overwrite GenericRho
+template <typename T, typename TypePack, typename ForceScheme, bool WriteToField>
+struct variableDensityRhoUImpl<CELL<T, D2Q9<T>, TypePack>, ForceScheme, WriteToField>{
+using CELLTYPE = CELL<T, D2Q9<T>, TypePack>;
+using LatSet = D2Q9<T>;
+using GenericRho = typename CELLTYPE::GenericRho;
+
+__any__ static inline void apply(CELLTYPE& cell, const Vector<T, LatSet::d>& f_alpha, T& rho_value, Vector<T, LatSet::d>& u_value){
+rho_value = cell.template get<GenericRho>();
+T rho_inv = T{1} / rho_value;
+u_value[0] = (cell[1]-cell[2]+cell[5]-cell[6]+cell[7]-cell[8] + f_alpha[0]*T{0.5}) * rho_inv;
+u_value[1] = (cell[3]-cell[4]+cell[5]-cell[6]-cell[7]+cell[8] + f_alpha[1]*T{0.5}) * rho_inv;
+if constexpr (WriteToField) {cell.template get<VELOCITY<T, LatSet::d>>() = u_value;}
+}
+};
+
 template <typename T, typename TypePack, typename ForceScheme, bool WriteToField>
 struct forcerhoUImpl<CELL<T, D3Q7<T>, TypePack>, ForceScheme, WriteToField>{
 using CELLTYPE = CELL<T, D3Q7<T>, TypePack>;

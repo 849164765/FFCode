@@ -39,7 +39,6 @@ T sigma;
 T gravity;
 T Eo;
 T Re;
-T U_g;       // characteristic lattice velocity
 T Tau_ns;
 
 // simulation
@@ -69,37 +68,52 @@ void readParam() {
   rho_h = param_reader.getValue<T>("Two_Phase", "rho_h");
   Eo = param_reader.getValue<T>("Two_Phase", "Eo");
   Re = param_reader.getValue<T>("Two_Phase", "Re");
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
+  eta_h = param_reader.getValue<T>("Two_Phase", "eta_h");
+  eta_l = param_reader.getValue<T>("Two_Phase", "eta_l");
 
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
 
-  // ===== 5-step parameter design =====
+  // ===== Parameter design =====
   // Step 1: bubble diameter in lattice units
   T D = T(2.0) * Bubble_Radius;
+  T DeltaRho = std::abs(rho_h - rho_l);
 
-  // Step 2: characteristic lattice velocity (Ma ~ U_g/cs << 1 for incompressible)
-  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
-  // validate: U_g should be in [0.02, 0.08] for LBM stability
-  if (U_g < T(0.01) || U_g > T(0.15)) {
-    if (mpi().getRank() == 0) {
-      std::cerr << "[Warning] U_g=" << U_g << " out of [0.01, 0.15] range\n";
-    }
+  // Read optional U_g; if > 0, override Re-based gravity derivation
+  T U_g_input = param_reader.getValue<T>("Two_Phase", "U_g");
+
+  T nu_h, nu_l, U_g_derived, nu;
+
+  if (U_g_input > T(0)) {
+    // ---- U_g-based design: keep Re, Eo and viscosity ratio unchanged ----
+    T eta_ratio = eta_l / eta_h;
+    eta_h = U_g_input * D * rho_h / Re;
+    eta_l = eta_h * eta_ratio;
+    nu_h = eta_h / rho_h;
+    nu_l = eta_l / rho_l;
+
+    T g_abs = U_g_input * U_g_input / D;
+    gravity = -g_abs;
+    U_g_derived = U_g_input;
+    nu = nu_h;
+
+    // Boussinesq recalibration: sigma uses effective gravity scaled by Δρ/ρ_l
+    // to maintain correct Eo after buoyancy is divided by ρ_l
+    sigma = DeltaRho * g_abs * D * D / (Eo * rho_l);
+  } else {
+    // ---- Original Re-based design ----
+    nu_h = eta_h / rho_h;
+    nu_l = eta_l / rho_l;
+
+    T g_abs = (Re * eta_h) * (Re * eta_h) / (rho_h * rho_h * D * D * D);
+    gravity = -g_abs;
+
+    U_g_derived = std::sqrt(g_abs * D);
+    nu = nu_h;
+
+    // Boussinesq recalibration: sigma uses effective gravity scaled by Δρ/ρ_l
+    sigma = DeltaRho * g_abs * D * D / (Eo * rho_l);
   }
-
-  // Step 3: gravity from characteristic velocity  g = U_g² / D
-  T g_abs = U_g * U_g / D;
-  gravity = -g_abs;
-
-  // Step 4: kinematic viscosity from Re  ν = U_g * D / Re
-  //         dynamic viscosity  η_h = ν * ρ_h,  η_l = η_h / 10
-  T nu = U_g * D / Re;
-  eta_h = nu * rho_h;
-  eta_l = eta_h / T(10);
-
-  // Step 5: surface tension from Eo  σ = Δρ * g * D² / Eo
-  T DeltaRho = rho_h - rho_l;
-  sigma = DeltaRho * g_abs * D * D / Eo;
 
   // derived from sigma: Eq.(14) β=12σ/W, κ=3Wσ/2
   Kappa = T(3.0) * Interface_Width * sigma * T(0.5);
@@ -110,9 +124,9 @@ void readParam() {
   // NS relaxation time  τ = 0.5 + ν/cs²
   Tau_ns = T(0.5) + nu / LatSet::cs2;
 
-  // CFL check: (U_g + cs) * dt / dx
+  // CFL check: (U_g_derived + cs) * dt / dx
   T cs = std::sqrt(LatSet::cs2);
-  T CFL = U_g + cs;  // dx=1, dt=1 in SimplifiedConverter
+  T CFL = U_g_derived + cs;  // dx=1, dt=1 in SimplifiedConverter
   bool cfl_ok = (CFL < T(1.2));
 
   MPI_RANK(0) {
@@ -121,10 +135,17 @@ void readParam() {
     std::cout << "[Bubble]: R=" << Bubble_Radius << " D=" << D
               << "  Center=(" << Bubble_Center[0] << "," << Bubble_Center[1] << ")\n";
     std::cout << "[Design] Step1: D = " << D << "\n";
-    std::cout << "[Design] Step2: U_g = " << U_g << " (Ma=" << U_g/cs << ")\n";
-    std::cout << "[Design] Step3: g = U_g^2/D = " << gravity << "\n";
-    std::cout << "[Design] Step4: nu = U_g*D/Re = " << nu
-              << "  eta_h = " << eta_h << "  eta_l = " << eta_l << "\n";
+    std::cout << "[Design] Step2: eta_h = " << eta_h << "  eta_l = " << eta_l
+              << "  nu_h(Bouss)=" << eta_h << "  nu_l(Bouss)=" << eta_l << "\n";
+    if (U_g_input > T(0)) {
+      std::cout << "[Design] Step3: g = U_g^2/D = " << gravity << "  [U_g-based]\n";
+      std::cout << "[Design] Step4: U_g = " << U_g_derived << " (input)"
+                << " (Ma=" << U_g_derived/cs << ")  tau_ns = " << Tau_ns << "\n";
+    } else {
+      std::cout << "[Design] Step3: g = (Re*eta_h)^2/(rho_h^2*D^3) = " << gravity << "  [Re-based]\n";
+      std::cout << "[Design] Step4: U_g = sqrt(|g|*D) = " << U_g_derived
+                << " (Ma=" << U_g_derived/cs << ")  tau_ns = " << Tau_ns << "\n";
+    }
     std::cout << "[Design] Step5: sigma = DeltaRho*g*D^2/Eo = " << sigma << "\n";
     std::cout << "[Phase]: W=" << Interface_Width << " M=" << Mobility
               << " beta=" << Beta << " kappa=" << Kappa
@@ -145,7 +166,7 @@ void readParam() {
 
   if (!cfl_ok) {
     MPI_RANK(0) {
-      std::cerr << "[ERROR] CFL=" << CFL << " > 1.2! Reduce U_g in ini file.\n";
+      std::cerr << "[ERROR] CFL=" << CFL << " > 1.2! Reduce Re or increase eta_h in ini file.\n";
     }
     exit(1);
   }
@@ -198,12 +219,13 @@ int main(int argc, char* argv[]) {
   GeoWriter.WriteBinary();
 
   // ------------------ define NS lattice ------------------
-  // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
-  // Actual density variation enters via the FORCE field
+  // OMEGA<T> enables per-cell variable viscosity via FFRhoOmegaUpdate2D
+  // RHO<T> is updated by FFRhoOmegaUpdate2D with the physical interpolated density
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
-                            FORCE<T, LatSet::d>>;
+                            FORCE<T, LatSet::d>, OMEGA<T>>;
+  T init_omega = T(1.0) / Tau_ns;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
-                         T{}, Vector<T, 2>{T{0}, T{0}});
+                         T{}, Vector<T, 2>{T{0}, T{0}}, init_omega);
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -229,8 +251,8 @@ int main(int argc, char* argv[]) {
                             gravity, Beta, Kappa);
 
   // ---- Initialize PHI and POP fields ----
-  // φ = 0 for light fluid (bubble interior), φ = 1 for heavy fluid (outside)
-  // φ = 0.5 + 0.5*tanh(2*(r-R)/W) per Eq.(11)
+  // φ = 1 for light fluid (bubble interior), φ = 0 for heavy fluid (outside)
+  // Theoretical equilibrium: sqrt(κ/β) = W/(2√2), so φ = 0.5-0.5*tanh(2√2*(r-R)/W)
   T R_phys = Bubble_Radius * Cell_Len;
   T xc_phys = Bubble_Center[0] * Cell_Len;
   T yc_phys = Bubble_Center[1] * Cell_Len;
@@ -252,7 +274,7 @@ int main(int argc, char* argv[]) {
         T dx = x - xc_phys;
         T dy = y - yc_phys;
         T dist = std::sqrt(dx * dx + dy * dy);
-        T phi = T(0.5) + T(0.5) * std::tanh(T(2.0) * (dist - R_phys) / W_phys);
+        T phi = T(0.5) - T(0.5) * std::tanh(T(2.0) * std::sqrt(T(2.0)) * (dist - R_phys) / W_phys);
         blockPhi.get(id) = phi;
       }
     }
@@ -356,8 +378,11 @@ int main(int argc, char* argv[]) {
   using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
 
   // ---- Coupling tasks (PF → NS) ----
+  // Surface tension: choose λ∇φ or -φ∇λ form (both equivalent up to pressure gradient)
   using STForceTask =
     tmp::Key_TypePair<BulkFlag, ff::FFSurfaceTension2D<PFCELL, NSCELL>>;
+  // using STForceTask =
+  //   tmp::Key_TypePair<BulkFlag, ff::FFSurfaceTensionChemPot2D<PFCELL, NSCELL>>;
   using STForceTaskSelector =
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, STForceTask>;
   BlockLatManagerCoupling STCoupling(PFLattice, NSLattice);
@@ -368,17 +393,25 @@ int main(int argc, char* argv[]) {
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravForceTask>;
   BlockLatManagerCoupling GravCoupling(PFLattice, NSLattice);
 
+  // Update NS rho and omega from phi via linear interpolation
+  using RhoOmegaTask =
+    tmp::Key_TypePair<BulkFlag, ff::FFRhoOmegaUpdate2D<PFCELL, NSCELL>>;
+  using RhoOmegaTaskSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, RhoOmegaTask>;
+  BlockLatManagerCoupling RhoOmegaCoupling(PFLattice, NSLattice);
+
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
   vtmo::VectorWriter NormalWriter("NORMAL", PFLattice.getField<NORMAL<T, 2>>());
   vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
   vtmo::ScalarWriter RhoWriter("Rho", NSLattice.getField<RHO<T>>());
+  vtmo::ScalarWriter OmegaWriter("Omega", NSLattice.getField<OMEGA<T>>());
   vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
   MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, RhoWriter, ForceWriter);
+                          VecWriter, RhoWriter, OmegaWriter, ForceWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
@@ -444,8 +477,12 @@ int main(int argc, char* argv[]) {
     // Step 5: Gravity/buoyancy force F_b → NS FORCE
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
+    // Step 5.5: Update NS rho and omega from phi interpolation
+    // ρ(φ) = ρ_l + φ*(ρ_h-ρ_l), η(φ) = η_l + φ*(η_h-η_l), ν = η/ρ, ω = 1/(0.5+ν/cs²)
+    RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+
     // ---- NS collision and streaming ----
-    // Step 6: NS BGKForce collision
+    // Step 6: NS BGKForce collision (reads per-cell OMEGA when available)
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
     // Step 7: NS BCs + Stream + Communicate

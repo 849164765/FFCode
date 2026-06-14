@@ -393,8 +393,8 @@ struct forcerhoUImpl {
       rho_value += cell[i];
       u_value += latset::c<LatSet>(i) * cell[i];
     }
-    u_value += f_alpha * T{0.5};
-    u_value /= rho_value;
+    u_value += f_alpha * T{0.5} / rho_value;
+    //u_value /= rho_value;
     if constexpr (WriteToField) {
       cell.template get<GenericRho>() = rho_value;
       cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
@@ -455,6 +455,62 @@ struct forcerhoU {
   // for scalar force
   __any__ static inline void apply(CELL& cell, const T f, T& rho_value, Vector<T, LatSet::d>& u_value) {
     forcerhoUImpl<CELL, ForceScheme, WriteToField>::apply(cell, f, rho_value, u_value);
+  }
+};
+
+// ---------------------------------------------------------------------------
+//  variableDensityRhoU  --  variable-density moment scheme
+//    rho = rho_phys (read from RHO field, set by FFRhoOmegaUpdate2D)
+//    u   = ( Σf_i·c_i + 0.5·F ) / rho_phys
+//    Writes VELOCITY only, preserves rho_phys in the RHO field.
+// ---------------------------------------------------------------------------
+template <typename CELLTYPE, typename ForceScheme, bool WriteToField>
+struct variableDensityRhoUImpl {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static inline void apply(CELL& cell, const Vector<T, LatSet::d>& f_alpha,
+                                   T& rho_value, Vector<T, LatSet::d>& u_value) {
+    rho_value = cell.template get<GenericRho>();
+    u_value.clear();
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      u_value += latset::c<LatSet>(i) * cell[i];
+    }
+    u_value += f_alpha * T{0.5};
+    u_value /= rho_value;
+    if constexpr (WriteToField) {
+      cell.template get<VELOCITY<T, LatSet::d>>() = u_value;
+    }
+  }
+};
+
+template <typename CELLTYPE, typename ForceScheme, bool WriteToField = false>
+struct variableDensityRhoU {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static inline void apply(CELL& cell) {
+    static_assert(WriteToField, "variableDensityRhoU::apply(CELL) must write to field");
+    const auto force = ForceScheme::getForce(cell);
+    apply(cell, force);
+  }
+  __any__ static inline void apply(CELL& cell, const Vector<T, LatSet::d>& f_alpha) {
+    static_assert(WriteToField, "variableDensityRhoU::apply(cell, f_alpha) must write to field");
+    T& rho_value = cell.template get<GenericRho>();
+    Vector<T, LatSet::d>& u_value = cell.template get<VELOCITY<T, LatSet::d>>();
+    apply(cell, f_alpha, rho_value, u_value);
+  }
+  __any__ static inline void apply(CELL& cell, T& rho_value, Vector<T, LatSet::d>& u_value) {
+    const auto force = ForceScheme::getForce(cell);
+    apply(cell, force, rho_value, u_value);
+  }
+  __any__ static inline void apply(CELL& cell, const Vector<T, LatSet::d>& f_alpha,
+                                   T& rho_value, Vector<T, LatSet::d>& u_value) {
+    variableDensityRhoUImpl<CELL, ForceScheme, WriteToField>::apply(cell, f_alpha, rho_value, u_value);
   }
 };
 

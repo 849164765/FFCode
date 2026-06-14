@@ -101,7 +101,7 @@ __any__ void FFChemPotentialGradient2D<CELL>::apply(CELL& cell) {
 }
 
 // ---- FFSurfaceTension2D ----
-// F_s = λ * ∇φ  → added to ns_cell FORCE
+// F_s = λ * ∇φ  → added to ns_cell FORCE (uniform scaling, no per-cell density division)
 template <typename PFCELL, typename NSCELL>
 __any__ void FFSurfaceTension2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T chem_potential = pf_cell.template get<CHEMICALPOTENTIAL<T>>();
@@ -110,6 +110,33 @@ __any__ void FFSurfaceTension2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
   ns_force[0] += chem_potential * grad[0];
   ns_force[1] += chem_potential * grad[1];
+}
+
+// ---- FFSurfaceTensionChemPot2D ----
+// F_s = -φ * ∇λ  → added to ns_cell FORCE (uniform scaling, no per-cell density division)
+template <typename PFCELL, typename NSCELL>
+__any__ void FFSurfaceTensionChemPot2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+
+  // Compute ∇λ from neighbor chemical potentials
+  Vector<T, LatSet::d> grad_lambda;
+  grad_lambda[0] = T{0};
+  grad_lambda[1] = T{0};
+
+  for (unsigned int i = 1; i < LatSet::q; ++i) {
+    T lambda_i = pf_cell.getNeighbor(i).template get<CHEMICALPOTENTIAL<T>>();
+    T wi = latset::w<LatSet>(i);
+    const auto& ci = latset::c<LatSet>(i);
+    grad_lambda[0] += wi * ci[0] * lambda_i;
+    grad_lambda[1] += wi * ci[1] * lambda_i;
+  }
+  grad_lambda[0] /= LatSet::cs2;
+  grad_lambda[1] /= LatSet::cs2;
+
+  // F_s = -φ * ∇λ
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] -= phi * grad_lambda[0];
+  ns_force[1] -= phi * grad_lambda[1];
 }
 
 // ---- FFGravityForce2D ----
@@ -121,25 +148,22 @@ __any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
   T rho_h = pf_cell.template get<RHO_H<T>>();
   T g = pf_cell.template get<GRAVITY<T>>();
 
-  // g is negative (downward), so |g| = -g
-  T rho = rho_l + phi * (rho_h - rho_l);
-  // F_b in y-direction. Gravity points downward (negative y).
-  // Since g is negative: buoyancy = rho*g (negative * negative = positive upward force if rho_l < rho_h)
-  // Wait: F_b = ρ * G_y where G_y is the gravitational acceleration.
-  // For bubble rising, the bubble is lighter (ρ_l << ρ_h), so light fluid rises.
-  // F_b[1] = rho * g where g is negative (pointing down).
+  // g is negative (downward).
+  // Boussinesq recalibration: divide by ρ_l to restore physical acceleration ratio.
+  // Effective buoyancy acceleration = (ρ_phys - ρ_l) / ρ_l * g
   // The NS solver handles the sign convention.
-  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_h) * g;
+  T rho = rho_l + phi * (rho_h - rho_l);
+  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_l) * g / rho_l;
 }
 
 // ---- FFRhoOmegaUpdate2D ----
-// WARNING: Cell::getOmega() returns the block-level scalar (from converter),
-// NOT the per-cell OMEGA<T> field. So per-cell omega updates have NO effect on
-// the collision. For variable viscosity, modify the collision operator to call
-// getOmegaf() instead of getOmega(). See src/data_struct/cell.h:168.
-//
-// ρ = ρ_l + φ*(ρ_h - ρ_l)
-// ν = η/ρ, τ = 0.5 + ν/cs², omega = 1/τ
+// Density: smooth polynomial  g(φ) = φ²(3-2φ),  ρ(φ) = ρ_l + g(φ)·(ρ_h-ρ_l)
+// Viscosity: harmonic average of relaxation times
+//   Boussinesq fix: ν = η/ρ₀ = η (ρ₀ = 1.0 is the LBM inertial density)
+//   NOT η/ρ_phys, because the LBM momentum equation uses ρ₀=1 everywhere.
+//   τ_L = 0.5 + ν_L/cs², τ_G = 0.5 + ν_G/cs²
+//   1/(τ(φ)-0.5) = (1-φ)/(τ_L-0.5) + φ/(τ_G-0.5)
+//   ω(φ) = 1/τ(φ), clamped to [0.01, 1.95]
 template <typename PFCELL, typename NSCELL>
 __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T phi = pf_cell.template get<typename PFCELL::GenericRho>();
@@ -148,17 +172,22 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T eta_l = pf_cell.template get<ETA_L<T>>();
   T eta_h = pf_cell.template get<ETA_H<T>>();
 
-  // Interpolate rho
-  T rho = rho_l + phi * (rho_h - rho_l);
+  // ---- Density: smooth polynomial g(φ) = φ²(3-2φ) ----
+  T g_phi = phi * phi * (T{3} - T{2} * phi);
+  T rho = rho_l + g_phi * (rho_h - rho_l);
   ns_cell.template get<typename NSCELL::GenericRho>() = rho;
 
-  // Interpolate eta (dynamic viscosity)
-  T eta = eta_l + phi * (eta_h - eta_l);
+  // ---- Viscosity: harmonic mean, ν = η (Boussinesq: ρ₀=1) ----
+  T nu_L = eta_l;  // was: eta_l / rho_l
+  T nu_G = eta_h;  // was: eta_h / rho_h
+  T inv_cs2 = T{1} / LatSet::cs2;
 
-  // Compute kinematic viscosity and omega
-  T nu = eta / rho;
-  T tau = T{0.5} + nu / LatSet::cs2;
-  // Clamp omega to avoid instability
+  T tau_L_m05 = nu_L * inv_cs2;  // τ_L - 0.5
+  T tau_G_m05 = nu_G * inv_cs2;  // τ_G - 0.5
+
+  T inv_tau_m05 = (T{1} - phi) / tau_L_m05 + phi / tau_G_m05;
+  T tau = T{0.5} + T{1} / inv_tau_m05;
+
   T omega = T{1} / tau;
   if (omega > T{1.95}) omega = T{1.95};
   if (omega < T{0.01}) omega = T{0.01};

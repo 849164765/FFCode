@@ -125,6 +125,16 @@ struct FFSurfaceTension2D {
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
 
+// Surface tension via chemical potential gradient: F_s = -φ∇λ
+// Equivalent to λ∇φ up to a gradient term ∇(φλ) absorbed by pressure.
+// Often numerically smoother than direct λ∇φ in the transitional region.
+template <typename PFCELL, typename NSCELL>
+struct FFSurfaceTensionChemPot2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
 template <typename PFCELL, typename NSCELL>
 struct FFGravityForce2D {
   using T = typename PFCELL::FloatType;
