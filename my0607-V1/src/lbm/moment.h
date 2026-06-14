@@ -19,6 +19,9 @@ struct PhaseFieldPhi {
   __any__ static inline void apply(CELL& cell) {
     T phi = T{0};
     for (unsigned int i = 0; i < LatSet::q; ++i) phi += cell[i];
+    // clamp phi to [0, 1] to suppress numerical noise
+    if (phi < T{0}) phi = T{0};
+    if (phi > T{1}) phi = T{1};
     cell.template get<typename CELL::GenericRho>() = phi;
   }
 };
@@ -70,8 +73,19 @@ struct PropertyInterpolation {
     const T eta_l = pf_cell.template get<ETA_L<T>>();
     const T eta_h = pf_cell.template get<ETA_H<T>>();
 
-    ns_cell.template get<typename NSCELL::GenericRho>() = rho_l + phi * (rho_h - rho_l);
-    ns_cell.template get<PHYSICAL_ETA<T>>() = eta_l + phi * (eta_h - eta_l);
+    const T rho = rho_l + phi * (rho_h - rho_l);
+    const T eta = eta_l + phi * (eta_h - eta_l);
+    ns_cell.template get<typename NSCELL::GenericRho>() = rho;
+    ns_cell.template get<PHYSICAL_ETA<T>>() = eta;
+
+    // update per-cell omega from interpolated viscosity
+    using LatSet = typename PFCELL::LatticeSet;
+    const T nu = eta / rho;
+    const T tau = T{0.5} + nu / LatSet::cs2;
+    T omega = T{1} / tau;
+    if (omega > T{1.95}) omega = T{1.95};
+    if (omega < T{0.01}) omega = T{0.01};
+    ns_cell.template get<OMEGA<T>>() = omega;
   }
 };
 

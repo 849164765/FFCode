@@ -246,9 +246,11 @@ int main(int argc, char* argv[]) {
 
   // Initialize PF interface width
   ff::BroadcastAllParams<T>(PFLattice,Interface_Width,rho_l, rho_h, eta_l, eta_h,gravity, Beta, Kappa);
-  // Initialize NS populations to equilibrium
+  // Initialize NS populations to velocity-based equilibrium
+  // geq[k] = w_k * (p/(rho*cs²) + e_k·u/cs² + ...)  with p=rho*cs², u=0  →  geq[k] = w_k
   Vector<T, 2> u_zero{T{0}, T{0}};
   T ns_rho_init = BaseConv.getLatRhoInit();
+  T ns_p_init = ns_rho_init * LatSet::cs2;
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
@@ -261,11 +263,13 @@ int main(int argc, char* argv[]) {
         NSCELL cell(id, blockLat);
         for (unsigned int k = 0; k < LatSet::q; ++k) {
           T uc = u_zero * latset::c<LatSet>(k);
-          T feq = latset::w<LatSet>(k) * ns_rho_init *
-                  (T{1} + LatSet::InvCs2 * uc + uc * uc * T{0.5} * LatSet::InvCs4 -
-                   LatSet::InvCs2 * u2 * T{0.5});
-          cell[k] = feq;
+          cell[k] = latset::w<LatSet>(k) *
+                    (ns_p_init * LatSet::InvCs2 / ns_rho_init
+                     + LatSet::InvCs2 * uc
+                     + uc * uc * T{0.5} * LatSet::InvCs4
+                     - LatSet::InvCs2 * u2 * T{0.5});
         }
+        cell.template get<PRESSURE<T>>() = ns_p_init;
       }
     }
   }
@@ -297,7 +301,7 @@ int main(int argc, char* argv[]) {
   using UpdateNormalTask = tmp::Key_TypePair<BulkFlag, ff::PhaseFieldNormal<PFCELL>>;
   using UpdateNormalTaskSelector = TaskSelector<std::uint8_t, PFCELL, UpdateNormalTask>;
 
-  using PhaseCollisionTask = tmp::Key_TypePair<BulkFlag, PhaseFieldBGK<PFCELL, equilibrium::PhaseFieldEquilibrium<PFCELL>>>;
+  using PhaseCollisionTask = tmp::Key_TypePair<BulkFlag, PhaseFieldBGK<PFCELL, equilibrium::SecondOrder<PFCELL>>>;
   using PhaseCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PhaseCollisionTask>;
   
   using NSMomentTask = tmp::Key_TypePair<BulkFlag, moment::VelocityMomenta<NSCELL>>;
@@ -306,11 +310,9 @@ int main(int argc, char* argv[]) {
   using NSCollisionTask = tmp::Key_TypePair<BulkFlag, VelocityBGK<NSCELL,equilibrium::NSFieldEquilibrium<NSCELL>>>;
   using NSCollisionTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSCollisionTask>;
   
-  using NSVisForceTask = tmp::Key_TypePair<BulkFlag, force::VisForce<PFCELL, NSCELL>>;
-  using NSPressForceTask = tmp::Key_TypePair<BulkFlag, force::PressForce<PFCELL, NSCELL>>;
   using NSGravityTask = tmp::Key_TypePair<BulkFlag, force::Gravity<PFCELL, NSCELL>>;
   using NSSurfaceTensionTask = tmp::Key_TypePair<BulkFlag, force::SurfaceTension<PFCELL, NSCELL>>;
-  using NSForceTaskSelector = CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, NSVisForceTask, NSPressForceTask, NSGravityTask, NSSurfaceTensionTask>;
+  using NSForceTaskSelector = CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, NSGravityTask, NSSurfaceTensionTask>;
   BlockLatManagerCoupling NSForceCoupling(PFLattice, NSLattice);
   
   using NSVelPressTask = tmp::Key_TypePair<BulkFlag, moment::VelocityMomenta<NSCELL>>;
@@ -361,16 +363,17 @@ int main(int argc, char* argv[]) {
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
 
+    // Clear total force and accumulate from current phi/velocity fields
+    NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
+    NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
+    NSLattice.template getField<FORCE<T, 2>>().Communicate();
+
+    // NS collision uses FORCE from current time step
     NSLattice.template ApplyCellDynamics<NSCollisionTaskSelector>(FlagFM);
     NS_BB.Apply();
     NSLattice.Stream();
     NSLattice.NormalCommunicate();
-    
-    // Clear total force before accumulation
-    NSLattice.template getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{T{0}, T{0}});
-    NSForceCoupling.template ApplyCellDynamics<NSForceTaskSelector>(FlagFM);
-    NSLattice.template getField<FORCE<T, 2>>().Communicate();
-    
+
     NSLattice.template ApplyCellDynamics<NSVelPressTaskSelector>(FlagFM);
     NSLattice.template getField<VELOCITY<T, 2>>().Communicate();
     NSLattice.template getField<PRESSURE<T>>().Communicate();

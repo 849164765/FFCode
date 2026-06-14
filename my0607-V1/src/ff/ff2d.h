@@ -41,16 +41,18 @@ struct PhaseFieldGrad {
     grad_phi[0] = T{0};
     grad_phi[1] = T{0};
 
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T phi_i = cell.getNeighbor(i).template get<GenericRho>();
+    // central difference: ∇φ = 1/(2cs²) Σ w_k·c_k·[φ(x+c_k) - φ(x-c_k)]
+    for (unsigned int i = 1; i < LatSet::q; ++i) {
+      T phi_pos = cell.getNeighbor(i).template get<GenericRho>();
+      T phi_neg = cell.getNeighbor(LatSet::opp[i]).template get<GenericRho>();
       T wi = latset::w<LatSet>(i);
       const auto& ci = latset::c<LatSet>(i);
-      grad_phi[0] += wi * phi_i * ci[0];
-      grad_phi[1] += wi * phi_i * ci[1];
+      grad_phi[0] += wi * ci[0] * (phi_pos - phi_neg);
+      grad_phi[1] += wi * ci[1] * (phi_pos - phi_neg);
     }
 
-    grad_phi[0] /= LatSet::cs2;
-    grad_phi[1] /= LatSet::cs2;
+    grad_phi[0] /= (T{2} * LatSet::cs2);
+    grad_phi[1] /= (T{2} * LatSet::cs2);
 
     cell.template get<GRAD<T, LatSet::d>>() = grad_phi;
   }
