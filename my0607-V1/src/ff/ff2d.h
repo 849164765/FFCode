@@ -139,6 +139,21 @@ struct FFRhoOmegaUpdate2D {
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
 
+// Computes ALL forces for the NS momentum equation (g-LBE, pressure-based):
+// F = F_s + F_p + F_b   (Eq.18 of Fakhari et al. 2017)
+// F_s = mu_phi * grad(phi)           - surface tension (Eq.4)
+// F_p = -p* * cs^2 * grad(rho)       - pressure force  (Eq.19)
+//     = -p* * cs^2 * drho * grad(phi)
+// F_b = (rho - rho_h) * g            - buoyancy
+//
+// p* is computed from NS g-populations: p* = sum(g_alpha)
+template <typename PFCELL, typename NSCELL>
+struct FFAllForces2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())

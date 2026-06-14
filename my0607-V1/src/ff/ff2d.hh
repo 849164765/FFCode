@@ -166,4 +166,42 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   ns_cell.template get<OMEGA<T>>() = omega;
 }
 
+// ---- FFAllForces2D ----
+// Computes ALL forces for the NS momentum equation (g-LBE, pressure-based):
+// F = F_s + F_p + F_b   (Eq.18 of Fakhari et al. 2017)
+// F_s = mu_phi * grad(phi)           - surface tension (Eq.4)
+// F_p = -p* * cs^2 * grad(rho)       - pressure force  (Eq.19,33)
+//     = -p* * cs^2 * (rho_h - rho_l) * grad(phi)
+// F_b = (rho - rho_h) * g            - buoyancy
+//
+// p* is computed from NS g-populations: p* = sum(g_alpha)
+template <typename PFCELL, typename NSCELL>
+__any__ void FFAllForces2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+
+  const T chem_pot = pf_cell.template get<CHEMICALPOTENTIAL<T>>();
+  const auto& grad = pf_cell.template get<GRAD<T, LatSet::d>>();
+  const T rho_l = pf_cell.template get<RHO_L<T>>();
+  const T rho_h = pf_cell.template get<RHO_H<T>>();
+  const T g = pf_cell.template get<GRAVITY<T>>();
+  const T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+
+  // Compute p* from NS g-populations (pressure-based LBE)
+  T p_star = T{0};
+  for (unsigned int k = 0; k < LatSet::q; ++k)
+    p_star += ns_cell[k];
+
+  auto& force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  const T drho = rho_h - rho_l;
+
+  // F_s + F_p
+  force[0] = chem_pot * grad[0] - p_star * LatSet::cs2 * drho * grad[0];
+  force[1] = chem_pot * grad[1] - p_star * LatSet::cs2 * drho * grad[1];
+
+  // F_b: buoyancy (gravity points down, g is negative)
+  T rho = rho_l + phi * drho;
+  force[1] += (rho - rho_h) * g;
+}
+
 }  // namespace ff
