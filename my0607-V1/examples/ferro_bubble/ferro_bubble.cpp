@@ -210,22 +210,26 @@ int main(int argc, char* argv[]) {
   NS_LatMan .NormalCommunicate();
   Mag_LatMan.NormalCommunicate();
 
+
+  Timer MainLoopTimer;
+  Timer OutputTimer;
+
   // ==============================================================
   // VTK Writers
   // ==============================================================
-  vtmo::ScalarWriter PhiW("phi",  phiField);
+  vtmo::ScalarWriter PhiW("phi",  PF_LatMan.getField<PHI<T>>());
   vtmo::VectorWriter VelW("u",    NS_LatMan.getField<VELOCITY<T, 2>>());
   vtmo::ScalarWriter MagW("psi",  Mag_LatMan.getField<PSI<T>>());
   vtmo::VectorWriter HW  ("H",    Mag_LatMan.getField<MAGH<T, 2>>());
   vtmo::ScalarWriter RhoW("rho",  NS_LatMan.getField<RHO<T>>());
   vtmo::vtmWriter<T, 2> MainWriter("ferro_bubble", Geo);
   MainWriter.addWriterSet(PhiW, VelW, MagW, HW, RhoW);
+  MainWriter.WriteBinary(MainLoopTimer());
 
   // ==============================================================
   // Main loop — 10-step coupling schedule (Research.md Section 3.3)
   // ==============================================================
-  Timer MainLoopTimer;
-  Timer OutputTimer;
+
   Printer::Print_BigBanner("Starting Ferrofluid Bubble Rise Simulation...");
 
   while (MainLoopTimer() < MaxStep) {
