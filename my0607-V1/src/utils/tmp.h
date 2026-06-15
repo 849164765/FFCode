@@ -427,8 +427,9 @@ struct GetGenericRhoType {
     std::conditional_t<
       isTypeInTuple<TEMP<T>, Pack>::value, TEMP<T>,
       std::conditional_t<isTypeInTuple<CONC<T>, Pack>::value, CONC<T>, 
-      std::conditional_t<isTypeInTuple<PHI<T>, Pack>::value, PHI<T>, void>
-      >>>;
+      std::conditional_t<isTypeInTuple<PHI<T>, Pack>::value, PHI<T>,
+      std::conditional_t<isTypeInTuple<PSI<T>, Pack>::value, PSI<T>, void>
+      >>>>;
 };
 
 template <typename T, typename Pack>
@@ -437,14 +438,16 @@ struct FindGenericRhoType;
 template <typename T, typename First, typename... Rest>
 struct FindGenericRhoType<T, TypePack<First, Rest...>> {
   using type =
-    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>>::value, First,
+    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>,
+                                PSI<T>>::value, First,
                        typename FindGenericRhoType<T, TypePack<Rest...>>::type>;
 };
 
 template <typename T, typename First>
 struct FindGenericRhoType<T, TypePack<First>> {
   using type =
-    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>>::value, First, void>;
+    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>,
+                                PSI<T>>::value, First, void>;
 };
 
 namespace cudev{
@@ -457,14 +460,14 @@ struct FindGenericRhoType;
 template <typename T, typename First, typename... Rest>
 struct FindGenericRhoType<T, TypePack<First, Rest...>> {
   using type =
-    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>>::value, First,
+    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>, PSI<T>>::value, First,
                        typename FindGenericRhoType<T, TypePack<Rest...>>::type>;
 };
 
 template <typename T, typename First>
 struct FindGenericRhoType<T, TypePack<First>> {
   using type =
-    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>>::value, First, void>;
+    std::conditional_t<isOneOf<First, RHO<T>, TEMP<T>, CONC<T>, PHI<T>, PSI<T>>::value, First, void>;
 };
 
 #endif

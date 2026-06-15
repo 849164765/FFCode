@@ -175,6 +175,26 @@ struct Cross_mBase : public FieldBase<1> {};
 struct PL_kBase : public FieldBase<1> {};
 struct PL_mBase : public FieldBase<1> {};
 
+// --- ferrofluid LBM new field bases (T15) ---
+struct PHASECHEMPotBase : public FieldBase<1> {};
+struct PHASENormalBase : public FieldBase<1> {};
+struct PHASEGradBase : public FieldBase<1> {};
+struct PHASELapBase : public FieldBase<1> {};
+struct PRESSUREBase : public FieldBase<1> {};
+struct VISCOSITYBase : public FieldBase<1> {};
+struct PSIBase : public FieldBase<1> {};
+struct MAGHSqBase : public FieldBase<1> {};
+struct MAGPermeabilityBase : public FieldBase<1> {};
+struct MAGHBase : public FieldBase<1> {};
+
+// --- Ferrofluid two-phase material constants (Data<T,Base>) ---
+struct RHOLBase : public FieldBase<1> {};
+struct RHOHBase : public FieldBase<1> {};
+struct ETALBase : public FieldBase<1> {};
+struct ETAHBase : public FieldBase<1> {};
+struct MULBase : public FieldBase<1> {};
+struct MUHBase : public FieldBase<1> {};
+
 namespace cudev {
 
 #ifdef __CUDACC__
@@ -221,6 +241,19 @@ template <typename T>
 using GBETA = Data<T, GBETABase>;
 
 template <typename T>
+using RHOL = Data<T, RHOLBase>;
+template <typename T>
+using RHOH = Data<T, RHOHBase>;
+template <typename T>
+using ETAL = Data<T, ETALBase>;
+template <typename T>
+using ETAH = Data<T, ETAHBase>;
+template <typename T>
+using MUL = Data<T, MULBase>;
+template <typename T>
+using MUH = Data<T, MUHBase>;
+
+template <typename T>
 using CONSTRHO = Data<T, CONSTRHOBase>;
 
 template <typename T, unsigned int D>
@@ -246,6 +279,30 @@ template <typename T>
 using PL_k = Data<T, PL_kBase>;
 template <typename T>
 using PL_m = Data<T, PL_mBase>;
+
+// --- ferrofluid LBM new field aliases (T15) ---
+template <typename T>
+using PHASE = GenericField<GenericArray<T>, PHASEBase>;
+template <typename T>
+using PHASECHEMPOTENTIAL = GenericField<GenericArray<T>, PHASECHEMPotBase>;
+template <typename T, unsigned int D>
+using PHASENORMAL = GenericField<GenericArray<Vector<T, D>>, PHASENormalBase>;
+template <typename T, unsigned int D>
+using PHASEGRADIENT = GenericField<GenericArray<Vector<T, D>>, PHASEGradBase>;
+template <typename T>
+using PHASELAPLACIAN = GenericField<GenericArray<T>, PHASELapBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
+template <typename T>
+using VISCOSITY = GenericField<GenericArray<T>, VISCOSITYBase>;
+template <typename T>
+using PSI = GenericField<GenericArray<T>, PSIBase>;
+template <typename T>
+using MAGHSQ = GenericField<GenericArray<T>, MAGHSqBase>;
+template <typename T>
+using MAGPERMEABILITY = GenericField<GenericArray<T>, MAGPermeabilityBase>;
+template <typename T, unsigned int D>
+using MAGH = GenericField<GenericArray<Vector<T, D>>, MAGHBase>;
 
 #endif
 
@@ -312,6 +369,19 @@ template <typename T>
 using GBETA = Data<T, GBETABase>;
 
 template <typename T>
+using RHOL = Data<T, RHOLBase>;
+template <typename T>
+using RHOH = Data<T, RHOHBase>;
+template <typename T>
+using ETAL = Data<T, ETALBase>;
+template <typename T>
+using ETAH = Data<T, ETAHBase>;
+template <typename T>
+using MUL = Data<T, MULBase>;
+template <typename T>
+using MUH = Data<T, MUHBase>;
+
+template <typename T>
 using CONSTRHO = Data<T, CONSTRHOBase>;
 
 template <typename T, unsigned int D>
@@ -337,6 +407,30 @@ template <typename T>
 using PL_k = Data<T, PL_kBase>;
 template <typename T>
 using PL_m = Data<T, PL_mBase>;
+
+// --- ferrofluid LBM new field aliases (T15) ---
+template <typename T>
+using PHASE = GenericField<GenericArray<T>, PHASEBase>;
+template <typename T>
+using PHASECHEMPOTENTIAL = GenericField<GenericArray<T>, PHASECHEMPotBase>;
+template <typename T, unsigned int D>
+using PHASENORMAL = GenericField<GenericArray<Vector<T, D>>, PHASENormalBase>;
+template <typename T, unsigned int D>
+using PHASEGRADIENT = GenericField<GenericArray<Vector<T, D>>, PHASEGradBase>;
+template <typename T>
+using PHASELAPLACIAN = GenericField<GenericArray<T>, PHASELapBase>;
+template <typename T>
+using PRESSURE = GenericField<GenericArray<T>, PRESSUREBase>;
+template <typename T>
+using VISCOSITY = GenericField<GenericArray<T>, VISCOSITYBase>;
+template <typename T>
+using PSI = GenericField<GenericArray<T>, PSIBase>;
+template <typename T>
+using MAGHSQ = GenericField<GenericArray<T>, MAGHSqBase>;
+template <typename T>
+using MAGPERMEABILITY = GenericField<GenericArray<T>, MAGPermeabilityBase>;
+template <typename T, unsigned int D>
+using MAGH = GenericField<GenericArray<Vector<T, D>>, MAGHBase>;
 
 // #endif
 

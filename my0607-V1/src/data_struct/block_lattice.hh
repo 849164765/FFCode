@@ -1703,7 +1703,14 @@ void BlockLatticeManager<T, LatSet, TypePack>::averCommunicate(BLOCKLATTICE& BLa
       Vector<T, LatSet::d> averU = getAverage<T, LatSet::d>(nUF, i, comm.SendRecvCells);
       // get feq, peparing for pop conversion
       std::array<T, LatSet::q> feq{};
-      Equilibrium<T, LatSet>::SecondOrder(feq, averU, averRho);
+      {
+      T usqr = averU * averU;
+      for (int k = 0; k < LatSet::q; ++k) {
+        T cu = latset::c<LatSet>(k) * averU;
+        feq[k] = latset::w<LatSet>(k) * averRho
+          * (T{1} + LatSet::InvCs2 * cu + LatSet::InvCs4 * cu * cu * T{0.5}
+             - LatSet::InvCs2 * usqr * T{0.5});
+      } }
 
       std::array<T*, LatSet::q> CellPop =
         BLat.template getField<POP<T, LatSet::q>>().getArray(comm.SendRecvCells[i+RecvOffset]);
@@ -1763,7 +1770,14 @@ const GenericArray<T>& nRhoF, const GenericArray<Vector<T, LatSet::d>>& nUF, std
   Vector<T, LatSet::d> averU = getInterpolation<D, T, LatSet::d>(nUF, i, comm.SendRecvCells);
 
   std::array<T, LatSet::q> feq{};
-  Equilibrium<T, LatSet>::SecondOrder(feq, averU, averRho);
+  {
+      T usqr = averU * averU;
+      for (int k = 0; k < LatSet::q; ++k) {
+        T cu = latset::c<LatSet>(k) * averU;
+        feq[k] = latset::w<LatSet>(k) * averRho
+          * (T{1} + LatSet::InvCs2 * cu + LatSet::InvCs4 * cu * cu * T{0.5}
+             - LatSet::InvCs2 * usqr * T{0.5});
+      } }
 
   std::array<T*, LatSet::q> CellPop =
     BLat.template getField<POP<T, LatSet::q>>().getArray(comm.SendRecvCells[i+RecvOffset]);
@@ -1954,7 +1968,15 @@ void DynamicBlockLatticeHelper2D<T, LatSet, TypePack>::PopConversionFineToCoarse
       std::array<T*, LatSet::q> cell = PopsF.getArray(id);
       // get feq, peparing for pop conversion
       std::array<T, LatSet::q> feq{};
-      Equilibrium<T, LatSet>::SecondOrder(feq, VelocityArr[id], RhoArr[id]);
+      {
+      T rho = RhoArr[id]; const auto& u = VelocityArr[id];
+      T usqr = u * u;
+      for (int k = 0; k < LatSet::q; ++k) {
+        T cu = latset::c<LatSet>(k) * u;
+        feq[k] = latset::w<LatSet>(k) * rho
+          * (T{1} + LatSet::InvCs2 * cu + LatSet::InvCs4 * cu * cu * T{0.5}
+             - LatSet::InvCs2 * usqr * T{0.5});
+      } }
       // convert from fine to coarse
       for (unsigned int iArr = 0; iArr < LatSet::q; ++iArr) {
         T popC = RefineConverter<T>::getPopC(*(cell[iArr]), feq[iArr], OmegaF);
@@ -1989,7 +2011,15 @@ void DynamicBlockLatticeHelper2D<T, LatSet, TypePack>::PopConversionCoarseToFine
       std::array<T*, LatSet::q> cell = PopsF.getArray(id);
       // get feq, peparing for pop conversion
       std::array<T, LatSet::q> feq{};
-      Equilibrium<T, LatSet>::SecondOrder(feq, VelocityArr[id], RhoArr[id]);
+      {
+      T rho = RhoArr[id]; const auto& u = VelocityArr[id];
+      T usqr = u * u;
+      for (int k = 0; k < LatSet::q; ++k) {
+        T cu = latset::c<LatSet>(k) * u;
+        feq[k] = latset::w<LatSet>(k) * rho
+          * (T{1} + LatSet::InvCs2 * cu + LatSet::InvCs4 * cu * cu * T{0.5}
+             - LatSet::InvCs2 * usqr * T{0.5});
+      } }
       // convert from fine to coarse
       for (unsigned int iArr = 0; iArr < LatSet::q; ++iArr) {
         T popF = RefineConverter<T>::getPopF(*(cell[iArr]), feq[iArr], OmegaC);

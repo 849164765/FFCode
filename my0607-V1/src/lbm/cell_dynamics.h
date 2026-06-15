@@ -2,7 +2,6 @@
 #pragma once
 
 #include "lbm/collision.h"
-#include "lbm/moment.h"
 
 // a template for cell dynamics
 // you could use it like:

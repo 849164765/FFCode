@@ -17,3 +17,10 @@
 #include "lbm/lattice_set.h"
 // lbm dynamics
 #include "lbm/lbm.h"
+
+// fflbm — ferrofluid LBM operators
+#include "fflbm/phasefield.h"
+#include "fflbm/phasefield_source.h"
+#include "fflbm/magnetic_field.h"
+#include "fflbm/magnetic_boundary.h"
+#include "fflbm/coupling.h"

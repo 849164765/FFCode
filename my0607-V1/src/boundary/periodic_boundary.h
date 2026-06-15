@@ -1,97 +1,11 @@
 #pragma once
 
 #include "boundary/basic_boundary.h"
-#include "lbm/moment.ur.h"
 
 #ifdef MPI_ENABLED
 #include <map>
 #include <tuple>
 #endif
-
-
-template <typename T, typename LatSet>
-class FixedPeriodicBoundary final : public AbstractBoundary {
- private:
-  std::vector<std::size_t> VCells;
-  std::vector<std::size_t> RCells;
-  std::vector<std::size_t> BdCells;
-  PopLattice<T, LatSet> &Lat;
-  Geometry<T, LatSet::d> &Geo;
-  GenericArray<std::uint8_t> &Field;
-  std::uint8_t BdCellFlag;
-  std::uint8_t voidFlag;
-  AABB<T, LatSet::d> &Box;
-  AABB<T, LatSet::d> &FromBox;
-  std::string _name = "FixedPeriodic";
-
- public:
-  FixedPeriodicBoundary(PopLattice<T, LatSet> &lat, AABB<T, LatSet::d> &box,
-                        AABB<T, LatSet::d> &frombox, std::uint8_t cellflag,
-                        std::uint8_t voidflag = std::uint8_t(1))
-      : Lat(lat), Geo(lat.getGeo()), Field(lat.getGeo().getGeoFlagField().getField()),
-        Box(box), FromBox(frombox), BdCellFlag(cellflag), voidFlag(voidflag) {
-    Vector<T, LatSet::d> boxext = Box.getExtension();
-    Vector<int, 3> SIZE(1);
-    if constexpr (LatSet::d == 2) {
-      SIZE[0] = int(boxext[0] / Geo.getVoxelSize()) + 2;
-      SIZE[1] = int(boxext[1] / Geo.getVoxelSize()) + 2;
-    } else if constexpr (LatSet::d == 3) {
-      SIZE[0] = int(boxext[0] / Geo.getVoxelSize()) + 2;
-      SIZE[1] = int(boxext[1] / Geo.getVoxelSize()) + 2;
-      SIZE[2] = int(boxext[2] / Geo.getVoxelSize()) + 2;
-    }
-    int size = SIZE[0] * SIZE[1] * SIZE[2];
-    VCells.reserve(size);
-    RCells.reserve(size);
-    BdCells.reserve(size);
-    Geo.forEachVoxel(Box, BdCellFlag, [this](int id) { BdCells.push_back(id); });
-    Vector<T, LatSet::d> dist = FromBox.getCenter() - Box.getCenter();
-    for (int i = 0; i < LatSet::d; ++i) {
-      if (dist[i] < T(-(1e-6))) {
-        dist[i] -= Geo.getVoxelSize();
-      } else if (dist[i] > T(1e-6)) {
-        dist[i] += Geo.getVoxelSize();
-      }
-    }
-    AABB<T, LatSet::d> extBox = Box.getExtended(Geo.getVoxelSize());
-    Geo.forEachVoxel(extBox, voidFlag, [this, &dist](int id) {
-      if (Geo.template hasNeighborFlag<LatSet>(id, BdCellFlag)) {
-        VCells.push_back(id);
-        int idr = Geo.findCellId(Geo.getVoxel(id) + dist);
-        RCells.push_back(idr);
-      }
-    });
-  }
-
-  void Apply() override {
-    int size = VCells.size();
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-    for (int i = 0; i < size; ++i) {
-      BasicPopCell<T, LatSet> vcell(VCells[i], Lat);
-      BasicPopCell<T, LatSet> rcell(RCells[i], Lat);
-      for (int k = 1; k < LatSet::q; ++k) vcell[k] = rcell[k];
-    }
-  }
-  void getinfo() override {
-    std::cout << std::setw(18) << std::left << _name << std::setw(10) << std::left << BdCells.size()
-              << std::endl;
-  }
-  void UpdateRho() override {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-    for (std::size_t id : BdCells) {
-      BasicPopCell<T, LatSet> cell(id, Lat);
-      moment::Rho<T, LatSet>::apply(cell, Lat.getRho(id));
-    }
-  }
-  void UpdateU() override {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-    for (std::size_t id : BdCells) {
-      BasicPopCell<T, LatSet> cell(id, Lat);
-      moment::Velocity<T, LatSet>::apply(cell, Lat.getVelocity(id));
-    }
-  }
-};
-
 
 template <typename BLOCKLATTICEMANAGER, typename BLOCKFIELDMANAGER>
 class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {

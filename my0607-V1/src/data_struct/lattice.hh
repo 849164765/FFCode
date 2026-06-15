@@ -50,7 +50,8 @@ void PopLattice<T, LatSet>::UpdateRho(const std::vector<int>& index) {
 #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int id : index) {
     BasicPopCell<T, LatSet> cell(id, *this);
-    moment::Rho<T, LatSet>::apply(cell, this->Rho.get(id));
+    T rho = this->Rho.get(id);
+    for (int k = 0; k < LatSet::q; ++k) cell[k] = latset::w<LatSet>(k) * rho;
   }
 }
 
@@ -61,7 +62,8 @@ void PopLattice<T, LatSet>::UpdateRho(const ArrayType& flagarr, std::uint8_t fla
   for (int id = 0; id < N; ++id) {
     if (util::isFlag(flagarr[id], flag)) {
       BasicPopCell<T, LatSet> cell(id, *this);
-      moment::Rho<T, LatSet>::apply(cell, this->Rho.get(id));
+      T rho = this->Rho.get(id);
+      for (int k = 0; k < LatSet::q; ++k) cell[k] = latset::w<LatSet>(k) * rho;
     }
   }
 }
@@ -74,7 +76,8 @@ void PopLattice<T, LatSet>::UpdateRho_Source(const ArrayType& flagarr,
   for (int id = 0; id < N; ++id) {
     if (util::isFlag(flagarr[id], flag)) {
       BasicPopCell<T, LatSet> cell(id, *this);
-      moment::Rho<T, LatSet>::apply(cell, this->Rho.get(id), source[id]);
+      T rho = this->Rho.get(id) + source[id];
+      for (int k = 0; k < LatSet::q; ++k) cell[k] = latset::w<LatSet>(k) * rho;
     }
   }
 }
@@ -86,7 +89,9 @@ void PopLattice<T, LatSet>::UpdateU(const ArrayType& flagarr, std::uint8_t flag)
   for (int id = 0; id < N; ++id) {
     if (util::isFlag(flagarr[id], flag)) {
       BasicPopCell<T, LatSet> cell(id, *this);
-      moment::Velocity<T, LatSet>::apply(cell, Velocity.get(id));
+      const auto& u = Velocity.get(id);
+      for (int k = 0; k < LatSet::q; ++k)
+        cell[k] *= (T{1} + LatSet::InvCs2 * (latset::c<LatSet>(k) * u));
     }
   }
 }
@@ -96,7 +101,9 @@ void PopLattice<T, LatSet>::UpdateU(const std::vector<int>& index) {
 #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int id : index) {
     BasicPopCell<T, LatSet> cell(id, *this);
-    moment::Velocity<T, LatSet>::apply(cell, Velocity.get(id));
+    const auto& u = Velocity.get(id);
+    for (int k = 0; k < LatSet::q; ++k)
+      cell[k] *= (T{1} + LatSet::InvCs2 * (latset::c<LatSet>(k) * u));
   }
 }
 
@@ -105,7 +112,10 @@ void PopLattice<T, LatSet>::UpdateRhoU(const std::vector<int>& index) {
 #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int id : index) {
     BasicPopCell<T, LatSet> cell(id, *this);
-    moment::RhoVelocity<T, LatSet>::apply(cell, this->Rho.get(id), Velocity.get(id));
+    T rho = this->Rho.get(id);
+    const auto& u = Velocity.get(id);
+    for (int k = 0; k < LatSet::q; ++k)
+      cell[k] = latset::w<LatSet>(k) * rho * (T{1} + LatSet::InvCs2 * (latset::c<LatSet>(k) * u));
   }
 }
 
@@ -115,7 +125,11 @@ void PopLattice<T, LatSet>::BGK() {
 #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int id = 0; id < N; ++id) {
     PopCell<T, LatSet> cell(id, *this);
-    legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
+    std::array<T, LatSet::q> feq{};
+    GetFeq(feq, cell.getVelocity(), cell.getRho());
+    T omega = cell.getfOmega();
+    for (int k = 0; k < LatSet::q; ++k)
+      cell[k] -= omega * (cell[k] - feq[k]);
   }
 }
 
@@ -125,7 +139,11 @@ void PopLattice<T, LatSet>::BGK(const std::vector<int>& index) {
 #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int id : index) {
     PopCell<T, LatSet> cell(id, *this);
-    legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
+    std::array<T, LatSet::q> feq{};
+    GetFeq(feq, cell.getVelocity(), cell.getRho());
+    T omega = cell.getfOmega();
+    for (int k = 0; k < LatSet::q; ++k)
+      cell[k] -= omega * (cell[k] - feq[k]);
   }
 }
 
@@ -137,7 +155,11 @@ void PopLattice<T, LatSet>::BGK(const ArrayType& flagarr, std::uint8_t flag) {
   for (int id = 0; id < N; ++id) {
     if (util::isFlag(flagarr[id], flag)) {
       PopCell<T, LatSet> cell(id, *this);
-      legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
+      std::array<T, LatSet::q> feq{};
+      GetFeq(feq, cell.getVelocity(), cell.getRho());
+      T omega = cell.getfOmega();
+      for (int k = 0; k < LatSet::q; ++k)
+        cell[k] -= omega * (cell[k] - feq[k]);
     }
   }
 }
@@ -151,8 +173,11 @@ void PopLattice<T, LatSet>::BGK_Source(const ArrayType& flagarr, std::uint8_t fl
   for (int id = 0; id < N; ++id) {
     if (util::isFlag(flagarr[id], flag)) {
       PopCell<T, LatSet> cell(id, *this);
-      legacy::BGK<T, LatSet>::template applySource<GetFeq>(cell,
-                                                              source[id]);
+      std::array<T, LatSet::q> feq{};
+      GetFeq(feq, cell.getVelocity(), cell.getRho());
+      T omega = cell.getfOmega();
+      for (int k = 0; k < LatSet::q; ++k)
+        cell[k] -= omega * (cell[k] - feq[k]) - (T{1} - omega * T{0.5}) * source[id] * latset::w<LatSet>(k);
     }
   }
 }

@@ -152,32 +152,7 @@ class UnitConvManager {
   BaseConverter<T> *BaseConv;
   std::vector<AbstractConverter<T> *> ConvList;
   UnitConvManager(AbstractConverter<T> *convlist) : ConvList(convlist) {}
-  UnitConvManager(BaseConverter<T> *BaseConv_, TempConverter<T> *TempConv_ = nullptr,
-                  ConcConverter<T> *ConcConv_ = nullptr,
-                  PhaseDiagramConverter<T> *CAConv_ = nullptr,
-                  PhaseFieldConverter<T> *PhaseFieldConv_ = nullptr)
-      : BaseConv(BaseConv_), TempConv(TempConv_), ConcConv(ConcConv_), CAConv(CAConv_), 
-        PhaseFieldConv(PhaseFieldConv_) {
-    ConvList.push_back(BaseConv);
-    if (TempConv != nullptr) {
-      ConvList.push_back(TempConv);
-    }
-    if (ConcConv != nullptr) {
-      ConvList.push_back(ConcConv);
-    }
-    if (PhaseFieldConv != nullptr) {
-      ConvList.push_back(PhaseFieldConv);
-    }
-  }
-  
-  // 新增构造函数重载，只接受BaseConverter和PhaseFieldConverter
-  UnitConvManager(BaseConverter<T> *BaseConv_, PhaseFieldConverter<T> *PhaseFieldConv_)
-      : BaseConv(BaseConv_), TempConv(nullptr), ConcConv(nullptr), CAConv(nullptr),
-        PhaseFieldConv(PhaseFieldConv_) {
-    ConvList.push_back(BaseConv);
-    ConvList.push_back(PhaseFieldConv_);
-  }
-  
+
   void Check_and_Print();
 };
 
