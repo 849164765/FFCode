@@ -2,6 +2,7 @@
 #pragma once
 
 #include <iostream>
+#include <vector>
 
 #include "data_struct/Vector.h"
 
@@ -145,39 +146,17 @@ template <typename T>
 class UnitConvManager {
   /*Unit converter for LB*/
   // Unit phys = Unit LB * Conversionfactor
-  // pressure and temperature: shift the physical values by a characteristic
-  // value -> lattice p and T ranging from 0 to 1 e.g. physT - charPhysT =
-  // Conversionfactor * LBT i.e. T - T0 = (Th - T0) * Theta
  public:
-  BaseConverter<T> *BaseConv;
+  BaseConverter<T> *BaseConv = nullptr;
   std::vector<AbstractConverter<T> *> ConvList;
-  UnitConvManager(AbstractConverter<T> *convlist) : ConvList(convlist) {}
-  UnitConvManager(BaseConverter<T> *BaseConv_, TempConverter<T> *TempConv_ = nullptr,
-                  ConcConverter<T> *ConcConv_ = nullptr,
-                  PhaseDiagramConverter<T> *CAConv_ = nullptr,
-                  PhaseFieldConverter<T> *PhaseFieldConv_ = nullptr)
-      : BaseConv(BaseConv_), TempConv(TempConv_), ConcConv(ConcConv_), CAConv(CAConv_), 
-        PhaseFieldConv(PhaseFieldConv_) {
-    ConvList.push_back(BaseConv);
-    if (TempConv != nullptr) {
-      ConvList.push_back(TempConv);
-    }
-    if (ConcConv != nullptr) {
-      ConvList.push_back(ConcConv);
-    }
-    if (PhaseFieldConv != nullptr) {
-      ConvList.push_back(PhaseFieldConv);
-    }
+
+  UnitConvManager(AbstractConverter<T> *convlist) {
+    if (convlist) ConvList.push_back(convlist);
   }
-  
-  // 新增构造函数重载，只接受BaseConverter和PhaseFieldConverter
-  UnitConvManager(BaseConverter<T> *BaseConv_, PhaseFieldConverter<T> *PhaseFieldConv_)
-      : BaseConv(BaseConv_), TempConv(nullptr), ConcConv(nullptr), CAConv(nullptr),
-        PhaseFieldConv(PhaseFieldConv_) {
-    ConvList.push_back(BaseConv);
-    ConvList.push_back(PhaseFieldConv_);
+  UnitConvManager(BaseConverter<T> *bc) : BaseConv(bc) {
+    if (bc) ConvList.push_back(bc);
   }
-  
+
   void Check_and_Print();
 };
 

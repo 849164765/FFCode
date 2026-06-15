@@ -101,63 +101,6 @@ void PopLattice<T, LatSet>::UpdateU(const std::vector<int>& index) {
 }
 
 template <typename T, typename LatSet>
-void PopLattice<T, LatSet>::UpdateRhoU(const std::vector<int>& index) {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-  for (int id : index) {
-    BasicPopCell<T, LatSet> cell(id, *this);
-    moment::RhoVelocity<T, LatSet>::apply(cell, this->Rho.get(id), Velocity.get(id));
-  }
-}
-
-template <typename T, typename LatSet>
-template <void (*GetFeq)(std::array<T, LatSet::q>&, const Vector<T, LatSet::d>&, T)>
-void PopLattice<T, LatSet>::BGK() {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-  for (int id = 0; id < N; ++id) {
-    PopCell<T, LatSet> cell(id, *this);
-    legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
-  }
-}
-
-template <typename T, typename LatSet>
-template <void (*GetFeq)(std::array<T, LatSet::q>&, const Vector<T, LatSet::d>&, T)>
-void PopLattice<T, LatSet>::BGK(const std::vector<int>& index) {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-  for (int id : index) {
-    PopCell<T, LatSet> cell(id, *this);
-    legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
-  }
-}
-
-template <typename T, typename LatSet>
-template <void (*GetFeq)(std::array<T, LatSet::q>&, const Vector<T, LatSet::d>&, T),
-          typename ArrayType>
-void PopLattice<T, LatSet>::BGK(const ArrayType& flagarr, std::uint8_t flag) {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-  for (int id = 0; id < N; ++id) {
-    if (util::isFlag(flagarr[id], flag)) {
-      PopCell<T, LatSet> cell(id, *this);
-      legacy::BGK<T, LatSet>::template apply<GetFeq>(cell);
-    }
-  }
-}
-
-template <typename T, typename LatSet>
-template <void (*GetFeq)(std::array<T, LatSet::q>&, const Vector<T, LatSet::d>&, T),
-          typename ArrayType>
-void PopLattice<T, LatSet>::BGK_Source(const ArrayType& flagarr, std::uint8_t flag,
-                                         const GenericArray<T>& source) {
-#pragma omp parallel for num_threads(Thread_Num) schedule(static)
-  for (int id = 0; id < N; ++id) {
-    if (util::isFlag(flagarr[id], flag)) {
-      PopCell<T, LatSet> cell(id, *this);
-      legacy::BGK<T, LatSet>::template applySource<GetFeq>(cell,
-                                                              source[id]);
-    }
-  }
-}
-
-template <typename T, typename LatSet>
 void PopLattice<T, LatSet>::Stream() {
   for (unsigned int i = 1; i < LatSet::q; ++i) {
     Pops.getField(i).rotate(latset::c<LatSet>(i) * Projection);
