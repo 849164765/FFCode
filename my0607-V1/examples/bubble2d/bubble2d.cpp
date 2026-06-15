@@ -330,14 +330,19 @@ int main(int argc, char* argv[]) {
   using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
+  // IMPORTANT: Each task uses a SEPARATE TaskSelector call.
+  // TupleWrapper's TaskSelector uses if/else-if dispatch and only executes
+  // the FIRST matching task per flag value. Since all three share BulkFlag,
+  // TupleWrapper would silently skip FFLaplacian2D and FFChemPotential2D.
   using FFNormalTask =
     tmp::Key_TypePair<BulkFlag, ff::FF2D<PFCELL>>;
   using FFLaplacianTask =
     tmp::Key_TypePair<BulkFlag, ff::FFLaplacian2D<PFCELL>>;
   using FFChemPotTask =
     tmp::Key_TypePair<BulkFlag, ff::FFChemPotential2D<PFCELL>>;
-  using PFFFTaskCollection = tmp::TupleWrapper<FFNormalTask, FFLaplacianTask, FFChemPotTask>;
-  using PFFFTaskSelector = tmp::TaskSelector<PFFFTaskCollection, std::uint8_t, PFCELL>;
+  using FFNormalTaskSel = TaskSelector<std::uint8_t, PFCELL, FFNormalTask>;
+  using FFLaplacianTaskSel = TaskSelector<std::uint8_t, PFCELL, FFLaplacianTask>;
+  using FFChemPotTaskSel = TaskSelector<std::uint8_t, PFCELL, FFChemPotTask>;
 
   // Chem potential gradient (∇λ): must run AFTER all λ values are computed and communicated
   // Overwrites NORMAL with ∇λ, turning BGKSource into Cahn-Hilliard source
@@ -422,7 +427,11 @@ int main(int argc, char* argv[]) {
     PFLattice.getField<PHI<T>>().Communicate();
 
     // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
-    PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
+    // Three separate ApplyCellDynamics calls to ensure all functors execute
+    // (TupleWrapper if/else-if bug: only the first matching key runs)
+    PFLattice.template ApplyCellDynamics<FFNormalTaskSel>(FlagFM);
+    PFLattice.template ApplyCellDynamics<FFLaplacianTaskSel>(FlagFM);
+    PFLattice.template ApplyCellDynamics<FFChemPotTaskSel>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
@@ -440,13 +449,13 @@ int main(int argc, char* argv[]) {
 
     // Step 4: Surface tension force F_s = λ*∇φ → NS FORCE
     STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
-
     // Step 5: Gravity/buoyancy force F_b → NS FORCE
     GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // ---- NS collision and streaming ----
     // Step 6: NS BGKForce collision
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
+
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
     // Step 7: NS BCs + Stream + Communicate
     NS_BB.Apply(MainLoopTimer());
