@@ -198,8 +198,6 @@ int main(int argc, char* argv[]) {
   GeoWriter.WriteBinary();
 
   // ------------------ define NS lattice ------------------
-  // Note: RHO<T> is cosmetic only (forcerhoU overwrites it with Σf≈1.0 each step)
-  // Actual density variation enters via the FORCE field
   using NSFIELDS = TypePack<RHO<T>, VELOCITY<T, 2>, POP<T, LatSet::q>,
                             FORCE<T, LatSet::d>>;
   ValuePack NSInitValues(BaseConv.getLatRhoInit(), Vector<T, 2>{T{0}, T{0}},
@@ -342,13 +340,16 @@ int main(int argc, char* argv[]) {
     tmp::Key_TypePair<BulkFlag, ff::FFChemPotentialGradient2D<PFCELL>>;
   using FFChemPotGradSel = TaskSelector<std::uint8_t, PFCELL, FFChemPotGradTask>;
 
-  // PF collision: MRTSource with NORMAL (= ∇φ/|∇φ|) as Allen-Cahn source
+  // PF collision: MRTSource with Cahn-Hilliard relaxation (UseCHRelaxation=true)
+  // All moments relaxed with omega_phi — numerically matches BGKSource.
+  // Sharpening mode (false) fails to maintain interface at high flow speeds.
   using PFCollisionTask = tmp::Key_TypePair<
     BulkFlag,
     collision::MRTSource<
       equilibrium::SecondOrder<PFCELL>,
       NORMAL<T, LatSet::d>,
-      true>>;
+      true,
+      true>>;  // UseCHRelaxation=true enables ALL-moment relaxation
   using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
 
   // ---- Coupling tasks (PF → NS) ----
