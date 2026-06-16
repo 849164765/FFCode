@@ -336,8 +336,9 @@ int main(int argc, char* argv[]) {
     tmp::Key_TypePair<BulkFlag, ff::FFLaplacian2D<PFCELL>>;
   using FFChemPotTask =
     tmp::Key_TypePair<BulkFlag, ff::FFChemPotential2D<PFCELL>>;
-  using PFFFTaskCollection = tmp::TupleWrapper<FFNormalTask, FFLaplacianTask, FFChemPotTask>;
-  using PFFFTaskSelector = tmp::TaskSelector<PFFFTaskCollection, std::uint8_t, PFCELL>;
+  using FFNormalSelector = TaskSelector<std::uint8_t, PFCELL, FFNormalTask>;
+  using FFLaplacianSelector = TaskSelector<std::uint8_t, PFCELL, FFLaplacianTask>;
+  using FFChemPotSelector = TaskSelector<std::uint8_t, PFCELL, FFChemPotTask>;
 
   // Chem potential gradient (∇λ): must run AFTER all λ values are computed and communicated
   // Overwrites NORMAL with ∇λ, turning BGKSource into Cahn-Hilliard source
@@ -389,7 +390,6 @@ int main(int argc, char* argv[]) {
   NSLattice.NormalCommunicate();
   MainWriter.WriteBinary(MainLoopTimer());
 
-  std::cout << "gravity = " << gravity << " kappa = " << Kappa << std::endl;
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   while (MainLoopTimer() < MaxStep) {
@@ -421,8 +421,10 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
-    PFLattice.template ApplyCellDynamics<PFFFTaskSelector>(FlagFM);
+    // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL (independent dispatch)
+    PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
+    PFLattice.template ApplyCellDynamics<FFLaplacianSelector>(FlagFM);
+    PFLattice.template ApplyCellDynamics<FFChemPotSelector>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
