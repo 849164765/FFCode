@@ -156,6 +156,7 @@ int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag = std::uint8_t(1);
   constexpr std::uint8_t BulkFlag = std::uint8_t(2);
   constexpr std::uint8_t BouncebackFlag = std::uint8_t(4);
+  constexpr std::uint8_t PeriodicFlag = std::uint8_t(8);
 
   mpi().init(&argc, &argv);
   MPI_DEBUG_WAIT
@@ -185,10 +186,28 @@ int main(int argc, char* argv[]) {
 
   BlockGeometry2D<T> Geo(GeoHelper);
 
+  // Ghost zones for periodic x-boundary (1-cell-wide strips outside domain)
+  T L_global = T(Ni) * Cell_Len;
+  T H_global = T(Nj) * Cell_Len;
+  AABB<T, 2> left(Vector<T, 2>(T(-Cell_Len), T(0)),
+                  Vector<T, 2>(T(0), H_global));
+  AABB<T, 2> right(Vector<T, 2>(L_global, T(0)),
+                   Vector<T, 2>(L_global + Cell_Len, H_global));
+
   // ------------------ define flag field ------------------
   BlockFieldManager<FLAG, T, LatSet::d> FlagFM(Geo, VoidFlag);
+
+  // Interior: BulkFlag
   FlagFM.forEach(domain,
                  [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+
+  // Left/right ghost: PeriodicFlag
+  FlagFM.forEach(left,
+                 [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(right,
+                 [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+
+  // Top/bottom: BouncebackFlag (via SetupBoundary detects cells whose neighbors leave domain)
   FlagFM.template SetupBoundary<LatSet>(domain, BouncebackFlag);
 
   // Write flag geometry for verification
@@ -307,17 +326,34 @@ int main(int argc, char* argv[]) {
   }
 
   // ------------------ define BCs ------------------
-  // NS: bounceback on all walls
-  BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>,
-                            BlockLatticeManager<T, LatSet, NSFIELDS>,
-                            BlockFieldManager<FLAG, T, LatSet::d>>
-    NS_BB("NS_BB", NSLattice, FlagFM, BouncebackFlag, VoidFlag);
+  using LM_NS = BlockLatticeManager<T, LatSet, NSFIELDS>;
+  using LM_PF = BlockLatticeManager<T, LatSet, PFFIELDPACK>;
+  using FM = BlockFieldManager<FLAG, T, LatSet::d>;
 
-  // PF: bounceback on all walls
-  using PFBLKLAT = BlockLatticeManager<T, LatSet, PFFIELDPACK>;
-  BBLikeFixedBlockBdManager<bounceback::normal<PFCELL>, PFBLKLAT,
-                            BlockFieldManager<FLAG, T, LatSet::d>>
-    PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
+  // NS: periodic in x (left-right)
+  FixedPeriodicBoundaryManager<LM_NS, FM>
+      NS_Periodic("NS_Periodic", NSLattice, FlagFM, PeriodicFlag, VoidFlag);
+  NS_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  NS_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+
+  // PF: periodic in x (left-right)
+  FixedPeriodicBoundaryManager<LM_PF, FM>
+      PF_Periodic("PF_Periodic", PFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  PF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  PF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+
+#ifdef MPI_ENABLED
+  NS_Periodic.SetupMPI(GeoHelper);
+  PF_Periodic.SetupMPI(GeoHelper);
+#endif
+
+  // NS: bounceback on top/bottom
+  BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>, LM_NS, FM>
+      NS_BB("NS_BB", NSLattice, FlagFM, BouncebackFlag, VoidFlag);
+
+  // PF: bounceback on top/bottom
+  BBLikeFixedBlockBdManager<bounceback::normal<PFCELL>, LM_PF, FM>
+      PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
   // ------------------ define tasks ------------------
   // NS task: BGKForce with Force vector field
@@ -327,7 +363,9 @@ int main(int argc, char* argv[]) {
       moment::forcerhoU<NSCELL, force::Force<NSCELL>, true>,
       equilibrium::SecondOrder<NSCELL>,
       force::Force<NSCELL>>>;
-  using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
+  using NSPeriodicTask = tmp::Key_TypePair<
+    PeriodicFlag, collision::PeriodicBoundary<NSCELL>>;
+  using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask, NSPeriodicTask>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
   using FFNormalTask =
@@ -354,7 +392,9 @@ int main(int argc, char* argv[]) {
       equilibrium::SecondOrder<PFCELL>,
       NORMAL<T, LatSet::d>,
       true>>;
-  using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
+  using PFPeriodicTask = tmp::Key_TypePair<
+    PeriodicFlag, collision::PeriodicBoundary<PFCELL>>;
+  using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask, PFPeriodicTask>;
 
   // ---- Coupling tasks (PF → NS) ----
   using STForceTask =
@@ -388,6 +428,8 @@ int main(int argc, char* argv[]) {
   
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
+  NS_Periodic.Apply();
+  PF_Periodic.Apply();
   MainWriter.WriteBinary(MainLoopTimer());
 
   Printer::Print_BigBanner(std::string("Start Calculation..."));
@@ -450,7 +492,8 @@ int main(int argc, char* argv[]) {
     // Step 6: NS BGKForce collision
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
-    // Step 7: NS BCs + Stream + Communicate
+    // Step 7: NS boundaries (periodic + bounceback) + Stream + Communicate
+    NS_Periodic.Apply();
     NS_BB.Apply(MainLoopTimer());
     NSLattice.Stream();
     NSLattice.NormalCommunicate();
@@ -459,7 +502,8 @@ int main(int argc, char* argv[]) {
     // Step 8: PF BGKSource collision (reads NORMAL and VELOCITY from NS ref)
     PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
 
-    // Step 9: PF BCs + Stream + Communicate
+    // Step 9: PF boundaries (periodic + bounceback) + Stream + Communicate
+    PF_Periodic.Apply();
     PF_BB.Apply(MainLoopTimer());
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
