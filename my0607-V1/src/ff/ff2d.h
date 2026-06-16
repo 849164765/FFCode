@@ -25,6 +25,7 @@ struct RhoLBase : public FieldBase<1> {};
 struct RhoHBase : public FieldBase<1> {};
 struct EtaLBase : public FieldBase<1> {};
 struct EtaHBase : public FieldBase<1> {};
+struct DeltaRhoBase : public FieldBase<1> {};
 
 // ===================================================================
 //  Section 2: Self-Owned Field Type Aliases
@@ -57,6 +58,9 @@ using ETA_L = Data<T, EtaLBase>;
 template <typename T>
 using ETA_H = Data<T, EtaHBase>;
 
+template <typename T>
+using DELTARHO = Data<T, DeltaRhoBase>;
+
 // ===================================================================
 //  Section 3: Field Packs (self-owned + external, cf. CAFIELDS + REFFIELDS)
 // ===================================================================
@@ -64,7 +68,8 @@ using ETA_H = Data<T, EtaHBase>;
 template <typename T>
 using FFFIELDS = TypePack<LAPLACIAN<T>, CHEMICALPOTENTIAL<T>,
                           GRAVITY<T>, BETA<T>, KAPPA<T>,
-                          RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>>;
+                          RHO_L<T>, RHO_H<T>, ETA_L<T>, ETA_H<T>,
+                          DELTARHO<T>>;
 
 template <typename T, unsigned int D>
 using FFEXTERNALFIELDS = TypePack<PHI<T>, GRAD<T, D>, NORMAL<T, D>, INTERFACEWIDTH<T>>;
@@ -127,6 +132,24 @@ struct FFSurfaceTension2D {
 
 template <typename PFCELL, typename NSCELL>
 struct FFGravityForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// FFViscoForce2D: F_v from non-equilibrium moments (Fortran MRT two-pass algorithm)
+// Computes mgneq from NS populations using first-pass MRT relaxation,
+// then F_v = -3*mu*DeltaRho/rho * (C · grad_phi)
+template <typename PFCELL, typename NSCELL>
+struct FFViscoForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// FFPreForce2D: F_p = -(p/3) * DeltaRho * grad_phi (pressure gradient force)
+template <typename PFCELL, typename NSCELL>
+struct FFPreForce2D {
   using T = typename PFCELL::FloatType;
   using LatSet = typename NSCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);

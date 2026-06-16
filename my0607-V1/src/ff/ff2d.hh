@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ff/ff2d.h"
+#include "lbm/collisionMRT.h"
 
 namespace ff {
 
@@ -59,7 +60,8 @@ __any__ void FFLaplacian2D<CELL>::apply(CELL& cell) {
 }
 
 // ---- FFChemPotential2D ----
-// λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ
+// λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ + λ_entropy
+// λ_entropy = ln((φ+ε)/(1-φ+ε)) / (φ*(1-φ)) * 1e-3
 template <typename CELL>
 __any__ void FFChemPotential2D<CELL>::apply(CELL& cell) {
   T phi = cell.template get<GenericRho>();
@@ -70,6 +72,20 @@ __any__ void FFChemPotential2D<CELL>::apply(CELL& cell) {
   // φ*(φ-1)*(φ-0.5)
   T double_well = phi * (phi - T{1}) * (phi - T{0.5});
   T chem_potential = T{4} * beta * double_well - kappa * laplacian;
+
+  // Log-entropy term: λ += ln((φ+ε)/(1-φ+ε)) / (φ*(1-φ)) * 1e-3
+  // ε = 1e-8 prevents division by zero / log(0)
+  T eps = T{1e-8};
+  T phi_safe = phi;
+  if (phi_safe < eps) phi_safe = eps;
+  if (phi_safe > T{1} - eps) phi_safe = T{1} - eps;
+#ifdef __CUDA_ARCH__
+  T log_term = log((phi_safe + eps) / (T{1} + eps - phi_safe));
+#else
+  T log_term = std::log((phi_safe + eps) / (T{1} + eps - phi_safe));
+#endif
+  T entropy_factor = log_term / (phi_safe * (T{1} - phi_safe)) * T{1e-3};
+  chem_potential += entropy_factor;
 
   cell.template get<CHEMICALPOTENTIAL<T>>() = chem_potential;
 }
@@ -113,7 +129,8 @@ __any__ void FFSurfaceTension2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
 }
 
 // ---- FFGravityForce2D ----
-// F_b[1] = -|gravity| * ρ(φ)  where ρ(φ) = ρ_l + φ*(ρ_h-ρ_l)
+// Fortran: bodyforcey = -rho * (1e-4/60.0)
+// g is positive scalar 1.667e-6, so -rho*g gives downward force
 template <typename PFCELL, typename NSCELL>
 __any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T phi = pf_cell.template get<typename PFCELL::GenericRho>();
@@ -121,15 +138,9 @@ __any__ void FFGravityForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
   T rho_h = pf_cell.template get<RHO_H<T>>();
   T g = pf_cell.template get<GRAVITY<T>>();
 
-  // g is negative (downward), so |g| = -g
   T rho = rho_l + phi * (rho_h - rho_l);
-  // F_b in y-direction. Gravity points downward (negative y).
-  // Since g is negative: buoyancy = rho*g (negative * negative = positive upward force if rho_l < rho_h)
-  // Wait: F_b = ρ * G_y where G_y is the gravitational acceleration.
-  // For bubble rising, the bubble is lighter (ρ_l << ρ_h), so light fluid rises.
-  // F_b[1] = rho * g where g is negative (pointing down).
-  // The NS solver handles the sign convention.
-  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += (rho - rho_h) * g;
+  // Fortran: bodyforcey = -rho(i,j) * 1e-4/60.0
+  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += -rho * g;
 }
 
 // ---- FFRhoOmegaUpdate2D ----
@@ -148,9 +159,13 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T eta_l = pf_cell.template get<ETA_L<T>>();
   T eta_h = pf_cell.template get<ETA_H<T>>();
 
-  // Interpolate rho
+  // Interpolate rho and write to DENSITY field (for incompressible He-Luo LBM)
   T rho = rho_l + phi * (rho_h - rho_l);
-  ns_cell.template get<typename NSCELL::GenericRho>() = rho;
+  if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
+    ns_cell.template get<DENSITY<T>>() = rho;
+  } else {
+    ns_cell.template get<typename NSCELL::GenericRho>() = rho;
+  }
 
   // Interpolate eta (dynamic viscosity)
   T eta = eta_l + phi * (eta_h - eta_l);
@@ -164,6 +179,154 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   if (omega < T{0.01}) omega = T{0.01};
 
   ns_cell.template get<OMEGA<T>>() = omega;
+}
+
+// ---- FFPreForce2D ----
+// F_p = -(p/3) * DeltaRho * grad_phi
+// Pressure gradient force from incompressible LBM formulation
+// p = ns_cell.get<PRESSURE<T>>() = sum(f_i)
+template <typename PFCELL, typename NSCELL>
+__any__ void FFPreForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  T p = ns_cell.template get<PRESSURE<T>>();
+  T delta_rho = pf_cell.template get<DELTARHO<T>>();
+  const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+
+  // F_p = -(p/3) * DeltaRho * grad(phi)
+  T coeff = -p / T{3} * delta_rho;
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += coeff * grad_phi[0];
+  ns_force[1] += coeff * grad_phi[1];
+}
+
+// ---- FFViscoForce2D ----
+// F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
+// C_ab = Σ_k c_ka * c_kb * mgneq_k
+// mgneq = InvM · S1 · (m - m_eq)   (first-pass MRT relaxation)
+// S1 = diag(0, ω, ω, 0, s_q, 0, s_q, ω, ω),  s_q = 8*(2-ω)/(8-ω)
+//
+// Adds F_v to NS FORCE (which already contains F_s + F_b + F_p)
+template <typename PFCELL, typename NSCELL>
+__any__ void FFViscoForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  // Read per-cell omega
+  T omega{};
+  if constexpr (ns_cell.template hasField<OMEGA<T>>()) {
+    omega = ns_cell.template get<OMEGA<T>>();
+  } else {
+    omega = ns_cell.getOmega();
+  }
+
+  // Read actual density: DENSITY field (incompressible) or sum(f) (compressible)
+  T f[LatSet::q];
+  for (unsigned int k = 0; k < LatSet::q; ++k) f[k] = ns_cell[k];
+  T rho;
+  if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
+    rho = ns_cell.template get<DENSITY<T>>();
+  } else {
+    rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8];
+  }
+  T ux = (f[1] - f[2] + f[5] - f[6] + f[7] - f[8]) / rho;
+  T uy = (f[3] - f[4] + f[5] - f[6] - f[7] + f[8]) / rho;
+
+  // Half-force correction using current FORCE (= F_s + F_b + F_p)
+  const auto& F_in = ns_cell.template get<FORCE<T, LatSet::d>>();
+  T halfInvRho = T{0.5} / rho;
+  T ucx = ux + halfInvRho * F_in[0];
+  T ucy = uy + halfInvRho * F_in[1];
+
+  // ---- First-pass MRT relaxation vector ----
+  T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
+  const T rtvec1[LatSet::q] {
+    T{0},     // rho (conserved)
+    omega,    // e
+    omega,    // epsilon
+    T{0},     // jx (conserved)
+    s_q,      // qx
+    T{0},     // jy (conserved)
+    s_q,      // qy
+    omega,    // pxx (shear)
+    omega     // pxy (shear)
+  };
+
+  // Moments from populations (M·f, unrolled D2Q9)
+  T zeroth = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8];
+  T m_raw[LatSet::q];
+  m_raw[0] = zeroth;
+  m_raw[1] = T{-4} * f[0] - f[1] - f[2] - f[3] - f[4]
+           + T{2} * (f[5] + f[6] + f[7] + f[8]);
+  m_raw[2] = T{4} * f[0] - T{2} * (f[1] + f[2] + f[3] + f[4])
+           + f[5] + f[6] + f[7] + f[8];
+  m_raw[3] = f[1] - f[2] + f[5] - f[6] + f[7] - f[8];
+  m_raw[4] = T{-2} * f[1] + T{2} * f[2] + f[5] - f[6] + f[7] - f[8];
+  m_raw[5] = f[3] - f[4] + f[5] - f[6] - f[7] + f[8];
+  m_raw[6] = T{-2} * f[3] + T{2} * f[4] + f[5] - f[6] - f[7] + f[8];
+  m_raw[7] = f[1] + f[2] - f[3] - f[4];
+  m_raw[8] = f[5] + f[6] - f[7] - f[8];
+
+  // Equilibrium moments: He-Luo incompressible (matches MRTForce and Fortran)
+  // For compressible (no DENSITY field), the original rho-multiplied forms are kept
+  constexpr bool isIncompressible = NSCELL::template hasField<DENSITY<T>>();
+  T ucx2 = ucx * ucx;
+  T ucy2 = ucy * ucy;
+  T uc2 = ucx2 + ucy2;
+  T m_eq[LatSet::q];
+  if constexpr (isIncompressible) {
+    m_eq[0] = zeroth;
+    m_eq[1] = T{-2} * zeroth + T{3} * uc2;
+    m_eq[2] = T{9} * ucx2 * ucy2 - T{3} * uc2 + zeroth;
+    m_eq[3] = ucx;
+    m_eq[4] = ucx * (T{3} * ucy2 - T{1});
+    m_eq[5] = ucy;
+    m_eq[6] = ucy * (T{3} * ucx2 - T{1});
+    m_eq[7] = ucx2 - ucy2;
+    m_eq[8] = ucx * ucy;
+  } else {
+    m_eq[0] = rho;
+    m_eq[1] = T{-2} * rho + T{3} * rho * uc2;
+    m_eq[2] = T{9} * rho * ucx2 * ucy2 - T{3} * rho * uc2 + rho;
+    m_eq[3] = rho * ucx;
+    m_eq[4] = rho * ucx * (T{3} * ucy2 - T{1});
+    m_eq[5] = rho * ucy;
+    m_eq[6] = rho * ucy * (T{3} * ucx2 - T{1});
+    m_eq[7] = rho * (ucx2 - ucy2);
+    m_eq[8] = rho * ucx * ucy;
+  }
+
+  // Deviation in moment space
+  T dm[LatSet::q];
+  for (unsigned int i = 0; i < LatSet::q; ++i) dm[i] = m_raw[i] - m_eq[i];
+
+  // Non-equilibrium population: mgneq_i = Σ_j InvM(i,j) * S1(j) * dm_j
+  T mgneq[LatSet::q] {};
+  for (unsigned int i = 0; i < LatSet::q; ++i) {
+    mgneq[i] = T{};
+    for (unsigned int j = 0; j < LatSet::q; ++j) {
+      mgneq[i] += mrt::InvM<LatSet>(i, j) * rtvec1[j] * dm[j];
+    }
+  }
+
+  // C_ab = Σ_k c_ka * c_kb * mgneq_k (unrolled D2Q9)
+  // c vectors: 0:(0,0), 1:(1,0), 2:(-1,0), 3:(0,1), 4:(0,-1), 5:(1,1), 6:(-1,-1), 7:(1,-1), 8:(-1,1)
+  T Cxx = mgneq[1] + mgneq[2] + mgneq[5] + mgneq[6] + mgneq[7] + mgneq[8];
+  T Cxy = mgneq[5] + mgneq[6] - mgneq[7] - mgneq[8];
+  T Cyy = mgneq[3] + mgneq[4] + mgneq[5] + mgneq[6] + mgneq[7] + mgneq[8];
+
+  // Read grad_phi and DeltaRho from PF cell
+  const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T delta_rho = pf_cell.template get<DELTARHO<T>>();
+
+  // mu = nu * rho = (tau-0.5)*cs²*rho = (1/omega - 0.5)*cs²*rho
+  T invOmega = T{1} / omega;
+  T nu = (invOmega - T{0.5}) * LatSet::cs2;
+  T mu = nu * rho;
+
+  // F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
+  T prefactor = -T{3} * mu * delta_rho / rho;
+  T Fv_x = prefactor * (Cxx * grad_phi[0] + Cxy * grad_phi[1]);
+  T Fv_y = prefactor * (Cxy * grad_phi[0] + Cyy * grad_phi[1]);
+
+  // Add F_v to NS FORCE
+  ns_cell.template get<FORCE<T, LatSet::d>>()[0] += Fv_x;
+  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += Fv_y;
 }
 
 }  // namespace ff

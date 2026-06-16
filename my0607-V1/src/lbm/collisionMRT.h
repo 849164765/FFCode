@@ -276,9 +276,25 @@ struct MRTSource {
 
     T rtvec[LatSet::q] {};
     if constexpr (UseCHRelaxation) {
-      // Cahn-Hilliard: use omega_phi for all → numerically matches BGKSource
-      for (unsigned int i = 0; i < LatSet::q; ++i) {
-        rtvec[i] = omega_phi;
+      // Cahn-Hilliard: Fortran-aligned relaxation vector
+      // Fortran Sf = {1.0, 1.1, 1.1, 1/tau, 1/tau, 1/tau, 1/tau, 1.2, 1.2}
+      if constexpr (std::is_same_v<LatSet, D2Q9<T>> || std::is_same_v<LatSet, D2Q5<T>>) {
+        rtvec[0] = T{1};                                    // rho/phi (conserved)
+        rtvec[1] = T{11./10.};                               // e
+        rtvec[2] = T{11./10.};                               // epsilon
+        rtvec[3] = omega_phi;                                // jx (1/tau)
+        rtvec[4] = omega_phi;                                // qx (1/tau)
+        if constexpr (LatSet::q > 5) {
+          rtvec[5] = omega_phi;                              // jy (1/tau)
+          rtvec[6] = omega_phi;                              // qy (1/tau)
+          rtvec[7] = T{12./10.};                             // pxx (1.2)
+          rtvec[8] = T{12./10.};                             // pxy (1.2)
+        }
+      } else {
+        // Generic fallback: use omega_phi for all moments
+        for (unsigned int i = 0; i < LatSet::q; ++i) {
+          rtvec[i] = omega_phi;
+        }
       }
     } else {
       // Interface sharpening: s1 + shear override (original behaviour)
@@ -365,7 +381,13 @@ struct MRTForce {
   using LatSet = typename CELL::LatticeSet;
 
   __any__ static void apply(CELL& cell) {
-    const T omega = cell.getOmega();
+    // Per-cell omega (spatially varying relaxation) for variable viscosity
+    T omega{};
+    if constexpr (cell.template hasField<OMEGA<T>>()) {
+      omega = cell.template get<OMEGA<T>>();
+    } else {
+      omega = cell.getOmega();
+    }
     const auto& F = cell.template get<ForceField>();
 
     // 1. Compute rho and u_raw from populations

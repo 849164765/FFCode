@@ -96,6 +96,31 @@ struct SecondOrder {
   }
 };
 
+// He-Luo incompressible equilibrium (for variable-density two-phase flow)
+// f_i^eq = w_i * p + w_i * [InvCs2*(c_i·u) + 0.5*InvCs4*(c_i·u)^2 - 0.5*InvCs2*u^2]
+// where p = sum(f_i) is pressure (not density).
+// The actual density rho comes separately from the phase-field (phi interpolation).
+template <typename CELL>
+struct IncompressibleSecondOrder {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using CELLTYPE = CELL;
+
+  __any__ static inline T get(unsigned int k, const Vector<T, LatSet::d>& u, const T p, const T u2) {
+    const T uc = u * latset::c<LatSet>(k);
+    return latset::w<LatSet>(k) * (p + LatSet::InvCs2 * uc
+           + uc * uc * T{0.5} * LatSet::InvCs4 - LatSet::InvCs2 * u2 * T{0.5});
+  }
+
+  __any__ static void apply(std::array<T, LatSet::q>& feq, const T p,
+                             const Vector<T, LatSet::d>& u) {
+    const T u2 = u.getnorm2();
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      feq[k] = get(k, u, p, u2);
+    }
+  }
+};
+
 
 template <typename CELL>
 struct FirstOrderImpl {
