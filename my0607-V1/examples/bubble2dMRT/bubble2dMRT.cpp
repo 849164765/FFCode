@@ -135,6 +135,7 @@ int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag = std::uint8_t(1);
   constexpr std::uint8_t BulkFlag = std::uint8_t(2);
   constexpr std::uint8_t BouncebackFlag = std::uint8_t(4);
+  constexpr std::uint8_t PeriodicFlag = std::uint8_t(8);
 
   mpi().init(&argc, &argv);
   MPI_DEBUG_WAIT
@@ -156,6 +157,10 @@ int main(int argc, char* argv[]) {
   // ------------------ define geometry ------------------
   AABB<T, 2> domain(Vector<T, 2>(T(0), T(0)),
                     Vector<T, 2>(T(Ni * Cell_Len), T(Nj * Cell_Len)));
+  AABB<T, 2> left(Vector<T, 2>(T(-Cell_Len), T(0)),
+                  Vector<T, 2>(T(0), T(Nj * Cell_Len)));
+  AABB<T, 2> right(Vector<T, 2>(T(Ni * Cell_Len), T(0)),
+                   Vector<T, 2>(T((Ni + 1) * Cell_Len), T(Nj * Cell_Len)));
 
   BlockGeometryHelper2D<T> GeoHelper(Ni, Nj, domain, Cell_Len, BlockCellLen);
   GeoHelper.CreateBlocks(1,mpi().getSize());
@@ -168,6 +173,8 @@ int main(int argc, char* argv[]) {
   BlockFieldManager<FLAG, T, LatSet::d> FlagFM(Geo, VoidFlag);
   FlagFM.forEach(domain,
                  [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+  FlagFM.forEach(left, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(right, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
   FlagFM.template SetupBoundary<LatSet>(domain, BouncebackFlag);
 
   // Write flag geometry for verification
@@ -307,12 +314,27 @@ int main(int argc, char* argv[]) {
                             BlockFieldManager<FLAG, T, LatSet::d>>
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
+  // Periodic BC in X direction
+  using LM_NS = BlockLatticeManager<T, LatSet, NSFIELDS>;
+  using LM_PF = BlockLatticeManager<T, LatSet, PFFIELDPACK>;
+  using FM = BlockFieldManager<FLAG, T, LatSet::d>;
+
+  FixedPeriodicBoundaryManager<LM_NS, FM>
+      NS_Periodic("NS_Periodic", NSLattice, FlagFM, PeriodicFlag, VoidFlag);
+  NS_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  NS_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+
+  FixedPeriodicBoundaryManager<LM_PF, FM>
+      PF_Periodic("PF_Periodic", PFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  PF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  PF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+
   // ------------------ define tasks ------------------
   // NS task: MRTForce with Guo force (moment-space equivalent of BGKForce)
-  using NSBulkTask = tmp::Key_TypePair<
-    BulkFlag,
-    collision::MRTForce<NSCELL, FORCE<T, LatSet::d>>>;
-  using NSTaskSelector = TaskSelector<std::uint8_t, NSCELL, NSBulkTask>;
+  using NSBulkTask = tmp::Key_TypePair<BulkFlag, collision::MRTForce<NSCELL, FORCE<T, LatSet::d>>>;
+  using NSPeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision::PeriodicBoundary<NSCELL>>;
+  using NSAllTasks = tmp::TupleWrapper<NSBulkTask, NSPeriodicTask>;
+  using NSTaskSelector = tmp::TaskSelector<NSAllTasks, std::uint8_t, NSCELL>;
 
   // PF tasks: FF2D (∇φ + n with ε=0.005), FFLaplacian2D (∇²φ), FFChemPotential2D (λ)
   using FFNormalTask =
@@ -333,7 +355,9 @@ int main(int argc, char* argv[]) {
       NORMAL<T, LatSet::d>,
       true,    // WriteToField
       true>>;  // UseCHRelaxation (Fortran-aligned rtvec)
-  using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
+  using PFPeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision::PeriodicBoundary<PFCELL>>;
+  using PFAllTasks = tmp::TupleWrapper<PFCollisionTask, PFPeriodicTask>;
+  using PFCollisionTaskSelector = tmp::TaskSelector<PFAllTasks, std::uint8_t, PFCELL>;
 
   // ---- Coupling tasks (PF → NS) ----
   using STForceTask =
@@ -386,6 +410,8 @@ int main(int argc, char* argv[]) {
   
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
+  NS_Periodic.Apply();
+  PF_Periodic.Apply();
 
   // Compute initial phi gradients, normal, laplacian, chempot (Fortran initHydroMacroVars)
   PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
@@ -422,14 +448,19 @@ int main(int argc, char* argv[]) {
     // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
     PreForceCoupling.ApplyCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
+    // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
+    NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
+
     // ---- Phase B: PF collision (Fortran collisionOrderDF2D) ----
     PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    PF_Periodic.Apply();
 
     // ---- Phase C: NS collision (Fortran collisionDenDF2D) ----
     // C1: Viscous force F_v from non-equilibrium moments
     ViscoForceCoupling.ApplyCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
     // C2: MRTForce with total accumulated FORCE (F_s+F_b+F_p+F_v)
     NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
+    NS_Periodic.Apply();
 
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
@@ -469,25 +500,37 @@ int main(int argc, char* argv[]) {
     PFLattice.getField<PHI<T>>().Communicate();
 
     // E2: phi=1 at top/bottom walls (Fortran setMacroOrderBC: phi(i,1)=1, phi(i,ny)=1)
+    // Only apply to blocks that actually touch the physical wall (global j=0 or j=Nj-1)
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
+      T H_global = T(Nj) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
         const auto& proj = block.getProjection();
         auto& blockPhi = phiField.getBlockField(blockid);
         int nx = block.getNx();
-        int ny = block.getNy();
         int overlap = block.getOverlap();
-        for (int i = overlap; i < nx - overlap; ++i) {
-          std::size_t id_bot = overlap * proj[1] + i;
-          blockPhi.get(id_bot) = T{1};
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        // Bottom wall: only if block touches global j=0
+        if (minY < Cell_Len * T(1.5)) {
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id_bot = overlap * proj[1] + i;
+            blockPhi.get(id_bot) = T{1};
+          }
         }
-        for (int i = overlap; i < nx - overlap; ++i) {
-          std::size_t id_top = (ny - 1 - overlap) * proj[1] + i;
-          blockPhi.get(id_top) = T{1};
+        // Top wall: only if block touches global j=Nj-1
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          int ny = block.getNy();
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id_top = (ny - 1 - overlap) * proj[1] + i;
+            blockPhi.get(id_top) = T{1};
+          }
         }
       }
     }
+    // E2a: Re-communicate PHI after wall modification (ghost cells need updated phi)
+    PFLattice.getField<PHI<T>>().Communicate();
 
     // E3: Gradients, normal, laplacian, chempot (Fortran computeOrderMacro)
     PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
@@ -497,29 +540,70 @@ int main(int argc, char* argv[]) {
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
+    // E3a: Wall grad_phi special handling (Fortran: nablaphiy(i,1)=nablaphiy(i,2), nablaphiy(i,ny)=nablaphiy(i,ny-1))
+    // Only apply to blocks that actually touch the physical wall
+    {
+      auto& gradField = PFLattice.getField<GRAD<T, LatSet::d>>();
+      T H_global = T(Nj) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockGrad = gradField.getBlockField(blockid);
+        int nx = block.getNx();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        // Bottom wall: only if block touches global j=0
+        if (minY < Cell_Len * T(1.5)) {
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id_bot = overlap * proj[1] + i;
+            std::size_t id_bot1 = (overlap + 1) * proj[1] + i;
+            blockGrad.get(id_bot)[1] = blockGrad.get(id_bot1)[1];
+          }
+        }
+        // Top wall: only if block touches global j=Nj-1
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          int ny = block.getNy();
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id_top = (ny - 1 - overlap) * proj[1] + i;
+            std::size_t id_top1 = (ny - 2 - overlap) * proj[1] + i;
+            blockGrad.get(id_top)[1] = blockGrad.get(id_top1)[1];
+          }
+        }
+      }
+    }
+
     // E4: Chempot extrapolation at walls (Fortran setMacroOrderBC chpoten)
+    // Only apply to blocks that actually touch the physical wall
     {
       auto& chpotenField = PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
+      T H_global = T(Nj) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
         const auto& proj = block.getProjection();
         auto& blockChpoten = chpotenField.getBlockField(blockid);
         int nx = block.getNx();
-        int ny = block.getNy();
         int overlap = block.getOverlap();
-        // Bottom: chpoten(j=1) = (4*chpoten(j=2) - chpoten(j=3)) / 3
-        for (int i = overlap; i < nx - overlap; ++i) {
-          std::size_t id1 = overlap * proj[1] + i;
-          std::size_t id2 = (overlap + 1) * proj[1] + i;
-          std::size_t id3 = (overlap + 2) * proj[1] + i;
-          blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        // Bottom wall: only if block touches global j=0
+        if (minY < Cell_Len * T(1.5)) {
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id1 = overlap * proj[1] + i;
+            std::size_t id2 = (overlap + 1) * proj[1] + i;
+            std::size_t id3 = (overlap + 2) * proj[1] + i;
+            blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+          }
         }
-        // Top: chpoten(j=ny) = (4*chpoten(j=ny-1) - chpoten(j=ny-2)) / 3
-        for (int i = overlap; i < nx - overlap; ++i) {
-          std::size_t id1 = (ny - 1 - overlap) * proj[1] + i;
-          std::size_t id2 = (ny - 2 - overlap) * proj[1] + i;
-          std::size_t id3 = (ny - 3 - overlap) * proj[1] + i;
-          blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+        // Top wall: only if block touches global j=Nj-1
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          int ny = block.getNy();
+          for (int i = overlap; i < nx - overlap; ++i) {
+            std::size_t id1 = (ny - 1 - overlap) * proj[1] + i;
+            std::size_t id2 = (ny - 2 - overlap) * proj[1] + i;
+            std::size_t id3 = (ny - 3 - overlap) * proj[1] + i;
+            blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+          }
         }
       }
     }

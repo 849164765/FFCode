@@ -24,18 +24,18 @@ __any__ void FF2D<CELL>::apply(CELL& cell) {
   cell.template get<GRAD<T, LatSet::d>>() = grad;
 
   T grad_mag = grad.getnorm();
-  // ε threshold for noise suppression: bulk regions have |∇φ| << 0.005
-  // At the interface center: |∇φ| ≈ 1/W ≈ 0.33 (W=3) >> 0.005
-  // This filters out noise-driven source terms while keeping interface dynamics
-  T delta = T(0.005); 
+  // Physical threshold normalization (replaces Fortran's eps=1e-30 which is too small):
+  // Interface width W=5, max |grad_phi|~0.2 at interface.
+  // Use cutoff=0.02 (~10% of max gradient): far from interface where |grad|<cutoff,
+  // |n| smoothly decays to 0 instead of being pinned at 1 by numerical noise.
+  // Impact on physics: negligible — NORMAL is only used in MRTSource Allen-Cahn term,
+  // which has a 4*phi*(1-phi) factor that zeroes the source outside the interface anyway.
+  T cutoff = T{0.02};
+  T eps = cutoff * cutoff;
+  T inv_mag = T{1} / std::sqrt(grad_mag * grad_mag + eps);
   Vector<T, LatSet::d> n;
-  if (grad_mag < delta) {
-    n[0] = T{0};
-    n[1] = T{0};
-  } else {
-    n[0] = grad[0] / grad_mag;
-    n[1] = grad[1] / grad_mag;
-  }
+  n[0] = grad[0] * inv_mag;
+  n[1] = grad[1] * inv_mag;
   cell.template get<NORMAL<T, LatSet::d>>() = n;
 }
 
@@ -60,8 +60,9 @@ __any__ void FFLaplacian2D<CELL>::apply(CELL& cell) {
 }
 
 // ---- FFChemPotential2D ----
-// λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ + λ_entropy
-// λ_entropy = ln((φ+ε)/(1-φ+ε)) / (φ*(1-φ)) * 1e-3
+// λ = 4β * φ*(φ-1)*(φ-0.5) - κ * ∇²φ
+// Fortran-aligned: NO entropy term (Fortran chpoten used for surface tension
+// does not include the entropy term; mchpoten has it but is unused in active path)
 template <typename CELL>
 __any__ void FFChemPotential2D<CELL>::apply(CELL& cell) {
   T phi = cell.template get<GenericRho>();
@@ -72,20 +73,6 @@ __any__ void FFChemPotential2D<CELL>::apply(CELL& cell) {
   // φ*(φ-1)*(φ-0.5)
   T double_well = phi * (phi - T{1}) * (phi - T{0.5});
   T chem_potential = T{4} * beta * double_well - kappa * laplacian;
-
-  // Log-entropy term: λ += ln((φ+ε)/(1-φ+ε)) / (φ*(1-φ)) * 1e-3
-  // ε = 1e-8 prevents division by zero / log(0)
-  T eps = T{1e-8};
-  T phi_safe = phi;
-  if (phi_safe < eps) phi_safe = eps;
-  if (phi_safe > T{1} - eps) phi_safe = T{1} - eps;
-#ifdef __CUDA_ARCH__
-  T log_term = log((phi_safe + eps) / (T{1} + eps - phi_safe));
-#else
-  T log_term = std::log((phi_safe + eps) / (T{1} + eps - phi_safe));
-#endif
-  T entropy_factor = log_term / (phi_safe * (T{1} - phi_safe)) * T{1e-3};
-  chem_potential += entropy_factor;
 
   cell.template get<CHEMICALPOTENTIAL<T>>() = chem_potential;
 }
@@ -224,10 +211,21 @@ __any__ void FFViscoForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   } else {
     rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8];
   }
-  T ux = (f[1] - f[2] + f[5] - f[6] + f[7] - f[8]) / rho;
-  T uy = (f[3] - f[4] + f[5] - f[6] - f[7] + f[8]) / rho;
+  // He-Luo incompressible: sum(c*f) = u (velocity, NOT rho*u)
+  // Fortran: ux = sum(ex*ddf)  (no division by rho)
+  // Compressible: sum(c*f) = rho*u (momentum, needs /rho)
+  constexpr bool isIncompressible = NSCELL::template hasField<DENSITY<T>>();
+  T ux, uy;
+  if constexpr (isIncompressible) {
+    ux = f[1] - f[2] + f[5] - f[6] + f[7] - f[8];
+    uy = f[3] - f[4] + f[5] - f[6] - f[7] + f[8];
+  } else {
+    ux = (f[1] - f[2] + f[5] - f[6] + f[7] - f[8]) / rho;
+    uy = (f[3] - f[4] + f[5] - f[6] - f[7] + f[8]) / rho;
+  }
 
   // Half-force correction using current FORCE (= F_s + F_b + F_p)
+  // Fortran: ux = sum(ex*ddf) + 0.5*F/rho
   const auto& F_in = ns_cell.template get<FORCE<T, LatSet::d>>();
   T halfInvRho = T{0.5} / rho;
   T ucx = ux + halfInvRho * F_in[0];
@@ -264,7 +262,7 @@ __any__ void FFViscoForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
 
   // Equilibrium moments: He-Luo incompressible (matches MRTForce and Fortran)
   // For compressible (no DENSITY field), the original rho-multiplied forms are kept
-  constexpr bool isIncompressible = NSCELL::template hasField<DENSITY<T>>();
+  // isIncompressible already declared above
   T ucx2 = ucx * ucx;
   T ucy2 = ucy * ucy;
   T uc2 = ucx2 + ucy2;

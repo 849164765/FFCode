@@ -255,11 +255,14 @@ struct MRTForce<CELL<T, D2Q9<T>, TypePack>, ForceField> {
     // ---- Branched: density source and velocity half-force correction ----
     T dens{}, ucx{}, ucy{};
     if constexpr (isIncompressible) {
+      // He-Luo incompressible: sum(c*f) = u (velocity, NOT rho*u)
+      // Fortran: ux = sum(ex*ddf) + 0.5*F*dt/rho  (only force term divided by rho)
       dens = cell.template get<DENSITY<T>>();   // from phi interpolation
-      ucx = (ux_raw + T{0.5} * F[0]) / dens;
-      ucy = (uy_raw + T{0.5} * F[1]) / dens;
+      ucx = ux_raw + T{0.5} * F[0] / dens;
+      ucy = uy_raw + T{0.5} * F[1] / dens;
       cell.template get<PRESSURE<T>>() = zeroth;
     } else {
+      // Compressible: sum(c*f) = rho*u (momentum, needs /rho)
       dens = zeroth;                              // sum(f) ~ 1.0
       ucx = (ux_raw + T{0.5} * F[0]) / dens;
       ucy = (uy_raw + T{0.5} * F[1]) / dens;
