@@ -117,6 +117,22 @@ struct FFChemPotential2D {
 };
 
 template <typename CELL>
+struct FFLaplacian3D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+  __any__ static void apply(CELL& cell);
+};
+
+template <typename CELL>
+struct FFChemPotential3D {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+  __any__ static void apply(CELL& cell);
+};
+
+template <typename CELL>
 struct FFChemPotentialGradient2D {
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
@@ -157,6 +173,43 @@ struct FFPreForce2D {
 
 template <typename PFCELL, typename NSCELL>
 struct FFRhoOmegaUpdate2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL, typename NSCELL>
+struct FFSurfaceTension3D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL, typename NSCELL>
+struct FFGravityForce3D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL, typename NSCELL>
+struct FFPreForce3D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL, typename NSCELL>
+struct FFRhoOmegaUpdate3D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+
+// FFViscoForce3D: F_v from non-equilibrium moments (Fortran MRT two-pass algorithm)
+// 3D generic version using M/InvM matrix operations.
+template <typename PFCELL, typename NSCELL>
+struct FFViscoForce3D {
   using T = typename PFCELL::FloatType;
   using LatSet = typename NSCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);

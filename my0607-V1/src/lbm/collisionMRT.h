@@ -277,8 +277,8 @@ struct MRTSource {
     T rtvec[LatSet::q] {};
     if constexpr (UseCHRelaxation) {
       // Cahn-Hilliard: Fortran-aligned relaxation vector
-      // Fortran Sf = {1.0, 1.1, 1.1, 1/tau, 1/tau, 1/tau, 1/tau, 1.2, 1.2}
       if constexpr (std::is_same_v<LatSet, D2Q9<T>> || std::is_same_v<LatSet, D2Q5<T>>) {
+        // Fortran Sf = {1.0, 1.1, 1.1, 1/tau, 1/tau, 1/tau, 1/tau, 1.2, 1.2}
         rtvec[0] = T{1};                                    // rho/phi (conserved)
         rtvec[1] = T{11./10.};                               // e
         rtvec[2] = T{11./10.};                               // epsilon
@@ -290,6 +290,29 @@ struct MRTSource {
           rtvec[7] = T{12./10.};                             // pxx (1.2)
           rtvec[8] = T{12./10.};                             // pxy (1.2)
         }
+      } else if constexpr (std::is_same_v<LatSet, D3Q19<T>>) {
+        // D3Q19 CH relaxation vector aligned with mrtdata::M<3,19> row order:
+        // 0:rho, 1:e, 2:epsilon, 3:jx, 4:qx, 5:jy, 6:qy, 7:jz, 8:qz,
+        // 9-18: stress/shear and higher-order moments (9,11,13,14,15 are shear modes)
+        rtvec[0] = T{1};            // rho/phi (conserved)
+        rtvec[1] = T{11./10.};       // e
+        rtvec[2] = T{11./10.};       // epsilon
+        rtvec[3] = omega_phi;        // jx (1/tau_phi)
+        rtvec[4] = omega_phi;        // qx (1/tau_phi)
+        rtvec[5] = omega_phi;        // jy (1/tau_phi)
+        rtvec[6] = omega_phi;        // qy (1/tau_phi)
+        rtvec[7] = omega_phi;        // jz (1/tau_phi)
+        rtvec[8] = omega_phi;        // qz (1/tau_phi)
+        rtvec[9] = T{12./10.};       // pxx
+        rtvec[10] = T{12./10.};      // pww
+        rtvec[11] = T{12./10.};      // pxy
+        rtvec[12] = T{12./10.};      // pyz
+        rtvec[13] = T{12./10.};      // pxz
+        rtvec[14] = T{12./10.};      // higher-order stress
+        rtvec[15] = T{12./10.};      // higher-order stress
+        rtvec[16] = T{12./10.};      // higher-order ghost
+        rtvec[17] = T{12./10.};      // higher-order ghost
+        rtvec[18] = T{12./10.};      // higher-order ghost
       } else {
         // Generic fallback: use omega_phi for all moments
         for (unsigned int i = 0; i < LatSet::q; ++i) {
@@ -379,6 +402,7 @@ template <typename CELL, typename ForceField>
 struct MRTForce {
   using T = typename CELL::FloatType;
   using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
 
   __any__ static void apply(CELL& cell) {
     // Per-cell omega (spatially varying relaxation) for variable viscosity
@@ -406,14 +430,30 @@ struct MRTForce {
     for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho);
 
     // Write macroscopic fields
-    cell.template get<RHO<T>>() = rho;
+    cell.template get<GenericRho>() = rho;
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
 
-    // 3. D2Q9 MRT relaxation time vector
-    //    全设为 omega，使 MRTForce 数值等价于 BGKForce
+    // 3. MRT relaxation time vector
+    //    D3Q19: s_q for q-moments, omega for others (Fortran-aligned)
+    //    其他格子：全设为 omega，使 MRTForce 数值等价于 BGKForce
     //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
+    if constexpr (std::is_same_v<LatSet, D3Q19<T>>) {
+      // D3Q19 MRT relaxation: s_q for q-moments, omega for others
+      T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
+      rtvec[0] = T{0};       // rho
+      rtvec[1] = omega;      // e
+      rtvec[2] = omega;      // epsilon
+      rtvec[3] = T{0};       // jx
+      rtvec[4] = s_q;        // qx
+      rtvec[5] = T{0};       // jy
+      rtvec[6] = s_q;        // qy
+      rtvec[7] = T{0};       // jz
+      rtvec[8] = s_q;        // qz
+      for (unsigned int i = 9; i < LatSet::q; ++i) rtvec[i] = omega;  // stress/higher-order
+    } else {
+      for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
+    }
 
     // 4. Moments from population
     T momenta[LatSet::q] {};

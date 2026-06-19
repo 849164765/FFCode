@@ -66,6 +66,13 @@ class iniReader {
     }
   }
 
+  // check if a key exists in a section
+  bool hasKey(const std::string& section, const std::string& name) const {
+    auto secIt = iniContent.find(section);
+    if (secIt == iniContent.end()) return false;
+    return secIt->second.find(name) != secIt->second.end();
+  }
+
   // get value from section and key
   template <typename T>
   T getValue(const std::string& section, const std::string& name) {
