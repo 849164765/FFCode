@@ -171,15 +171,17 @@ __any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   T f[19];
   for (unsigned int k = 0; k < 19; ++k) f[k] = ns_cell[k];
 
+  // zeroth = Σf (zeroth moment of populations, used for equilibrium consistency)
+  // rho   = physical density from DENSITY field (from phi, used for prefactor only)
+  // NOTE: If zeroth were set to DENSITY, m_raw[0]=Σf would mismatch m_eq[0]=rho,
+  // producing huge dm[0] = Σf - DENSITY (e.g. 1 - 1000 = -999) and exploding F_v.
+  T zeroth = T{0};
+  for (unsigned int k = 0; k < 19; ++k) zeroth += f[k];
   T rho{};
-  T zeroth{};
   if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
     rho = ns_cell.template get<DENSITY<T>>();
-    zeroth = rho;
   } else {
-    rho = T{0};
-    for (unsigned int k = 0; k < 19; ++k) rho += f[k];
-    zeroth = rho;
+    rho = zeroth;
   }
 
   // Compute velocity: sum(c*f) / rho for compressible, sum(c*f) for incompressible

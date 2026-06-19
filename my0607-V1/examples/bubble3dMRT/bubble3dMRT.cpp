@@ -293,8 +293,11 @@ int main(int argc, char* argv[]) {
   // Initialize PF interface width
   PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
 
-  // Initialize NS populations to incompressible equilibrium
-  // p_init = 0 (Fortran: pressure(i,j) = 0.d0)
+  // Initialize NS populations to He-Luo incompressible equilibrium (p=0, u=0)
+  // MRTForce now uses incompressible model: rho from DENSITY field (not Σf),
+  // u = Σ(c·f) (not divided by rho). So Σf=0 (p=0) no longer causes division
+  // by zero. This aligns with Fortran initHydroMacroVars2D (pressure=0, u=0).
+  // Actual density enters via DENSITY field (set by FFRhoOmegaUpdate3D from phi).
   Vector<T, LatSet::d> u_zero{T{0}};
   T p_init = T{0};
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -306,16 +309,11 @@ int main(int argc, char* argv[]) {
       for (int j = overlap; j < block.getNy() - overlap; ++j) {
         for (int i = overlap; i < block.getNx() - overlap; ++i) {
           std::size_t id = k * proj[2] + j * proj[1] + i;
-          T u2 = T{0};
           NSCELL cell(id, blockLat);
+          std::array<T, LatSet::q> feq;
+          equilibrium::IncompressibleSecondOrder<NSCELL>::apply(feq, p_init, u_zero);
           for (unsigned int k_pop = 0; k_pop < LatSet::q; ++k_pop) {
-            T uc = u_zero * latset::c<LatSet>(k_pop);
-            // He-Luo incompressible: f_eq = w_k * (p + 3*(c.u) + 4.5*(c.u)^2 - 1.5*u^2)
-            T feq = latset::w<LatSet>(k_pop) * (p_init
-                    + LatSet::InvCs2 * uc
-                    + uc * uc * T{0.5} * LatSet::InvCs4
-                    - LatSet::InvCs2 * u2 * T{0.5});
-            cell[k_pop] = feq;
+            cell[k_pop] = feq[k_pop];
           }
         }
       }

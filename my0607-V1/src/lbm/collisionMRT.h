@@ -414,27 +414,49 @@ struct MRTForce {
     }
     const auto& F = cell.template get<ForceField>();
 
-    // 1. Compute rho and u_raw from populations
-    T rho{};
+    // Compile-time check: incompressible (He-Luo) vs compressible LBM
+    // DENSITY field present => He-Luo incompressible (Fortran-aligned)
+    constexpr bool isIncompressible = CELL::template hasField<DENSITY<T>>();
+
+    // 1. Compute zeroth moment p=Σf (pressure) and first moment Σ(c·f)
+    //    Incompressible: u = Σ(c·f) (velocity, NOT divided by rho)
+    //    Compressible:   u = Σ(c·f)/rho (momentum divided by rho)
+    T zeroth{};  // p = Σf (pressure)
     Vector<T, LatSet::d> u{};
     for (unsigned int k = 0; k < LatSet::q; ++k) {
-      rho += cell[k];
+      zeroth += cell[k];
       for (unsigned int d = 0; d < LatSet::d; ++d) {
         u[d] += latset::c<LatSet>(k)[d] * cell[k];
       }
     }
-    for (unsigned int d = 0; d < LatSet::d; ++d) u[d] /= rho;
+
+    // rho: incompressible reads from DENSITY field (phi-based, set by
+    // FFRhoOmegaUpdate3D); compressible falls back to rho = Σf
+    T rho{};
+    if constexpr (isIncompressible) {
+      rho = cell.template get<DENSITY<T>>();
+    } else {
+      rho = zeroth;
+      for (unsigned int d = 0; d < LatSet::d; ++d) u[d] /= rho;
+    }
 
     // 2. Half-force correction: u_c = u + F/(2*rho)
     Vector<T, LatSet::d> uc = u;
     for (unsigned int d = 0; d < LatSet::d; ++d) uc[d] += F[d] / (T{2} * rho);
 
     // Write macroscopic fields
-    cell.template get<GenericRho>() = rho;
+    // Incompressible: do NOT write GenericRho (=DENSITY), which is set from phi
+    // by FFRhoOmegaUpdate3D and must not be overwritten with Σf.
+    // Compressible: write rho = Σf to GenericRho.
+    if constexpr (!isIncompressible) {
+      cell.template get<GenericRho>() = rho;
+    }
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
 
     // 3. MRT relaxation time vector
     //    D3Q19: s_q for q-moments, omega for others (Fortran-aligned)
+    //    D2Q9: aligned with Fortran BubbleRising.f90 L773/L817
+    //          Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
     //    其他格子：全设为 omega，使 MRTForce 数值等价于 BGKForce
     //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
@@ -451,6 +473,19 @@ struct MRTForce {
       rtvec[7] = T{0};       // jz
       rtvec[8] = s_q;        // qz
       for (unsigned int i = 9; i < LatSet::q; ++i) rtvec[i] = omega;  // stress/higher-order
+    } else if constexpr (std::is_same_v<LatSet, D2Q9<T>>) {
+      // D2Q9 MRT relaxation: aligned with Fortran BubbleRising.f90 L773/L817
+      // Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
+      T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
+      rtvec[0] = T{0};       // rho
+      rtvec[1] = omega;      // e
+      rtvec[2] = omega;      // eps
+      rtvec[3] = T{0};       // jx
+      rtvec[4] = s_q;        // qx
+      rtvec[5] = T{0};       // jy
+      rtvec[6] = s_q;        // qy
+      rtvec[7] = omega;      // pxx
+      rtvec[8] = omega;      // pxy
     } else {
       for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
     }
@@ -463,7 +498,13 @@ struct MRTForce {
 
     // 5. Equilibrium in moment space
     std::array<T, LatSet::q> feq{};
-    equilibrium::SecondOrder<CELL>::apply(feq, rho, uc);
+    if constexpr (isIncompressible) {
+      // Incompressible (He-Luo): feq = w*(p + 3*cu + 4.5*cu² - 1.5*u²), p = Σf
+      equilibrium::IncompressibleSecondOrder<CELL>::apply(feq, zeroth, uc);
+    } else {
+      // Compressible: feq = w*rho*(1 + 3*cu + 4.5*cu² - 1.5*u²)
+      equilibrium::SecondOrder<CELL>::apply(feq, rho, uc);
+    }
     T momentaEq[LatSet::q] {};
     for (unsigned int i = 0; i < LatSet::q; ++i)
       for (unsigned int j = 0; j < LatSet::q; ++j)
@@ -479,8 +520,15 @@ struct MRTForce {
         cF += latset::c<LatSet>(i)[d] * F[d];
         cu += latset::c<LatSet>(i)[d] * uc[d];
       }
-      fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF)
-                     + LatSet::InvCs4 * cu * cF);
+      // Incompressible Guo force needs /rho factor (Fortran L824: DF = w*[...] * dt/rho, dt=1)
+      // Compressible Guo force has no /rho factor
+      if constexpr (isIncompressible) {
+        fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF)
+                       + LatSet::InvCs4 * cu * cF) / rho;
+      } else {
+        fi_force[i] = latset::w<LatSet>(i) * (LatSet::InvCs2 * (cF - uF)
+                       + LatSet::InvCs4 * cu * cF);
+      }
     }
 
     // 7. Force source in moment space
