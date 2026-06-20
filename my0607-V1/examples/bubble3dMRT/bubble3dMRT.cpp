@@ -176,7 +176,7 @@ int main(int argc, char* argv[]) {
                             Vector<T, LatSet::d>(T(Ni * Cell_Len), T(Nj * Cell_Len), T(Nz * Cell_Len)));
 
   BlockGeometryHelper3D<T> GeoHelper(Ni, Nj, Nz, domain, Cell_Len, BlockCellLen);
-  GeoHelper.CreateBlocks(1, mpi().getSize(), 1);
+  GeoHelper.CreateBlocks();
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
 
@@ -253,9 +253,9 @@ int main(int argc, char* argv[]) {
       for (int j = overlap; j < block.getNy() - overlap; ++j) {
         for (int i = overlap; i < block.getNx() - overlap; ++i) {
           std::size_t id = k * proj[2] + j * proj[1] + i;
-          T x = block.getMin()[0] + static_cast<T>(i) * voxelSize;
-          T y = block.getMin()[1] + static_cast<T>(j) * voxelSize;
-          T z = block.getMin()[2] + static_cast<T>(k) * voxelSize;
+          T x = block.getMinCenter()[0] + static_cast<T>(i) * voxelSize;
+          T y = block.getMinCenter()[1] + static_cast<T>(j) * voxelSize;
+          T z = block.getMinCenter()[2] + static_cast<T>(k) * voxelSize;
           T dx = x - xc_phys;
           T dy = y - yc_phys;
           T dz = z - zc_phys;

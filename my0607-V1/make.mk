@@ -64,7 +64,7 @@ cp:
 mpi:
 	make clean
 	make
-	mpiexec -n 9 ./$(TARGET)
+	mpiexec -n 8 ./$(TARGET)
 	make cp
 
 run:

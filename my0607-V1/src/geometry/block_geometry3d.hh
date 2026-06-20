@@ -1667,13 +1667,16 @@ void BlockGeometryHelper3D<T>::CreateBlocks(bool CreateFromInsideTag, bool outpu
 
         BlockCellNumVec.push_back(Nx * Ny * Nz);
         // create block
-        Vector<int, 3> Ext = BlockCellLen * Vector<int, 3>{Nx, Ny, Nz};
+        // use actual NewMesh (sum of merged BlockCells) instead of
+        // BlockCellLen*{Nx,Ny,Nz}, because the last BlockCell in each
+        // direction can be smaller than BlockCellLen when the domain
+        // size is not an integer multiple of BlockCellLen.
         Vector<int, 3> min = _BlockCells[id].getIdxBlock().getMin();
-        Vector<int, 3> max = min + Ext - Vector<int, 3>{1};
+        Vector<int, 3> max = min + NewMesh - Vector<int, 3>{1};
         AABB<int, 3> idxblock(min, max);
         Vector<T, 3> MIN = _BlockCells[id].getMin();
         int ratio = static_cast<int>(std::pow(2, static_cast<int>(level)));
-        Vector<T, 3> MAX = Ext * voxsize * ratio + MIN;
+        Vector<T, 3> MAX = NewMesh * voxsize * ratio + MIN;
         AABB<T, 3> block(MIN, MAX);
         BasicBlocks.emplace_back(level, voxsize, blockid, block, idxblock, NewMesh);
         blockid++;
