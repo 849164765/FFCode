@@ -11,8 +11,17 @@ __any__ void FF3D<CELL>::apply(CELL& cell) {
   grad[1] = T{0};
   grad[2] = T{0};
 
+  const T phi_self = cell.template get<GenericRho>();
+  const std::size_t N = cell.getN();
   for (unsigned int i = 1; i < LatSet::q; ++i) {
-    T phi_i = cell.getNeighbor(i).template get<GenericRho>();
+    T phi_i;
+    // boundary check: out-of-range neighbor index (ghost/overlap cells)
+    // falls back to self phi (zero-gradient contribution)
+    if (cell.getNeighborId(i) < N) {
+      phi_i = cell.getNeighbor(i).template get<GenericRho>();
+    } else {
+      phi_i = phi_self;
+    }
     T wi = latset::w<LatSet>(i);
     const auto& ci = latset::c<LatSet>(i);
     grad[0] += wi * ci[0] * phi_i;
@@ -44,8 +53,16 @@ __any__ void FFLaplacian3D<CELL>::apply(CELL& cell) {
   T phi_self = cell.template get<GenericRho>();
   T laplacian = T{0};
 
+  const std::size_t N = cell.getN();
   for (unsigned int k = 0; k < LatSet::q; ++k) {
-    T phi_k = cell.getNeighbor(k).template get<GenericRho>();
+    T phi_k;
+    // boundary check: out-of-range neighbor index (ghost/overlap cells)
+    // falls back to self phi (zero-laplacian contribution)
+    if (cell.getNeighborId(k) < N) {
+      phi_k = cell.getNeighbor(k).template get<GenericRho>();
+    } else {
+      phi_k = phi_self;
+    }
     T wk = latset::w<LatSet>(k);
     // sum w_k * (phi_neighbor - phi_self)
     laplacian += wk * (phi_k - phi_self);

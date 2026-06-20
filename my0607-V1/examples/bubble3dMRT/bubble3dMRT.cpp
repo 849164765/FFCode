@@ -815,6 +815,44 @@ int main(int argc, char* argv[]) {
       NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
       NSLattice.getField<PRESSURE<T>>().Communicate();
       NSLattice.getField<DENSITY<T>>().Communicate();
+      // === TEMP VERIFICATION: phi & density range check ===
+      {
+        auto& phiField = PFLattice.getField<PHI<T>>();
+        auto& densField = NSLattice.getField<DENSITY<T>>();
+        T phi_min_l = T(2), phi_max_l = T(-1);
+        T dens_min_l = T(1e30), dens_max_l = T(-1e30);
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& blockPhi = phiField.getBlockField(blockid);
+          auto& blockDens = densField.getBlockField(blockid);
+          int overlap = block.getOverlap();
+          for (int k = overlap; k < block.getNz() - overlap; ++k) {
+            for (int j = overlap; j < block.getNy() - overlap; ++j) {
+              for (int i = overlap; i < block.getNx() - overlap; ++i) {
+                std::size_t id = k * proj[2] + j * proj[1] + i;
+                T phi = blockPhi.get(id);
+                T dens = blockDens.get(id);
+                if (phi < phi_min_l) phi_min_l = phi;
+                if (phi > phi_max_l) phi_max_l = phi;
+                if (dens < dens_min_l) dens_min_l = dens;
+                if (dens > dens_max_l) dens_max_l = dens;
+              }
+            }
+          }
+        }
+#ifdef MPI_ENABLED
+        mpi().reduceAndBcast<T>(phi_min_l, MPI_MIN);
+        mpi().reduceAndBcast<T>(phi_max_l, MPI_MAX);
+        mpi().reduceAndBcast<T>(dens_min_l, MPI_MIN);
+        mpi().reduceAndBcast<T>(dens_max_l, MPI_MAX);
+#endif
+        if (mpi().isMainProcessor()) {
+          std::cout << "[Step " << MainLoopTimer() << "] phi range: [" << phi_min_l << ", " << phi_max_l
+                    << "]  dens range: [" << dens_min_l << ", " << dens_max_l << "]" << std::endl;
+        }
+      }
+      // === END TEMP VERIFICATION ===
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());

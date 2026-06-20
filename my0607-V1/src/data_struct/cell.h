@@ -156,6 +156,7 @@ class Cell {
 
   std::size_t getId() const { return Id; }
   std::size_t getNeighborId(unsigned int i) const { return Id + Lat.getDelta_Index()[i]; }
+  std::size_t getN() const { return Lat.getN(); }
 
   
 
@@ -237,6 +238,7 @@ class GenericCell {
   // get cell index
   std::size_t getId() const { return Id; }
   std::size_t getNeighborId(int i) const { return Id + Lat.getDelta_Index()[i]; }
+  std::size_t getN() const { return Lat.getN(); }
 };
 
 // gpu representation of cell interface
