@@ -1,9 +1,0 @@
-<?xml version="1.0"?>
-<VTKFile type="vtkMultiBlockDataSet" version="1.0" byte_order="LittleEndian">
-<vtkMultiBlockDataSet>
-<Block index="0" >
-<DataSet index= "0" file="ferro_bubble_T70_B0.vti">
-</DataSet>
-</Block>
-</vtkMultiBlockDataSet>
-</VTKFile>
