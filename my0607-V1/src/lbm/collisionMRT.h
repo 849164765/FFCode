@@ -43,9 +43,9 @@ struct PhaseFieldMRT {
     mrt::M9Transform(m_eq, feq.data());
 
     // 4. Relaxation: S = [1,1,1,s3,1,s5,1,1,1]
-    //    s3 = s5 = 1 / (M_phi/(cs2*dt) + 0.5)
-    //    TODO: read mobility M_phi from cell field after T15
-    constexpr T s_pf = T{1};
+    //    s3 = s5 = 1/tau_phi,  tau_phi = 0.5 + M_phi/cs^2  (Eq.22)
+    T tau_pf = cell.template get<TAUPHI<T>>();
+    T s_pf = T{1} / tau_pf;
     T S[9] = {T{1}, T{1}, T{1}, s_pf, T{1}, s_pf, T{1}, T{1}, T{1}};
 
     // 5. Source term in moment space: M_F = M9 * F_beta
@@ -76,6 +76,11 @@ struct PhaseFieldMRT {
 // g_tilde = g - M^{-1} S M (g - g_eq) + M^{-1}(I - S/2) M G
 // Relaxation: S = diag(1,1,1,1,1,1,1,s7,s8)
 //   1/s7 = 1/s8 = eta/(rho*cs^2*dt) + 0.5  (Eq.33)
+// After collision: sets VELOCITY (Eq.35) and PRESSURE (Eq.36)
+// ================================================================
+// NSMRT (Eq.29): D2Q9 MRT collision for velocity-based NS
+// Reads VELOCITY and PRESSURE from cell field (set by moment::NSMomentum
+// as a SEPARATE task BEFORE this collision). Does NOT write VELOCITY/PRESSURE.
 // ================================================================
 template <typename CELLTYPE>
 struct NSMRT {
@@ -88,21 +93,22 @@ struct NSMRT {
     std::array<T, 9> geq{};
     T m[9], m_eq[9];
 
-    // 1. Read populations
+    // 1. Read populations and physical fields
     for (int k = 0; k < 9; ++k) g[k] = cell[k];
+    T rho = cell.template get<RHO<T>>();
+    T eta = cell.template get<VISCOSITY<T>>();
 
-    // 2. Equilibrium (zero-moment = p/(rho*cs^2))
+    // 2. Relaxation: s7 = s8 = 1/(eta/(rho*cs^2) + 0.5)  (Eq.33)
+    T tau_nu = eta / (rho * LatSet::cs2) + T{0.5};
+    T s_nu = T{1} / tau_nu;
+    T S[9] = {T{1}, T{1}, T{1}, T{1}, T{1}, T{1}, T{1}, s_nu, s_nu};
+
+    // 3. Equilibrium (reads VELOCITY/PRESSURE from field set by NSMomentum)
     NSEquilibrium<CELL>::apply(cell, geq);
 
-    // 3. MRT forward transform
+    // 4. MRT forward transform
     mrt::M9Transform(m, g);
     mrt::M9Transform(m_eq, geq.data());
-
-    // 4. Relaxation: S = [1,1,1,1,1,1,1,s7,s8]
-    //    s7 = s8 = 1 / (eta/(rho*cs2*dt) + 0.5)
-    //    TODO: read viscosity eta from cell field after T15
-    constexpr T s_nu = T{1};
-    T S[9] = {T{1}, T{1}, T{1}, T{1}, T{1}, T{1}, T{1}, s_nu, s_nu};
 
     // 5. Force in moment space: M_G = M9 * G, then m += (I - S/2) * M_G
     std::array<T, 9> G{};
@@ -140,35 +146,27 @@ struct MagMRT {
   using LatSet = typename CELL::LatticeSet;
 
   __any__ static inline void apply(CELL& cell) {
-    T h[5];
-    std::array<T, 5> heq{};
-    T m[5], m_eq[5];
+    T h[9];
+    std::array<T, 9> heq{};
+    T m[9], m_eq[9];
 
-    // 1. Read populations
-    for (int k = 0; k < 5; ++k) h[k] = cell[k];
+    for (int k = 0; k < 9; ++k) h[k] = cell[k];
 
     // 2. Equilibrium: h_alpha^eq = w_alpha * psi
     MagEquilibrium<CELL>::apply(cell, heq);
 
     // 3. MRT forward transform: m = M5 * h
-    mrt::M5Transform(m, h);
-    mrt::M5Transform(m_eq, heq.data());
+    mrt::M9Transform(m, h);
+    mrt::M9Transform(m_eq, heq.data());
 
-    // 4. Relaxation: S = [1, s1, s2, 1, 1]
-    //    s1 = s2 = 1 / (2.5*epsilon*mu/(c^2*dt) + 0.5)
-    //    TODO: read permeability mu from cell field after T15
     constexpr T s_h = T{1};
-    T S[5] = {T{1}, s_h, s_h, T{1}, T{1}};
+    T S[9] = {T{1}, T{1}, T{1}, s_h, T{1}, s_h, T{1}, T{1}, T{1}};
 
-    // 5. Collision in moment space (no force term — Eq.38)
-    for (int k = 0; k < 5; ++k) {
+    for (int k = 0; k < 9; ++k)
       m[k] -= S[k] * (m[k] - m_eq[k]);
-    }
 
-    // 6. MRT inverse transform: h = invM5 * m
-    mrt::M5InverseTransform(h, m);
+    mrt::M9InverseTransform(h, m);
 
-    // 7. Write back populations
-    for (int k = 0; k < 5; ++k) cell[k] = h[k];
+    for (int k = 0; k < 9; ++k) cell[k] = h[k];
   }
 };

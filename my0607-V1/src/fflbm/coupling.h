@@ -40,8 +40,9 @@ struct PFtoNS_Properties {
 };
 
 // ================================================================
-// PFtoNS_Forces (Eq.12): PF → NS surface tension force
+// PFtoNS_Forces (Eq.12 + Eq.26): PF → NS surface tension + body force
 //   F_s = lambda_phi * grad_phi
+//   F_b = rho * g  (gravity body force, Eq.26 buoyancy term)
 // Accumulates into NS FORCE field (caller zeroes FORCE before first call).
 // ================================================================
 template <typename CELL_PF_TYPE, typename CELL_NS_TYPE>
@@ -54,7 +55,12 @@ struct PFtoNS_Forces {
   __any__ static inline void apply(CELL_PF& pf, CELL_NS& ns) {
     T lambda = pf.template get<PHASECHEMPOTENTIAL<T>>();
     const auto& grad = pf.template get<GRAD<T, D>>();
+    // F_s = lambda * grad_phi (surface tension)
     ns.template get<FORCE<T, D>>() += lambda * grad;
+
+    // F_b = rho * g (buoyancy/gravity body force)
+    const auto& g = ns.template get<CONSTFORCE<T, D>>();
+    ns.template get<FORCE<T, D>>() += ns.template get<RHO<T>>() * g;
   }
 };
 

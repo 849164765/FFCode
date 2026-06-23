@@ -88,4 +88,33 @@ struct MagPotentialMoment {
   }
 };
 
+// ================================================================
+// NSMomentum (Eqs.35-36): combined VELOCITY + PRESSURE from populations
+// Runs as a SEPARATE task BEFORE NSMRT collision, so NSMRT's equilibrium
+// and GuoForce read fresh VELOCITY/PRESSURE from pre-collision g[k].
+// ================================================================
+template <typename CELLTYPE>
+struct NSMomentum {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  __any__ static inline void apply(CELL& cell) {
+    // Eq.35: u = sum(g * e) + dt/(2*rho)*F_total
+    T rho = cell.template get<RHO<T>>();
+    const auto& F_total = cell.template get<FORCE<T, LatSet::d>>();
+    Vector<T, LatSet::d> u{};
+    for (int k = 0; k < LatSet::q; ++k) {
+      u += cell[k] * latset::c<LatSet>(k);
+    }
+    u += T{0.5} / rho * F_total;
+    cell.template get<VELOCITY<T, LatSet::d>>() = u;
+
+    // Eq.36: p = rho * cs^2 * sum(g)
+    T sum_g = T{0};
+    for (int k = 0; k < LatSet::q; ++k) sum_g += cell[k];
+    cell.template get<PRESSURE<T>>() = rho * LatSet::cs2 * sum_g;
+  }
+};
+
 }  // namespace moment

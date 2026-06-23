@@ -151,7 +151,7 @@ class UnitConvManager {
  public:
   BaseConverter<T> *BaseConv;
   std::vector<AbstractConverter<T> *> ConvList;
-  UnitConvManager(AbstractConverter<T> *convlist) : ConvList(convlist) {}
+  UnitConvManager(AbstractConverter<T> *convlist) : BaseConv(dynamic_cast<BaseConverter<T>*>(convlist)) { ConvList.push_back(convlist); }
 
   void Check_and_Print();
 };
