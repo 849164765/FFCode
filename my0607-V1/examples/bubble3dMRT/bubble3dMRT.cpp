@@ -640,9 +640,57 @@ int main(int argc, char* argv[]) {
   while (MainLoopTimer() < MaxStep) {
     // ===== Fortran-aligned: force → PF collision → NS collision → stream → macro =====
 
+    // #region debug-point A:track-cell-start
+    // Track cell (27,44,43) in block 0 at each step to diagnose NS pop NaN
+    // Only process 0 (block 0 owner) outputs
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
+      auto& dbg_nsRho = NSLattice.getField<DENSITY<T>>().getBlockField(dbg_block);
+      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
+      auto& dbg_pfPhi = PFLattice.getField<PHI<T>>().getBlockField(dbg_block);
+      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
+      T dbg_ns_sum = T{0};
+      T dbg_ns_max = T{0};
+      for (unsigned int q = 0; q < LatSet::q; ++q) {
+        dbg_ns_sum += dbg_nscell[q];
+        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
+      }
+      T dbg_rho = dbg_nsRho.get(dbg_id);
+      T dbg_phi = dbg_pfPhi.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=preA1"
+                << " phi=" << dbg_phi
+                << " rho=" << dbg_rho
+                << " ns_sum=" << dbg_ns_sum
+                << " ns_max=" << dbg_ns_max
+                << std::endl;
+    }
+    // #endregion
+
     // ---- Phase A: Force setup (Fortran computeForce) ----
     // A1: Update per-cell rho and omega from phi
     RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // #region debug-point B:after-A1
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsRho = NSLattice.getField<DENSITY<T>>().getBlockField(dbg_block);
+      T dbg_rho = dbg_nsRho.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterA1"
+                << " rho=" << dbg_rho
+                << std::endl;
+    }
+    // #endregion
 
     // A2: Clear NS FORCE to zero
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, LatSet::d>{T{0}});
@@ -650,11 +698,43 @@ int main(int argc, char* argv[]) {
     // A3: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
     STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
+    // #region debug-point C:after-A3
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
+      const auto& F = dbg_nsForce.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterA3_Fs"
+                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
+                << std::endl;
+    }
+    // #endregion
+
     // A4: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
     GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
     PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // #region debug-point D:after-A5
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
+      const auto& F = dbg_nsForce.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterA5_FsFbFp"
+                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
+                << std::endl;
+    }
+    // #endregion
 
     // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
@@ -665,8 +745,48 @@ int main(int argc, char* argv[]) {
     // ---- Phase C: NS collision (Fortran collisionDenDF2D) ----
     // C1: Viscous force F_v from non-equilibrium moments
     ViscoForceCoupling.ApplyInnerCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // #region debug-point E:after-C1
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
+      const auto& F = dbg_nsForce.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterC1_Ftotal"
+                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
+                << std::endl;
+    }
+    // #endregion
+
     // C2: MRTForce with total accumulated FORCE (F_s+F_b+F_p+F_v)
     NSLattice.template ApplyInnerCellDynamics<NSTaskSelector>(FlagFM);
+
+    // #region debug-point F:after-C2
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
+      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
+      T dbg_ns_sum = T{0};
+      T dbg_ns_max = T{0};
+      for (unsigned int q = 0; q < LatSet::q; ++q) {
+        dbg_ns_sum += dbg_nscell[q];
+        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
+      }
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterC2_collision"
+                << " ns_sum=" << dbg_ns_sum
+                << " ns_max=" << dbg_ns_max
+                << std::endl;
+    }
+    // #endregion
 
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
@@ -684,6 +804,29 @@ int main(int argc, char* argv[]) {
     // this reset the corrupted POP propagates inward each step, producing
     // the boundary shadow that diffuses toward the centre.
     applyWallPop<T, LatSet, decltype(PFLattice), decltype(NSLattice)>(Geo, PFLattice, NSLattice, Cell_Len);
+
+    // #region debug-point G:after-stream
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
+      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
+      T dbg_ns_sum = T{0};
+      T dbg_ns_max = T{0};
+      for (unsigned int q = 0; q < LatSet::q; ++q) {
+        dbg_ns_sum += dbg_nscell[q];
+        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
+      }
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterStream"
+                << " ns_sum=" << dbg_ns_sum
+                << " ns_max=" << dbg_ns_max
+                << std::endl;
+    }
+    // #endregion
 
     // ---- Phase E: Macro update (Fortran: computeOrderMacro + computeMacro + setMacroOrderBC) ----
     // E1: phi from PF pops (Fortran: phi = Σ ddg)
@@ -704,6 +847,9 @@ int main(int argc, char* argv[]) {
               for (unsigned int k_pop = 0; k_pop < LatSet::q; ++k_pop) {
                 phi_new += cell[k_pop];
               }
+              // NaN/Inf guard: IEEE 754 makes NaN<x and NaN>x both false,
+              // so the [0,1] clamps below cannot catch NaN. isfinite first.
+              if (!std::isfinite(phi_new)) phi_new = T{0};
               if (phi_new < T{0}) phi_new = T{0};
               if (phi_new > T{1}) phi_new = T{1};
               blockPhi.get(id) = phi_new;
@@ -944,6 +1090,25 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    // #region debug-point H:after-E5
+    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
+      int dbg_block = 0;
+      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
+      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
+      const auto& dbg_proj = dbg_block_ref.getProjection();
+      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
+      auto& dbg_nsPres = NSLattice.getField<PRESSURE<T>>().getBlockField(dbg_block);
+      auto& dbg_nsVel = NSLattice.getField<VELOCITY<T, LatSet::d>>().getBlockField(dbg_block);
+      T dbg_pres = dbg_nsPres.get(dbg_id);
+      const auto& dbg_vel = dbg_nsVel.get(dbg_id);
+      std::cout << "[DBG] Step=" << MainLoopTimer()
+                << " phase=afterE5_macro"
+                << " pres=" << dbg_pres
+                << " vel=[" << dbg_vel[0] << "," << dbg_vel[1] << "," << dbg_vel[2] << "]"
+                << std::endl;
+    }
+    // #endregion
+
     // E5a: Zero out velocity at BouncebackFlag cells (wall cells should have u=0)
     // E5 computes u = u_raw + 0.5*F/rho for ALL internal cells including
     // BouncebackFlag, but BouncebackFlag cells are not collided (no MRTForce),
@@ -1018,6 +1183,100 @@ int main(int argc, char* argv[]) {
         }
       }
       // === END TEMP VERIFICATION ===
+
+      // === NaN/Inf DIAGNOSTIC: locate first occurrence of non-finite values ===
+      {
+        static bool nan_detected = false;
+        if (!nan_detected) {
+          bool local_nan = false;
+          std::string nan_field;
+          int nan_block = -1;
+          int nan_i = -1, nan_j = -1, nan_k = -1;
+          T nan_val = T{0};
+
+          auto check_scalar = [&](const std::string& name, T val, int bid, int i, int j, int k) {
+            if (!local_nan && !std::isfinite(val)) {
+              local_nan = true;
+              nan_field = name;
+              nan_block = bid;
+              nan_i = i; nan_j = j; nan_k = k;
+              nan_val = val;
+            }
+          };
+          auto check_vec = [&](const std::string& name, const Vector<T, LatSet::d>& v, int bid, int i, int j, int k) {
+            for (int d = 0; d < LatSet::d; ++d) {
+              if (!local_nan && !std::isfinite(v[d])) {
+                local_nan = true;
+                nan_field = name + "[" + std::to_string(d) + "]";
+                nan_block = bid;
+                nan_i = i; nan_j = j; nan_k = k;
+                nan_val = v[d];
+              }
+            }
+          };
+
+          auto& phiField = PFLattice.getField<PHI<T>>();
+          auto& densField = NSLattice.getField<DENSITY<T>>();
+          auto& presField = NSLattice.getField<PRESSURE<T>>();
+          auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
+          auto& forceField = NSLattice.getField<FORCE<T, LatSet::d>>();
+
+          for (int blockid = 0; blockid < Geo.getBlockNum() && !local_nan; ++blockid) {
+            const auto& block = Geo.getBlock(blockid);
+            const auto& proj = block.getProjection();
+            auto& blockPhi = phiField.getBlockField(blockid);
+            auto& blockDens = densField.getBlockField(blockid);
+            auto& blockPres = presField.getBlockField(blockid);
+            auto& blockVel = velField.getBlockField(blockid);
+            auto& blockForce = forceField.getBlockField(blockid);
+            auto& blockPFLat = PFLattice.getBlockLat(blockid);
+            auto& blockNSLat = NSLattice.getBlockLat(blockid);
+            int overlap = block.getOverlap();
+            for (int k = overlap; k < block.getNz() - overlap && !local_nan; ++k) {
+              for (int j = overlap; j < block.getNy() - overlap && !local_nan; ++j) {
+                for (int i = overlap; i < block.getNx() - overlap && !local_nan; ++i) {
+                  std::size_t id = k * proj[2] + j * proj[1] + i;
+                  check_scalar("PHI", blockPhi.get(id), blockid, i, j, k);
+                  check_scalar("DENSITY", blockDens.get(id), blockid, i, j, k);
+                  check_scalar("PRESSURE", blockPres.get(id), blockid, i, j, k);
+                  check_vec("VELOCITY", blockVel.get(id), blockid, i, j, k);
+                  check_vec("FORCE", blockForce.get(id), blockid, i, j, k);
+                  // Check PF pops and NS pops
+                  if (!local_nan) {
+                    PFCELL pfcell(id, blockPFLat);
+                    for (unsigned int q = 0; q < LatSet::q && !local_nan; ++q) {
+                      check_scalar("PF_POP[" + std::to_string(q) + "]", pfcell[q], blockid, i, j, k);
+                    }
+                  }
+                  if (!local_nan) {
+                    NSCELL nscell(id, blockNSLat);
+                    for (unsigned int q = 0; q < LatSet::q && !local_nan; ++q) {
+                      check_scalar("NS_POP[" + std::to_string(q) + "]", nscell[q], blockid, i, j, k);
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+#ifdef MPI_ENABLED
+          int any_nan = local_nan ? 1 : 0;
+          mpi().reduceAndBcast<int>(any_nan, MPI_LOR);
+          local_nan = (any_nan != 0);
+#endif
+          if (local_nan) {
+            nan_detected = true;
+            if (mpi().isMainProcessor()) {
+              std::cout << "[Step " << MainLoopTimer() << "] *** FIRST NaN/Inf DETECTED ***"
+                        << " field=" << nan_field
+                        << " block=" << nan_block
+                        << " coord=(" << nan_i << "," << nan_j << "," << nan_k << ")"
+                        << " value=" << nan_val << std::endl;
+            }
+          }
+        }
+      }
+      // === END NaN/Inf DIAGNOSTIC ===
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());

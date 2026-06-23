@@ -119,9 +119,19 @@ __any__ void FFGravityForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
 
 // ---- FFPreForce3D ----
 // F_p = -(p/3) * DeltaRho * grad_phi
+// NOTE: p = Σf (PRESSURE field) forms a positive feedback loop:
+//   p → F_p → collision (Guo force) → non-equilibrium pops → streaming → p grows.
+// Under high density ratio (Δρ up to 999), the loop gain exceeds 1 and p grows
+// exponentially, leading to NaN. Clamp p to break the loop.
+// Evidence: p=2.83e-3 stable (step 80), p=0.0262 unstable (step 81) → p_max=0.01.
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T p = ns_cell.template get<PRESSURE<T>>();
+  // NaN/Inf guard and clamp to break positive feedback loop.
+  if (!std::isfinite(p)) p = T{0};
+  constexpr T p_max = T{0.01};
+  if (p < -p_max) p = -p_max;
+  if (p > p_max) p = p_max;
   T delta_rho = pf_cell.template get<DELTARHO<T>>();
   const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
 
@@ -149,6 +159,10 @@ __any__ void FFRhoOmegaUpdate3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T eta_h = pf_cell.template get<ETA_H<T>>();
 
   T rho = rho_l + phi * (rho_h - rho_l);
+  // Clamp rho to [rho_l, rho_h] to prevent out-of-range values from
+  // corrupted phi amplifying downstream divisions (e.g. F/rho in MRTForce).
+  if (!std::isfinite(rho) || rho < rho_l) rho = rho_l;
+  if (rho > rho_h) rho = rho_h;
   if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
     ns_cell.template get<DENSITY<T>>() = rho;
   } else {

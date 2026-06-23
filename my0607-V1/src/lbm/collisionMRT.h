@@ -268,6 +268,10 @@ struct MRTSource {
     const Vector<T, LatSet::d>& n = cell.template get<NORMAL>();
 
     T phi = cell.template get<GenericRho>();
+    // Clamp phi to [0,1] with NaN/Inf guard before Allen-Cahn source term.
+    // IEEE 754 makes NaN<x false, so isfinite must be checked first.
+    if (!std::isfinite(phi) || phi < T{0}) phi = T{0};
+    if (phi > T{1}) phi = T{1};
     std::array<T, LatSet::q> feq;
     EquilibriumScheme::apply(feq, phi, u);
 
