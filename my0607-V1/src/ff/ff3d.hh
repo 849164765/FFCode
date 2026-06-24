@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ff/ff2d.h"
+#include "lbm/collisionMRT.h"
 
 namespace ff {
 
@@ -357,19 +358,30 @@ __any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   T dm[19];
   for (unsigned int i = 0; i < 19; ++i) dm[i] = m_raw[i] - m_eq[i];
 
-  // C_ab = Σ_k c_ka * c_kb * (InvM · (rtvec1 * dm))_k
-  // Fully expanded for D3Q19; s_q terms and j=2,16,17,18 terms vanish by symmetry.
-  T Cxx = omega * (T{1} / T{3} * dm[1] + T{1} / T{3} * dm[9]);
+  // Non-equilibrium population: mgneq_i = Σ_j InvM(i,j) * S1(j) * dm_j
+  T mgneq[19] {};
+  for (unsigned int i = 0; i < 19; ++i) {
+    mgneq[i] = T{};
+    for (unsigned int j = 0; j < 19; ++j) {
+      mgneq[i] += mrt::InvM<LatSet>(i, j) * rtvec1[j] * dm[j];
+    }
+  }
 
-  T Cyy = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] + T{1} / T{2} * dm[11]);
-
-  T Czz = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] - T{1} / T{2} * dm[11]);
-
-  T Cxy = omega * dm[13];
-
-  T Cxz = omega * dm[14];
-
-  T Cyz = omega * dm[15];
+  // C_ab = Σ_k c_ka * c_kb * mgneq_k
+  // Geometric velocity projection: 100% avoids hand-simplification bugs
+  T Cxx{}, Cyy{}, Czz{}, Cxy{}, Cxz{}, Cyz{};
+  for (unsigned int k = 0; k < 19; ++k) {
+    const auto& ck = latset::c<LatSet>(k);
+    T cx = static_cast<T>(ck[0]);
+    T cy = static_cast<T>(ck[1]);
+    T cz = static_cast<T>(ck[2]);
+    Cxx += cx * cx * mgneq[k];
+    Cyy += cy * cy * mgneq[k];
+    Czz += cz * cz * mgneq[k];
+    Cxy += cx * cy * mgneq[k];
+    Cxz += cx * cz * mgneq[k];
+    Cyz += cy * cz * mgneq[k];
+  }
 
   // mu = nu * rho = (1/omega - 0.5) * cs² * rho
   T invOmega = T{1} / omega;
