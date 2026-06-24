@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ff/ff2d.h"
+#include "lbm/collisionMRT.h"
 
 namespace ff {
 
@@ -11,8 +12,12 @@ __any__ void FF3D<CELL>::apply(CELL& cell) {
   grad[1] = T{0};
   grad[2] = T{0};
 
+  const T phi_self = cell.template get<GenericRho>();
   for (unsigned int i = 1; i < LatSet::q; ++i) {
-    T phi_i = cell.getNeighbor(i).template get<GenericRho>();
+    T phi_i;
+    // boundary check: out-of-range neighbor index (ghost/overlap cells)
+    // falls back to self phi (zero-gradient contribution)
+    phi_i = cell.getNeighbor(i).template get<GenericRho>();
     T wi = latset::w<LatSet>(i);
     const auto& ci = latset::c<LatSet>(i);
     grad[0] += wi * ci[0] * phi_i;
@@ -43,9 +48,11 @@ template <typename CELL>
 __any__ void FFLaplacian3D<CELL>::apply(CELL& cell) {
   T phi_self = cell.template get<GenericRho>();
   T laplacian = T{0};
-
   for (unsigned int k = 0; k < LatSet::q; ++k) {
-    T phi_k = cell.getNeighbor(k).template get<GenericRho>();
+    T phi_k;
+    // boundary check: out-of-range neighbor index (ghost/overlap cells)
+    // falls back to self phi (zero-laplacian contribution)
+    phi_k = cell.getNeighbor(k).template get<GenericRho>();
     T wk = latset::w<LatSet>(k);
     // sum w_k * (phi_neighbor - phi_self)
     laplacian += wk * (phi_k - phi_self);
@@ -102,9 +109,19 @@ __any__ void FFGravityForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
 
 // ---- FFPreForce3D ----
 // F_p = -(p/3) * DeltaRho * grad_phi
+// NOTE: p = Σf (PRESSURE field) forms a positive feedback loop:
+//   p → F_p → collision (Guo force) → non-equilibrium pops → streaming → p grows.
+// Under high density ratio (Δρ up to 999), the loop gain exceeds 1 and p grows
+// exponentially, leading to NaN. Clamp p to break the loop.
+// Evidence: p=2.83e-3 stable (step 80), p=0.0262 unstable (step 81) → p_max=0.01.
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T p = ns_cell.template get<PRESSURE<T>>();
+  // NaN/Inf guard and clamp to break positive feedback loop.
+  if (!std::isfinite(p)) p = T{0};
+  constexpr T p_max = T{0.01};
+  if (p < -p_max) p = -p_max;
+  if (p > p_max) p = p_max;
   T delta_rho = pf_cell.template get<DELTARHO<T>>();
   const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
 
@@ -132,6 +149,10 @@ __any__ void FFRhoOmegaUpdate3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T eta_h = pf_cell.template get<ETA_H<T>>();
 
   T rho = rho_l + phi * (rho_h - rho_l);
+  // Clamp rho to [rho_l, rho_h] to prevent out-of-range values from
+  // corrupted phi amplifying downstream divisions (e.g. F/rho in MRTForce).
+  if (!std::isfinite(rho) || rho < rho_l) rho = rho_l;
+  if (rho > rho_h) rho = rho_h;
   if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
     ns_cell.template get<DENSITY<T>>() = rho;
   } else {
@@ -326,19 +347,30 @@ __any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   T dm[19];
   for (unsigned int i = 0; i < 19; ++i) dm[i] = m_raw[i] - m_eq[i];
 
-  // C_ab = Σ_k c_ka * c_kb * (InvM · (rtvec1 * dm))_k
-  // Fully expanded for D3Q19; s_q terms and j=2,16,17,18 terms vanish by symmetry.
-  T Cxx = omega * (T{1} / T{3} * dm[1] + T{1} / T{3} * dm[9]);
+  // Non-equilibrium population: mgneq_i = Σ_j InvM(i,j) * S1(j) * dm_j
+  T mgneq[19] {};
+  for (unsigned int i = 0; i < 19; ++i) {
+    mgneq[i] = T{};
+    for (unsigned int j = 0; j < 19; ++j) {
+      mgneq[i] += mrt::InvM<LatSet>(i, j) * rtvec1[j] * dm[j];
+    }
+  }
 
-  T Cyy = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] + T{1} / T{2} * dm[11]);
-
-  T Czz = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] - T{1} / T{2} * dm[11]);
-
-  T Cxy = omega * dm[13];
-
-  T Cxz = omega * dm[14];
-
-  T Cyz = omega * dm[15];
+  // C_ab = Σ_k c_ka * c_kb * mgneq_k
+  // Geometric velocity projection: 100% avoids hand-simplification bugs
+  T Cxx{}, Cyy{}, Czz{}, Cxy{}, Cxz{}, Cyz{};
+  for (unsigned int k = 0; k < 19; ++k) {
+    const auto& ck = latset::c<LatSet>(k);
+    T cx = static_cast<T>(ck[0]);
+    T cy = static_cast<T>(ck[1]);
+    T cz = static_cast<T>(ck[2]);
+    Cxx += cx * cx * mgneq[k];
+    Cyy += cy * cy * mgneq[k];
+    Czz += cz * cz * mgneq[k];
+    Cxy += cx * cy * mgneq[k];
+    Cxz += cx * cz * mgneq[k];
+    Cyz += cy * cz * mgneq[k];
+  }
 
   // mu = nu * rho = (1/omega - 0.5) * cs² * rho
   T invOmega = T{1} / omega;
