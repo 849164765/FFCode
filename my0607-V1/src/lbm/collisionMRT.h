@@ -452,40 +452,52 @@ struct MRTForce {
       cell.template get<GenericRho>() = rho;
     }
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
-
-    // 3. MRT relaxation time vector
-    //    D3Q19: s_q for q-moments, omega for others (Fortran-aligned)
-    //    D2Q9: aligned with Fortran BubbleRising.f90 L773/L817
-    //          Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
-    //    其他格子：全设为 omega，使 MRTForce 数值等价于 BGKForce
-    //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
     if constexpr (std::is_same_v<LatSet, D3Q19<T>>) {
-      // D3Q19 MRT relaxation: s_q for q-moments, omega for others
-      T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
-      rtvec[0] = T{0};       // rho
-      rtvec[1] = omega;      // e
-      rtvec[2] = omega;      // epsilon
-      rtvec[3] = T{0};       // jx
-      rtvec[4] = s_q;        // qx
-      rtvec[5] = T{0};       // jy
-      rtvec[6] = s_q;        // qy
-      rtvec[7] = T{0};       // jz
-      rtvec[8] = s_q;        // qz
-      for (unsigned int i = 9; i < LatSet::q; ++i) rtvec[i] = omega;  // stress/higher-order
+      // =====================================================================
+      // 3D Multiphase MRT Relaxation Vector (Based on Premnath 2007 & Fakhari 2017)
+      // 核心原则：解耦物理剪切粘度与数值耗散，镇压 3D 界面高频噪声与声波！
+      // =====================================================================
+      
+      // 放弃 2D 魔法公式，固定为常数以提供稳定的界面耗散
+      T s_q_fixed = T{1.1}; 
+      T s_bulk = T{1.1};     // 控制体粘度，用于快速衰减界面声波
+      T s_ghost = T{1.2};    // 幽灵矩强制耗散，充当高频噪声垃圾桶
+
+      rtvec[0] = T{0};       // rho (守恒)
+      rtvec[1] = s_bulk;     // e (能量 -> 控制体粘度，必须 > omega！)
+      rtvec[2] = s_bulk;     // epsilon (控制体粘度)
+      rtvec[3] = T{0};       // jx (守恒)
+      rtvec[4] = s_q_fixed;  // qx (能量通量)
+      rtvec[5] = T{0};       // jy (守恒)
+      rtvec[6] = s_q_fixed;  // qy (能量通量)
+      rtvec[7] = T{0};       // jz (守恒)
+      rtvec[8] = s_q_fixed;  // qz (能量通量)
+      
+      // 剪切应力矩 (控制物理剪切粘度，必须严格绑定 omega)
+      // 对应库里的 shearViscIndexes: 9, 11, 13, 14, 15
+      rtvec[9]  = omega;     // 3cx^2 - r^2 (剪切)
+      rtvec[11] = omega;     // cy^2 - cz^2 (剪切)
+      rtvec[13] = omega;     // xy (剪切)
+      rtvec[14] = omega;     // xz (剪切)
+      rtvec[15] = omega;     // yz (剪切)
+
+      // 幽灵矩 / 高阶非流体力学矩 (无宏观物理意义，强制拉满以耗散 3D 噪声)
+      // 对应索引: 10, 12, 16, 17, 18
+      rtvec[10] = s_ghost;   // Ghost moment (MAXIMUM DISSIPATION)
+      rtvec[12] = s_ghost;   // Ghost moment
+      rtvec[16] = s_ghost;   // Ghost moment
+      rtvec[17] = s_ghost;   // Ghost moment
+      rtvec[18] = s_ghost;   // Ghost moment
+      // =====================================================================
+
     } else if constexpr (std::is_same_v<LatSet, D2Q9<T>>) {
-      // D2Q9 MRT relaxation: aligned with Fortran BubbleRising.f90 L773/L817
-      // Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
+      // 2D 保持你原有的逻辑（2D 矩空间紧凑，原有逻辑已足够稳定）
       T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
-      rtvec[0] = T{0};       // rho
-      rtvec[1] = omega;      // e
-      rtvec[2] = omega;      // eps
-      rtvec[3] = T{0};       // jx
-      rtvec[4] = s_q;        // qx
-      rtvec[5] = T{0};       // jy
-      rtvec[6] = s_q;        // qy
-      rtvec[7] = omega;      // pxx
-      rtvec[8] = omega;      // pxy
+      rtvec[0] = T{0}; rtvec[1] = omega; rtvec[2] = omega;
+      rtvec[3] = T{0}; rtvec[4] = s_q;
+      rtvec[5] = T{0}; rtvec[6] = s_q;
+      rtvec[7] = omega; rtvec[8] = omega;
     } else {
       for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
     }

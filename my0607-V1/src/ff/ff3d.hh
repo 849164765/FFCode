@@ -197,28 +197,30 @@ __any__ void FFViscoForce3DM<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_
   T ucy = uy + halfInvRho * F_in[1];
   T ucz = uz + halfInvRho * F_in[2];
 
-  // ---- First-pass MRT relaxation vector ----
-  T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
+  // 严格遵循 Premnath (2007) Eq. 77 的物理绑定关系
+  // 以及 Zu & He (2013) 对应力重构的渐近一致性要求
+  T s_q = T{8} * (T{2} - omega) / (T{8} - omega); // 2D魔法公式在3D可作为近似，或直接设为1.0~1.2
+
   const T rtvec1[LatSet::q] {
-    T{0},     // 0: rho (conserved)
-    omega,    // 1: e
-    omega,    // 2: epsilon
-    T{0},     // 3: jx (conserved)
-    1.1,      // 4: qx
-    T{0},     // 5: jy (conserved)
-    1.1,      // 6: qy
-    T{0},     // 7: jz (conserved)
-    1.1,      // 8: qz
-    omega,    // 9: 3cx^2 - r^2 (shear)
-    1.15,    // 10: non-hydro
-    omega,    // 11: cy^2 - cz^2 (shear)
-    1.15,    // 12: non-hydro
-    omega,    // 13: xy (shear)
-    omega,    // 14: xz (shear)
-    omega,    // 15: yz (shear)
-    1.15,    // 16: non-hydro
-    1.15,    // 17: non-hydro
-    1.15     // 18: non-hydro
+    T{0},     // 0: rho (守恒)
+    omega,    // 1: e (物理)
+    omega,    // 2: epsilon (物理)
+    T{0},     // 3: jx (守恒)
+    s_q,      // 4: qx (能量通量)
+    T{0},     // 5: jy (守恒)
+    s_q,      // 6: qy 
+    T{0},     // 7: jz (守恒)
+    s_q,      // 8: qz 
+    omega,    // 9: 剪切 (对应文献 s_10，必须等于 omega 以保证 Eq. 68 成立！)
+    omega,    // 10: 幽灵矩 (保持物理一致性，绝不能是 1.5)
+    omega,    // 11: 剪切 (对应文献 s_11，必须等于 omega)
+    omega,    // 12: 幽灵矩 
+    omega,    // 13: 剪切 (对应文献 s_12，必须等于 omega 以保证 Eq. 70 成立！)
+    omega,    // 14: 剪切 (对应文献 s_13)
+    omega,    // 15: 剪切 (对应文献 s_14)
+    omega,    // 16: 幽灵矩
+    omega,    // 17: 幽灵矩
+    omega     // 18: 幽灵矩
   };
 
   // Moments from populations (M·f, unrolled D3Q19 matching library M matrix)

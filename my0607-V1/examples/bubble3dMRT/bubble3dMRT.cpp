@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) {
                           Vector<T, LatSet::d>(T(Ni * Cell_Len), T((Nj + 1) * Cell_Len), T(Nz * Cell_Len)));
 
   BlockGeometryHelper3D<T> GeoHelper(Ni, Nj, Nz, domain, Cell_Len, BlockCellLen);
-  GeoHelper.CreateBlocks(1, mpi().getSize(), 1);
+  GeoHelper.CreateBlocks(1,9,1);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
 
@@ -409,48 +409,50 @@ int main(int argc, char* argv[]) {
   BlockLatManagerCoupling RhoOmegaCoupling(PFLattice, NSLattice);
 
   using PreForceTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFPreForce3DM<PFCELL, NSCELL>>;
+    tmp::Key_TypePair<BulkFlag, ff::FFPreForce3D<PFCELL, NSCELL>>;
   using PreForceTaskSelector =
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PreForceTask>;
   BlockLatManagerCoupling PreForceCoupling(PFLattice, NSLattice);
 
   using ViscoForceTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFViscoForce3D<PFCELL, NSCELL>>;
+    tmp::Key_TypePair<BulkFlag, ff::FFViscoForce3DM<PFCELL, NSCELL>>;
   using ViscoForceTaskSelector =
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, ViscoForceTask>;
   BlockLatManagerCoupling ViscoForceCoupling(PFLattice, NSLattice);
 
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
-  vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, LatSet::d>>());
-  vtmo::VectorWriter NormalWriter("NORMAL", PFLattice.getField<NORMAL<T, LatSet::d>>());
-  vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, LatSet::d>>());
-  vtmo::ScalarWriter DensityWriter("Density", NSLattice.getField<DENSITY<T>>());
-  vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
-  vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, LatSet::d>>());
+  //vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, LatSet::d>>());
+  //vtmo::VectorWriter NormalWriter("NORMAL", PFLattice.getField<NORMAL<T, LatSet::d>>());
+  //vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, LatSet::d>>());
+  //vtmo::ScalarWriter DensityWriter("Density", NSLattice.getField<DENSITY<T>>());
+  //vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
+  //vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, LatSet::d>>());
 
   vtmo::vtmWriter<T, LatSet::d> MainWriter("bubble3d", Geo);
-  MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, PressureWriter, DensityWriter, ForceWriter);
+  MainWriter.addWriterSet(PHIWriter);//, GRADWriter, NormalWriter,
+                          //VecWriter, PressureWriter, DensityWriter, ForceWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
   Timer OutputTimer;
 
   
-  PFLattice.NormalCommunicate();
-  NSLattice.NormalCommunicate();
+  PFLattice.NormalFullCommunicate();
+  NSLattice.NormalFullCommunicate();
+  NS_Periodic.Apply();
+  PF_Periodic.Apply();
 
   // Compute initial phi gradients, normal, laplacian, chempot (Fortran initHydroMacroVars)
-  PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
-  PFLattice.template ApplyCellDynamics<FFLaplacianSelector>(FlagFM);
-  PFLattice.template ApplyCellDynamics<FFChemPotSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFNormalSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFLaplacianSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFChemPotSelector>(FlagFM);
   PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
   PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
   ff::CommunicateAllSelfFields<T>(PFLattice);
 
   // Initial NS rho and omega from phi
-  RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+  RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
 
   MainWriter.WriteBinary(MainLoopTimer());
 
@@ -462,31 +464,36 @@ int main(int argc, char* argv[]) {
 
     // ---- Phase A: Force setup (Fortran computeForce) ----
     // A1: Update per-cell rho and omega from phi
-    RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+    RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A2: Clear NS FORCE to zero
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, LatSet::d>{T{0}});
 
     // A3: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
-    STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
+    STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A4: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
-    GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
+    GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
-    PreForceCoupling.ApplyCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
+    PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
 
     // ---- Phase B: PF collision (Fortran collisionOrderDF2D) ----
-    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    PF_Periodic.Apply();
+    PFLattice.NormalFullCommunicate();
+
 
     // ---- Phase C: NS collision (Fortran collisionDenDF2D) ----
     // C1: Viscous force F_v from non-equilibrium moments
-    ViscoForceCoupling.ApplyCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
+    ViscoForceCoupling.ApplyInnerCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
     // C2: MRTForce with total accumulated FORCE (F_s+F_b+F_p+F_v)
-    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
+    NSLattice.template ApplyInnerCellDynamics<NSTaskSelector>(FlagFM);
+    NS_Periodic.Apply();
+    NSLattice.NormalFullCommunicate();
 
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
@@ -542,7 +549,7 @@ int main(int argc, char* argv[]) {
       }
     }
     PFLattice.Stream();
-    PFLattice.NormalCommunicate();
+    PFLattice.NormalFullCommunicate();
     // D2: NS bounceback + stream
     NS_BB.Apply(MainLoopTimer());
     // D2a: Set NS Z ghost cell POPs to wall cell POPs (same rationale as D1a)
@@ -591,7 +598,7 @@ int main(int argc, char* argv[]) {
       }
     }
     NSLattice.Stream();
-    NSLattice.NormalCommunicate();
+    NSLattice.NormalFullCommunicate();
 
     // ---- Phase E: Macro update (Fortran: computeOrderMacro + computeMacro + setMacroOrderBC) ----
     // E1: phi from PF pops (Fortran: phi = Σ ddg)
@@ -743,9 +750,9 @@ int main(int argc, char* argv[]) {
     }
 
     // E3: Gradients, normal, laplacian, chempot (Fortran computeOrderMacro)
-    PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
-    PFLattice.template ApplyCellDynamics<FFLaplacianSelector>(FlagFM);
-    PFLattice.template ApplyCellDynamics<FFChemPotSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFNormalSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFLaplacianSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFChemPotSelector>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
