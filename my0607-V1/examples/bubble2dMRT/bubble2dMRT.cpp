@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
                    Vector<T, 2>(T((Ni + 1) * Cell_Len), T(Nj * Cell_Len)));
 
   BlockGeometryHelper2D<T> GeoHelper(Ni, Nj, domain, Cell_Len, BlockCellLen);
-  GeoHelper.CreateBlocks(1,mpi().getSize());
+  GeoHelper.CreateBlocks(3,3);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
 
@@ -329,6 +329,11 @@ int main(int argc, char* argv[]) {
   PF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
   PF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
 
+#ifdef MPI_ENABLED
+  NS_Periodic.SetupMPI(GeoHelper);
+  PF_Periodic.SetupMPI(GeoHelper);
+#endif
+
   // ------------------ define tasks ------------------
   // NS task: MRTForce with Guo force (moment-space equivalent of BGKForce)
   using NSBulkTask = tmp::Key_TypePair<BulkFlag, collision::MRTForce<NSCELL, FORCE<T, LatSet::d>>>;
@@ -408,21 +413,21 @@ int main(int argc, char* argv[]) {
   Timer OutputTimer;
 
   
-  PFLattice.NormalCommunicate();
-  NSLattice.NormalCommunicate();
+  PFLattice.NormalFullCommunicate();
+  NSLattice.NormalFullCommunicate();
   NS_Periodic.Apply();
   PF_Periodic.Apply();
 
   // Compute initial phi gradients, normal, laplacian, chempot (Fortran initHydroMacroVars)
-  PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
-  PFLattice.template ApplyCellDynamics<FFLaplacianSelector>(FlagFM);
-  PFLattice.template ApplyCellDynamics<FFChemPotSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFNormalSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFLaplacianSelector>(FlagFM);
+  PFLattice.template ApplyInnerCellDynamics<FFChemPotSelector>(FlagFM);
   PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
   PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
   ff::CommunicateAllSelfFields<T>(PFLattice);
 
   // Initial NS rho and omega from phi
-  RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+  RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
 
   MainWriter.WriteBinary(MainLoopTimer());
 
@@ -434,43 +439,124 @@ int main(int argc, char* argv[]) {
 
     // ---- Phase A: Force setup (Fortran computeForce) ----
     // A1: Update per-cell rho and omega from phi
-    RhoOmegaCoupling.ApplyCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+    RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A2: Clear NS FORCE to zero
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
     // A3: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
-    STCoupling.ApplyCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
+    STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A4: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
-    GravCoupling.ApplyCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
+    GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
-    PreForceCoupling.ApplyCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
+    PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
 
     // ---- Phase B: PF collision (Fortran collisionOrderDF2D) ----
-    PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<PFCollisionTaskSelector>(FlagFM);
     PF_Periodic.Apply();
+    // Communicate post-collision pops to ghost cells (needed for streaming)
+    PFLattice.NormalFullCommunicate();
 
     // ---- Phase C: NS collision (Fortran collisionDenDF2D) ----
     // C1: Viscous force F_v from non-equilibrium moments
-    ViscoForceCoupling.ApplyCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
+    ViscoForceCoupling.ApplyInnerCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
     // C2: MRTForce with total accumulated FORCE (F_s+F_b+F_p+F_v)
-    NSLattice.template ApplyCellDynamics<NSTaskSelector>(FlagFM);
+    NSLattice.template ApplyInnerCellDynamics<NSTaskSelector>(FlagFM);
     NS_Periodic.Apply();
+    // Communicate post-collision pops to ghost cells (needed for streaming)
+    NSLattice.NormalFullCommunicate();
 
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
     PF_BB.Apply(MainLoopTimer());
+    // D1a: Set PF Y ghost cell POPs to wall cell POPs
+    // Y ghost cells at physical walls are not in any SharedComm and are
+    // corrupted by pointer rotation (streaming). Their stale POPs are pulled
+    // into wall cells during streaming, causing pressure/phi errors that
+    // propagate to internal cells and eventually cause NaN at T4100.
+    // Fix: copy wall cell POPs to ghost cell POPs (zero-gradient condition).
+    {
+      T H_global = T(Nj) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockLat = PFLattice.getBlockLat(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int i = 0; i < nx; ++i) {
+            std::size_t id_ghost = 0 * proj[1] + i;
+            std::size_t id_wall = overlap * proj[1] + i;
+            PFCELL ghost_cell(id_ghost, blockLat);
+            PFCELL wall_cell(id_wall, blockLat);
+            for (unsigned int k = 0; k < LatSet::q; ++k) {
+              ghost_cell[k] = wall_cell[k];
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int i = 0; i < nx; ++i) {
+            std::size_t id_ghost = (ny - 1) * proj[1] + i;
+            std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
+            PFCELL ghost_cell(id_ghost, blockLat);
+            PFCELL wall_cell(id_wall, blockLat);
+            for (unsigned int k = 0; k < LatSet::q; ++k) {
+              ghost_cell[k] = wall_cell[k];
+            }
+          }
+        }
+      }
+    }
     PFLattice.Stream();
-    PFLattice.NormalCommunicate();
+    PFLattice.NormalFullCommunicate();
     // D2: NS bounceback + stream
     NS_BB.Apply(MainLoopTimer());
+    // D2a: Set NS Y ghost cell POPs to wall cell POPs (same rationale as D1a)
+    {
+      T H_global = T(Nj) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockLat = NSLattice.getBlockLat(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int i = 0; i < nx; ++i) {
+            std::size_t id_ghost = 0 * proj[1] + i;
+            std::size_t id_wall = overlap * proj[1] + i;
+            NSCELL ghost_cell(id_ghost, blockLat);
+            NSCELL wall_cell(id_wall, blockLat);
+            for (unsigned int k = 0; k < LatSet::q; ++k) {
+              ghost_cell[k] = wall_cell[k];
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int i = 0; i < nx; ++i) {
+            std::size_t id_ghost = (ny - 1) * proj[1] + i;
+            std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
+            NSCELL ghost_cell(id_ghost, blockLat);
+            NSCELL wall_cell(id_wall, blockLat);
+            for (unsigned int k = 0; k < LatSet::q; ++k) {
+              ghost_cell[k] = wall_cell[k];
+            }
+          }
+        }
+      }
+    }
     NSLattice.Stream();
-    NSLattice.NormalCommunicate();
+    NSLattice.NormalFullCommunicate();
 
     // ---- Phase E: Macro update (Fortran: computeOrderMacro + computeMacro + setMacroOrderBC) ----
     // E1: phi from PF pops (Fortran: phi = Σ ddg)
@@ -532,10 +618,45 @@ int main(int argc, char* argv[]) {
     // E2a: Re-communicate PHI after wall modification (ghost cells need updated phi)
     PFLattice.getField<PHI<T>>().Communicate();
 
+    // E2b: Set PHI at Y ghost cells (physical wall ghost cells are NOT in any
+    // SharedComm — they are "三不管" zones: block comm doesn't cover them,
+    // BBLikeFixedBlockBdManager only processes internal cells, and no diagonal
+    // neighbor can fill them. FF2D::apply reads PHI from all 8 neighbors
+    // including these stale ghost cells, causing incorrect gradient at wall
+    // cells and eventual NaN.)
+    {
+      auto& phiField = PFLattice.getField<PHI<T>>();
+      T H_global = T(Nj) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockPhi = phiField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int j = 0; j < overlap; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              blockPhi.get(j * proj[1] + i) = T{1};
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int j = ny - overlap; j < ny; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              blockPhi.get(j * proj[1] + i) = T{1};
+            }
+          }
+        }
+      }
+    }
+
     // E3: Gradients, normal, laplacian, chempot (Fortran computeOrderMacro)
-    PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
-    PFLattice.template ApplyCellDynamics<FFLaplacianSelector>(FlagFM);
-    PFLattice.template ApplyCellDynamics<FFChemPotSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFNormalSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFLaplacianSelector>(FlagFM);
+    PFLattice.template ApplyInnerCellDynamics<FFChemPotSelector>(FlagFM);
     PFLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
     PFLattice.getField<GRAD<T, LatSet::d>>().Communicate();
     ff::CommunicateAllSelfFields<T>(PFLattice);
@@ -609,6 +730,50 @@ int main(int argc, char* argv[]) {
     }
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
+    // E4a: Extrapolate GRAD, NORMAL, CHEMPOT to Y ghost cells
+    // (same "三不管" issue as E2b — these fields are not in SharedComm at
+    // physical wall ghost cells, so they remain stale after Communicate)
+    {
+      T H_global = T(Nj) * Cell_Len;
+      auto& gradField = PFLattice.getField<GRAD<T, LatSet::d>>();
+      auto& normField = PFLattice.getField<NORMAL<T, LatSet::d>>();
+      auto& chmField = PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockGrad = gradField.getBlockField(blockid);
+        auto& blockNorm = normField.getBlockField(blockid);
+        auto& blockChm = chmField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int j = 0; j < overlap; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = overlap * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockGrad.get(id_ghost) = blockGrad.get(id_wall);
+              blockNorm.get(id_ghost) = blockNorm.get(id_wall);
+              blockChm.get(id_ghost) = blockChm.get(id_wall);
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int j = ny - overlap; j < ny; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockGrad.get(id_ghost) = blockGrad.get(id_wall);
+              blockNorm.get(id_ghost) = blockNorm.get(id_wall);
+              blockChm.get(id_ghost) = blockChm.get(id_wall);
+            }
+          }
+        }
+      }
+    }
+
     // E5: NS macro from streamed pops (Fortran computeMacro: p=Σf, u=Σe*f+0.5*F/ρ)
     {
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -646,6 +811,62 @@ int main(int argc, char* argv[]) {
         }
       }
     }
+    // E5a: Communicate NS macro fields to ghost cells every step
+    // (PF collision references NS velocity; PreForce references PRESSURE;
+    //  ViscoForce/MRTForce reference DENSITY and OMEGA; stale ghost values
+    //  cause feedback loop leading to exponential growth and NaN)
+    NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
+    NSLattice.getField<PRESSURE<T>>().Communicate();
+    NSLattice.getField<DENSITY<T>>().Communicate();
+    NSLattice.getField<OMEGA<T>>().Communicate();
+
+    // E5b: Extrapolate NS macro fields to Y ghost cells
+    // (same "三不管" issue — VELOCITY is read from neighbors by bounceback BC,
+    // and all NS fields need correct ghost values for coupling calculations)
+    {
+      T H_global = T(Nj) * Cell_Len;
+      auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
+      auto& presField = NSLattice.getField<PRESSURE<T>>();
+      auto& rhoField = NSLattice.getField<DENSITY<T>>();
+      auto& omegaField = NSLattice.getField<OMEGA<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockVel = velField.getBlockField(blockid);
+        auto& blockPres = presField.getBlockField(blockid);
+        auto& blockRho = rhoField.getBlockField(blockid);
+        auto& blockOmega = omegaField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int j = 0; j < overlap; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = overlap * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockVel.get(id_ghost) = blockVel.get(id_wall);
+              blockPres.get(id_ghost) = blockPres.get(id_wall);
+              blockRho.get(id_ghost) = blockRho.get(id_wall);
+              blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int j = ny - overlap; j < ny; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockVel.get(id_ghost) = blockVel.get(id_wall);
+              blockPres.get(id_ghost) = blockPres.get(id_wall);
+              blockRho.get(id_ghost) = blockRho.get(id_wall);
+              blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+            }
+          }
+        }
+      }
+    }
 
     ++MainLoopTimer;
     ++OutputTimer;
@@ -653,9 +874,6 @@ int main(int argc, char* argv[]) {
     if (MainLoopTimer() % OutputStep == 0) {
       PFLattice.getField<GRAD<T, 2>>().Communicate();
       PFLattice.getField<PHI<T>>().Communicate();
-      NSLattice.getField<VELOCITY<T, 2>>().Communicate();
-      NSLattice.getField<PRESSURE<T>>().Communicate();
-      NSLattice.getField<DENSITY<T>>().Communicate();
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());
