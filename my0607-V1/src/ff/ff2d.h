@@ -209,12 +209,17 @@ struct FFRhoOmegaUpdate3D {
 // FFViscoForce3D: F_v from non-equilibrium moments (Fortran MRT two-pass algorithm)
 // 3D generic version using M/InvM matrix operations.
 template <typename PFCELL, typename NSCELL>
+struct FFViscoForce3DM {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
+};
+template <typename PFCELL, typename NSCELL>
 struct FFViscoForce3D {
   using T = typename PFCELL::FloatType;
   using LatSet = typename NSCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
-
 // ===================================================================
 //  Section 5: Communication Functions for Self-Owned Fields
 //  (cf. src/ca/zhu_stefanescu2d.h: BlockZhuStefanescu2DManager::Communicate())

@@ -148,17 +148,17 @@ __any__ void FFRhoOmegaUpdate3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   ns_cell.template get<OMEGA<T>>() = omega;
 }
 
-// ---- FFViscoForce3D ----
+// ---- FFViscoForce3D (Palabos/Latt Simplified D3Q19 Basis) ----
+
 // F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
 // C_ab = Σ_k c_ka * c_kb * mgneq_k
-// mgneq = InvM · S1 · (m - m_eq)
-// S1: conserved moments 0, energy modes omega, q-modes s_q, stress modes omega.
-// Hand-written D3Q19 version, analogous to FFViscoForce2D.
-template <typename PFCELL, typename NSCELL>
-__any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-  static_assert(LatSet::q == 19 && LatSet::d == 3,
-                "FFViscoForce3D only supports D3Q19");
+// mgneq = InvM · S1 · (m - m_eq)   (first-pass MRT relaxation)
+// S1 = diag(0, ω, ω, 0, s_q, 0, s_q, 0, s_q, ω, ω, ω, ω, ω, ω, ω, ω, ω, ω)
+//
+// Adds F_v to NS FORCE (which already contains F_s + F_b + F_p)
 
+template <typename PFCELL, typename NSCELL>
+__any__ void FFViscoForce3DM<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   // Read per-cell omega
   T omega{};
   if constexpr (ns_cell.template hasField<OMEGA<T>>()) {
@@ -167,36 +167,27 @@ __any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
     omega = ns_cell.getOmega();
   }
 
-  // Read populations and density
-  T f[19];
-  for (unsigned int k = 0; k < 19; ++k) f[k] = ns_cell[k];
-
-  // zeroth = Σf (zeroth moment of populations, used for equilibrium consistency)
-  // rho   = physical density from DENSITY field (from phi, used for prefactor only)
-  // NOTE: If zeroth were set to DENSITY, m_raw[0]=Σf would mismatch m_eq[0]=rho,
-  // producing huge dm[0] = Σf - DENSITY (e.g. 1 - 1000 = -999) and exploding F_v.
-  T zeroth = T{0};
-  for (unsigned int k = 0; k < 19; ++k) zeroth += f[k];
-  T rho{};
+  // Read actual density: DENSITY field (incompressible) or sum(f) (compressible)
+  T f[LatSet::q];
+  for (unsigned int k = 0; k < LatSet::q; ++k) f[k] = ns_cell[k];
+  T rho;
   if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
     rho = ns_cell.template get<DENSITY<T>>();
   } else {
-    rho = zeroth;
+    rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8] 
+        + f[9] + f[10] + f[11] + f[12] + f[13] + f[14] + f[15] + f[16] + f[17] + f[18];
   }
 
-  // Compute velocity: sum(c*f) / rho for compressible, sum(c*f) for incompressible
-  // D3Q19 ordering (from lattice_set.h):
-  // 0:rest, 1:+x, 2:-x, 3:+y, 4:-y, 5:+z, 6:-z,
-  // 7:+x+y, 8:-x-y, 9:+x+z, 10:-x-z, 11:+y+z, 12:-y-z,
-  // 13:+x-y, 14:-x+y, 15:+x-z, 16:-x+z, 17:+y-z, 18:-y+z
   constexpr bool isIncompressible = NSCELL::template hasField<DENSITY<T>>();
-  T ux = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
-  T uy = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
-  T uz = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
-  if constexpr (!isIncompressible) {
-    ux /= rho;
-    uy /= rho;
-    uz /= rho;
+  T ux, uy, uz;
+  if constexpr (isIncompressible) {
+    ux = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+    uy = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+    uz = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  } else {
+    ux = (f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16]) / rho;
+    uy = (f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18]) / rho;
+    uz = (f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18]) / rho;
   }
 
   // Half-force correction using current FORCE (= F_s + F_b + F_p)
@@ -206,154 +197,285 @@ __any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   T ucy = uy + halfInvRho * F_in[1];
   T ucz = uz + halfInvRho * F_in[2];
 
-  // ---- First-pass MRT relaxation vector (D3Q19) ----
+  // ---- First-pass MRT relaxation vector ----
   T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
-  const T rtvec1[19] {
-    T{0},     // 0:  rho (conserved)
-    omega,    // 1:  e
-    omega,    // 2:  epsilon
-    T{0},     // 3:  jx (conserved)
-    s_q,      // 4:  qx
-    T{0},     // 5:  jy (conserved)
-    s_q,      // 6:  qy
-    T{0},     // 7:  jz (conserved)
-    s_q,      // 8:  qz
-    omega,    // 9:  stress
-    omega,    // 10: stress
-    omega,    // 11: shear
-    omega,    // 12: higher-order
-    omega,    // 13: shear
-    omega,    // 14: stress
-    omega,    // 15: shear
-    omega,    // 16: higher-order
-    omega,    // 17: higher-order
-    omega     // 18: higher-order
+  const T rtvec1[LatSet::q] {
+    T{0},     // 0: rho (conserved)
+    omega,    // 1: e
+    omega,    // 2: epsilon
+    T{0},     // 3: jx (conserved)
+    1.1,      // 4: qx
+    T{0},     // 5: jy (conserved)
+    1.1,      // 6: qy
+    T{0},     // 7: jz (conserved)
+    1.1,      // 8: qz
+    omega,    // 9: 3cx^2 - r^2 (shear)
+    1.15,    // 10: non-hydro
+    omega,    // 11: cy^2 - cz^2 (shear)
+    1.15,    // 12: non-hydro
+    omega,    // 13: xy (shear)
+    omega,    // 14: xz (shear)
+    omega,    // 15: yz (shear)
+    1.15,    // 16: non-hydro
+    1.15,    // 17: non-hydro
+    1.15     // 18: non-hydro
   };
 
-  // Equilibrium populations (standard D3Q19)
-  T feq[19];
+  // Moments from populations (M·f, unrolled D3Q19 matching library M matrix)
+  T zeroth = rho; 
+  T m_raw[LatSet::q];
+  m_raw[0] = zeroth;
+  m_raw[1] = -f[0] + f[7] + f[8] + f[9] + f[10] + f[11] + f[12] + f[13] + f[14] + f[15] + f[16] + f[17] + f[18];
+  m_raw[2] = f[0] - T{2}*(f[1]+f[2]+f[3]+f[4]+f[5]+f[6]) + f[7]+f[8]+f[9]+f[10]+f[11]+f[12]+f[13]+f[14]+f[15]+f[16]+f[17]+f[18];
+  m_raw[3] = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+  m_raw[4] = -T{2}*f[1] + T{2}*f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+  m_raw[5] = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+  m_raw[6] = -T{2}*f[3] + T{2}*f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+  m_raw[7] = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  m_raw[8] = -T{2}*f[5] + T{2}*f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  m_raw[9] = T{2}*(f[1]+f[2]) - (f[3]+f[4]+f[5]+f[6]) + (f[7]+f[8]+f[9]+f[10]) - T{2}*(f[11]+f[12]) + (f[13]+f[14]+f[15]+f[16]) - T{2}*(f[17]+f[18]);
+  m_raw[10] = -T{2}*(f[1]+f[2]) + (f[3]+f[4]+f[5]+f[6]) + (f[7]+f[8]+f[9]+f[10]) - T{2}*(f[11]+f[12]) + (f[13]+f[14]+f[15]+f[16]) - T{2}*(f[17]+f[18]);
+  m_raw[11] = f[3]+f[4] - (f[5]+f[6]) + f[7]+f[8] - (f[9]+f[10]) + f[13]+f[14] - (f[15]+f[16]);
+  m_raw[12] = -f[3]-f[4] + f[5]+f[6] + f[7]+f[8] - (f[9]+f[10]) + f[13]+f[14] - (f[15]+f[16]);
+  m_raw[13] = f[7]+f[8] - f[13]-f[14];
+  m_raw[14] = f[9]+f[10] - f[15]-f[16];
+  m_raw[15] = f[11]+f[12] - f[17]-f[18];
+  m_raw[16] = f[7]-f[8] - f[9]+f[10] + f[13]-f[14] - f[15]+f[16];
+  m_raw[17] = f[7]-f[8] - f[11]+f[12] - f[13]+f[14] - f[17]+f[18];
+  m_raw[18] = f[9]-f[10] - f[11]+f[12] - f[15]+f[16] + f[17]-f[18];
+
+  // Equilibrium moments: Palabos/Latt Simplified D3Q19 Basis
+  // NOTE: This basis naturally maintains Galilean invariance without O(u^3) corrections!
+  // Many higher-order moments are EXACTLY ZERO in equilibrium.
   T ucx2 = ucx * ucx;
   T ucy2 = ucy * ucy;
   T ucz2 = ucz * ucz;
   T uc2 = ucx2 + ucy2 + ucz2;
-  T rho_eq = isIncompressible ? zeroth : rho;
-  // rest direction
-  feq[0] = latset::w<LatSet>(0) * (rho_eq - T{1.5} * uc2);
-  for (unsigned int k = 1; k < 19; ++k) {
-    const auto& ck = latset::c<LatSet>(k);
-    T cu = ck[0] * ucx + ck[1] * ucy + ck[2] * ucz;
-    T wk = latset::w<LatSet>(k);
-    feq[k] = wk * (rho_eq + T{3} * cu + T{4.5} * cu * cu - T{1.5} * uc2);
+  T m_eq[LatSet::q];
+  
+  if constexpr (isIncompressible) {
+    m_eq[0] = zeroth;
+    m_eq[1] = zeroth * uc2;
+    m_eq[2] = T{0};
+    m_eq[3] = ucx;
+    m_eq[4] = T{0};
+    m_eq[5] = ucy;
+    m_eq[6] = T{0};
+    m_eq[7] = ucz;
+    m_eq[8] = T{0};
+    m_eq[9] = T{2} * ucx2 - ucy2 - ucz2;
+    m_eq[10] = T{0};
+    m_eq[11] = ucy2 - ucz2;
+    m_eq[12] = T{0};
+    m_eq[13] = ucx * ucy;
+    m_eq[14] = ucx * ucz;
+    m_eq[15] = ucy * ucz;
+    m_eq[16] = T{0}; m_eq[17] = T{0}; m_eq[18] = T{0};
+  } else {
+    m_eq[0] = rho;
+    m_eq[1] = rho * uc2;
+    m_eq[2] = T{0};
+    m_eq[3] = rho * ucx;
+    m_eq[4] = T{0};
+    m_eq[5] = rho * ucy;
+    m_eq[6] = T{0};
+    m_eq[7] = rho * ucz;
+    m_eq[8] = T{0};
+    m_eq[9] = rho * (T{2} * ucx2 - ucy2 - ucz2);
+    m_eq[10] = T{0};
+    m_eq[11] = rho * (ucy2 - ucz2);
+    m_eq[12] = T{0};
+    m_eq[13] = rho * ucx * ucy;
+    m_eq[14] = rho * ucx * ucz;
+    m_eq[15] = rho * ucy * ucz;
+    m_eq[16] = T{0}; m_eq[17] = T{0}; m_eq[18] = T{0};
   }
 
-  // ---- Moments from populations (handwritten M·f for D3Q19) ----
-  T m_raw[19];
-  T sum1_6 = f[1] + f[2] + f[3] + f[4] + f[5] + f[6];
-  T sum7_10 = f[7] + f[8] + f[9] + f[10];
-  T sum11_14 = f[11] + f[12] + f[13] + f[14];
-  T sum15_18 = f[15] + f[16] + f[17] + f[18];
-  T sum7_18 = sum7_10 + sum11_14 + sum15_18;
-  m_raw[0] = f[0] + sum1_6 + sum7_18;
-  m_raw[1] = -f[0] + sum7_18;
-  m_raw[2] = f[0] - T{2} * sum1_6 + sum7_18;
-  m_raw[3] = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
-  m_raw[4] = T{-2} * (f[1] - f[2]) + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
-  m_raw[5] = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
-  m_raw[6] = -T{2} * f[3] + T{2} * f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
-  m_raw[7] = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
-  m_raw[8] = -T{2} * f[5] + T{2} * f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
-  m_raw[9] = f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8] - f[9] - f[10] - f[11] - f[12] + f[13] + f[14] + f[15] + f[16] - f[17] - f[18];
-  m_raw[10] = T{-2} * (f[1] + f[2]) + (f[3] + f[4] + f[5] + f[6])
-            + (f[7] + f[8] + f[9] + f[10])
-            - T{2} * (f[11] + f[12])
-            + (f[13] + f[14] + f[15] + f[16])
-            - T{2} * (f[17] + f[18]);
-  m_raw[11] = (f[3] + f[4]) - (f[5] + f[6])
-            + (f[7] + f[8]) - (f[9] + f[10])
-            + (f[13] + f[14]) - (f[15] + f[16]);
-  m_raw[12] = -(f[3] + f[4]) + (f[5] + f[6])
-            + (f[7] + f[8]) - (f[9] + f[10])
-            + (f[13] + f[14]) - (f[15] + f[16]);
-  m_raw[13] = (f[7] + f[8]) - (f[13] + f[14]);
-  m_raw[14] = (f[9] + f[10]) - (f[15] + f[16]);
-  m_raw[15] = (f[11] + f[12]) - (f[17] + f[18]);
-  m_raw[16] = (f[7] - f[8]) - (f[9] - f[10])
-            + (f[13] - f[14]) - (f[15] - f[16]);
-  m_raw[17] = (f[7] - f[8]) - (f[11] - f[12])
-            - (f[13] - f[14]) - (f[17] - f[18]);
-  m_raw[18] = (f[9] - f[10]) - (f[11] - f[12])
-            - (f[15] - f[16]) + (f[17] - f[18]);
-
-  // Equilibrium moments (same M applied to feq)
-  T m_eq[19];
-  T esum1_6 = feq[1] + feq[2] + feq[3] + feq[4] + feq[5] + feq[6];
-  T esum7_10 = feq[7] + feq[8] + feq[9] + feq[10];
-  T esum11_14 = feq[11] + feq[12] + feq[13] + feq[14];
-  T esum15_18 = feq[15] + feq[16] + feq[17] + feq[18];
-  T esum7_18 = esum7_10 + esum11_14 + esum15_18;
-  m_eq[0] = feq[0] + esum1_6 + esum7_18;
-  m_eq[1] = -feq[0] + esum7_18;
-  m_eq[2] = feq[0] - T{2} * esum1_6 + esum7_18;
-  m_eq[3] = feq[1] - feq[2] + feq[7] - feq[8] + feq[9] - feq[10] + feq[13] - feq[14] + feq[15] - feq[16];
-  m_eq[4] = T{-2} * (feq[1] - feq[2]) + feq[7] - feq[8] + feq[9] - feq[10] + feq[13] - feq[14] + feq[15] - feq[16];
-  m_eq[5] = feq[3] - feq[4] + feq[7] - feq[8] + feq[11] - feq[12] - feq[13] + feq[14] + feq[17] - feq[18];
-  m_eq[6] = -T{2} * feq[3] + T{2} * feq[4] + feq[7] - feq[8] + feq[11] - feq[12] - feq[13] + feq[14] + feq[17] - feq[18];
-  m_eq[7] = feq[5] - feq[6] + feq[9] - feq[10] + feq[11] - feq[12] - feq[15] + feq[16] - feq[17] + feq[18];
-  m_eq[8] = -T{2} * feq[5] + T{2} * feq[6] + feq[9] - feq[10] + feq[11] - feq[12] - feq[15] + feq[16] - feq[17] + feq[18];
-  m_eq[9] = feq[1] + feq[2] + feq[3] + feq[4] + feq[5] + feq[6] + feq[7] + feq[8] - feq[9] - feq[10] - feq[11] - feq[12] + feq[13] + feq[14] + feq[15] + feq[16] - feq[17] - feq[18];
-  m_eq[10] = T{-2} * (feq[1] + feq[2]) + (feq[3] + feq[4] + feq[5] + feq[6])
-           + (feq[7] + feq[8] + feq[9] + feq[10])
-           - T{2} * (feq[11] + feq[12])
-           + (feq[13] + feq[14] + feq[15] + feq[16])
-           - T{2} * (feq[17] + feq[18]);
-  m_eq[11] = (feq[3] + feq[4]) - (feq[5] + feq[6])
-           + (feq[7] + feq[8]) - (feq[9] + feq[10])
-           + (feq[13] + feq[14]) - (feq[15] + feq[16]);
-  m_eq[12] = -(feq[3] + feq[4]) + (feq[5] + feq[6])
-           + (feq[7] + feq[8]) - (feq[9] + feq[10])
-           + (feq[13] + feq[14]) - (feq[15] + feq[16]);
-  m_eq[13] = (feq[7] + feq[8]) - (feq[13] + feq[14]);
-  m_eq[14] = (feq[9] + feq[10]) - (feq[15] + feq[16]);
-  m_eq[15] = (feq[11] + feq[12]) - (feq[17] + feq[18]);
-  m_eq[16] = (feq[7] - feq[8]) - (feq[9] - feq[10])
-           + (feq[13] - feq[14]) - (feq[15] - feq[16]);
-  m_eq[17] = (feq[7] - feq[8]) - (feq[11] - feq[12])
-           - (feq[13] - feq[14]) - (feq[17] - feq[18]);
-  m_eq[18] = (feq[9] - feq[10]) - (feq[11] - feq[12])
-           - (feq[15] - feq[16]) + (feq[17] - feq[18]);
-
   // Deviation in moment space
-  T dm[19];
-  for (unsigned int i = 0; i < 19; ++i) dm[i] = m_raw[i] - m_eq[i];
+  T dm[LatSet::q];
+  for (unsigned int i = 0; i < LatSet::q; ++i) dm[i] = m_raw[i] - m_eq[i];
 
-  // C_ab = Σ_k c_ka * c_kb * (InvM · (rtvec1 * dm))_k
-  // Fully expanded for D3Q19; s_q terms and j=2,16,17,18 terms vanish by symmetry.
-  T Cxx = omega * (T{1} / T{3} * dm[1] + T{1} / T{3} * dm[9]);
+  // Non-equilibrium population: mgneq_i = Σ_j InvM(i,j) * S1(j) * dm_j
+  T mgneq[LatSet::q] {};
+  for (unsigned int i = 0; i < LatSet::q; ++i) {
+    mgneq[i] = T{};
+    for (unsigned int j = 0; j < LatSet::q; ++j) {
+      mgneq[i] += mrt::InvM<LatSet>(i, j) * rtvec1[j] * dm[j];
+    }
+  }
 
-  T Cyy = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] + T{1} / T{2} * dm[11]);
+  // C_ab = Σ_k c_ka * c_kb * mgneq_k (unrolled D3Q19 stress tensor)
+  T Cxx = mgneq[1] + mgneq[2] + mgneq[7] + mgneq[8] + mgneq[9] + mgneq[10] + mgneq[13] + mgneq[14] + mgneq[15] + mgneq[16];
+  T Cyy = mgneq[3] + mgneq[4] + mgneq[7] + mgneq[8] + mgneq[11] + mgneq[12] + mgneq[13] + mgneq[14] + mgneq[17] + mgneq[18];
+  T Czz = mgneq[5] + mgneq[6] + mgneq[9] + mgneq[10] + mgneq[11] + mgneq[12] + mgneq[15] + mgneq[16] + mgneq[17] + mgneq[18];
+  T Cxy = mgneq[7] + mgneq[8] - mgneq[13] - mgneq[14];
+  T Cxz = mgneq[9] + mgneq[10] - mgneq[15] - mgneq[16];
+  T Cyz = mgneq[11] + mgneq[12] - mgneq[17] - mgneq[18];
 
-  T Czz = omega * (T{1} / T{3} * dm[1] - T{1} / T{6} * dm[9] - T{1} / T{2} * dm[11]);
+  // Read grad_phi and DeltaRho from PF cell
+  const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T delta_rho = pf_cell.template get<DELTARHO<T>>();
 
-  T Cxy = omega * dm[13];
-
-  T Cxz = omega * dm[14];
-
-  T Cyz = omega * dm[15];
-
-  // mu = nu * rho = (1/omega - 0.5) * cs² * rho
+  // mu = nu * rho = (tau-0.5)*cs²*rho = (1/omega - 0.5)*cs²*rho
   T invOmega = T{1} / omega;
   T nu = (invOmega - T{0.5}) * LatSet::cs2;
   T mu = nu * rho;
 
   // F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
-  T delta_rho = pf_cell.template get<DELTARHO<T>>();
-  const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
   T prefactor = -T{3} * mu * delta_rho / rho;
+  T Fv_x = prefactor * (Cxx * grad_phi[0] + Cxy * grad_phi[1] + Cxz * grad_phi[2]);
+  T Fv_y = prefactor * (Cxy * grad_phi[0] + Cyy * grad_phi[1] + Cyz * grad_phi[2]);
+  T Fv_z = prefactor * (Cxz * grad_phi[0] + Cyz * grad_phi[1] + Czz * grad_phi[2]);
 
-  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
-  ns_force[0] += prefactor * (Cxx * grad_phi[0] + Cxy * grad_phi[1] + Cxz * grad_phi[2]);
-  ns_force[1] += prefactor * (Cxy * grad_phi[0] + Cyy * grad_phi[1] + Cyz * grad_phi[2]);
-  ns_force[2] += prefactor * (Cxz * grad_phi[0] + Cyz * grad_phi[1] + Czz * grad_phi[2]);
+  // Add F_v to NS FORCE
+  ns_cell.template get<FORCE<T, LatSet::d>>()[0] += Fv_x;
+  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += Fv_y;
+  ns_cell.template get<FORCE<T, LatSet::d>>()[2] += Fv_z;
+}
+// ---- FFViscoForce3D (SRT / BGK Version) ----
+
+// F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
+// C_ab = Σ_k c_ka * c_kb * f_neq_k
+// f_neq_k = f_k - f_eq_k  (Standard BGK non-equilibrium)
+//
+// Adds F_v to NS FORCE (which already contains F_s + F_b + F_p)
+
+template <typename PFCELL, typename NSCELL>
+__any__ void FFViscoForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+  // Read per-cell omega
+  T omega{};
+  if constexpr (ns_cell.template hasField<OMEGA<T>>()) {
+    omega = ns_cell.template get<OMEGA<T>>();
+  } else {
+    omega = ns_cell.getOmega();
+  }
+
+  // Read actual density and populations
+  T f[LatSet::q];
+  for (unsigned int k = 0; k < LatSet::q; ++k) f[k] = ns_cell[k];
+  T rho;
+  if constexpr (ns_cell.template hasField<DENSITY<T>>()) {
+    rho = ns_cell.template get<DENSITY<T>>();
+  } else {
+    rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8] 
+        + f[9] + f[10] + f[11] + f[12] + f[13] + f[14] + f[15] + f[16] + f[17] + f[18];
+  }
+
+  constexpr bool isIncompressible = NSCELL::template hasField<DENSITY<T>>();
+  T ux, uy, uz;
+  if constexpr (isIncompressible) {
+    ux = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+    uy = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+    uz = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  } else {
+    ux = (f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16]) / rho;
+    uy = (f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18]) / rho;
+    uz = (f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18]) / rho;
+  }
+
+  // Half-force correction using current FORCE
+  const auto& F_in = ns_cell.template get<FORCE<T, LatSet::d>>();
+  T halfInvRho = T{0.5} / rho;
+  T ucx = ux + halfInvRho * F_in[0];
+  T ucy = uy + halfInvRho * F_in[1];
+  T ucz = uz + halfInvRho * F_in[2];
+
+  // ---- SRT (BGK) Non-equilibrium distribution function ----
+  // f_neq_k = f_k - f_eq_k
+  // Standard D3Q19 equilibrium: f_eq = w * rho * (1 + 3(c·u) + 4.5(c·u)^2 - 1.5u^2)
+  T f_neq[LatSet::q];
+  T usqr = ucx * ucx + ucy * ucy + ucz * ucz;
+  
+  // Precompute common terms for equilibrium
+  T w0 = T{1} / T{3};
+  T w1 = T{1} / T{18};
+  T w2 = T{1} / T{36};
+  T base_eq = T{1} - T{1.5} * usqr;
+
+  // 0: Rest node (0,0,0)
+  f_neq[0] = f[0] - w0 * rho * base_eq;
+
+  // 1,2: Face nodes (+-1, 0, 0) -> c·u = +-ux
+  T cu_x = T{3} * ucx;
+  f_neq[1] = f[1] - w1 * rho * (base_eq + cu_x + T{4.5} * ucx * ucx);
+  f_neq[2] = f[2] - w1 * rho * (base_eq - cu_x + T{4.5} * ucx * ucx);
+
+  // 3,4: Face nodes (0, +-1, 0) -> c·u = +-uy
+  T cu_y = T{3} * ucy;
+  f_neq[3] = f[3] - w1 * rho * (base_eq + cu_y + T{4.5} * ucy * ucy);
+  f_neq[4] = f[4] - w1 * rho * (base_eq - cu_y + T{4.5} * ucy * ucy);
+
+  // 5,6: Face nodes (0, 0, +-1) -> c·u = +-uz
+  T cu_z = T{3} * ucz;
+  f_neq[5] = f[5] - w1 * rho * (base_eq + cu_z + T{4.5} * ucz * ucz);
+  f_neq[6] = f[6] - w1 * rho * (base_eq - cu_z + T{4.5} * ucz * ucz);
+
+  // Edge nodes (diagonals)
+  // Helper macro/lambda for edge nodes to keep code clean
+  auto calc_edge = [&](T cx, T cy, T cz) {
+    T cu = cx * ucx + cy * ucy + cz * ucz;
+    return base_eq + T{3} * cu + T{4.5} * cu * cu;
+  };
+
+  // 7,8: (1,1,0), (-1,-1,0)
+  f_neq[7]  = f[7]  - w2 * rho * calc_edge( 1,  1,  0);
+  f_neq[8]  = f[8]  - w2 * rho * calc_edge(-1, -1,  0);
+
+  // 9,10: (1,0,1), (-1,0,-1)
+  f_neq[9]  = f[9]  - w2 * rho * calc_edge( 1,  0,  1);
+  f_neq[10] = f[10] - w2 * rho * calc_edge(-1,  0, -1);
+
+  // 11,12: (0,1,1), (0,-1,-1)
+  f_neq[11] = f[11] - w2 * rho * calc_edge( 0,  1,  1);
+  f_neq[12] = f[12] - w2 * rho * calc_edge( 0, -1, -1);
+
+  // 13,14: (1,-1,0), (-1,1,0)
+  f_neq[13] = f[13] - w2 * rho * calc_edge( 1, -1,  0);
+  f_neq[14] = f[14] - w2 * rho * calc_edge(-1,  1,  0);
+
+  // 15,16: (1,0,-1), (-1,0,1)
+  f_neq[15] = f[15] - w2 * rho * calc_edge( 1,  0, -1);
+  f_neq[16] = f[16] - w2 * rho * calc_edge(-1,  0,  1);
+
+  // 17,18: (0,1,-1), (0,-1,1)
+  f_neq[17] = f[17] - w2 * rho * calc_edge( 0,  1, -1);
+  f_neq[18] = f[18] - w2 * rho * calc_edge( 0, -1,  1);
+
+
+  // ---- Stress Tensor C_ab = Σ_k c_ka * c_kb * f_neq_k ----
+  // Unrolled based on the specific D3Q19 velocity set mapping
+  T Cxx = f_neq[1] + f_neq[2] + f_neq[7] + f_neq[8] + f_neq[9] + f_neq[10] 
+        + f_neq[13] + f_neq[14] + f_neq[15] + f_neq[16];
+        
+  T Cyy = f_neq[3] + f_neq[4] + f_neq[7] + f_neq[8] + f_neq[11] + f_neq[12] 
+        + f_neq[13] + f_neq[14] + f_neq[17] + f_neq[18];
+        
+  T Czz = f_neq[5] + f_neq[6] + f_neq[9] + f_neq[10] + f_neq[11] + f_neq[12] 
+        + f_neq[15] + f_neq[16] + f_neq[17] + f_neq[18];
+
+  T Cxy = f_neq[7] + f_neq[8] - f_neq[13] - f_neq[14];
+  T Cxz = f_neq[9] + f_neq[10] - f_neq[15] - f_neq[16];
+  T Cyz = f_neq[11] + f_neq[12] - f_neq[17] - f_neq[18];
+
+  // Read grad_phi and DeltaRho from PF cell
+  const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+  T delta_rho = pf_cell.template get<DELTARHO<T>>();
+
+  // mu = nu * rho = (tau-0.5)*cs²*rho = (1/omega - 0.5)*cs²*rho
+  T invOmega = T{1} / omega;
+  T nu = (invOmega - T{0.5}) * LatSet::cs2;
+  T mu = nu * rho;
+
+  // F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
+  T prefactor = -T{3} * mu * delta_rho / rho;
+  T Fv_x = prefactor * (Cxx * grad_phi[0] + Cxy * grad_phi[1] + Cxz * grad_phi[2]);
+  T Fv_y = prefactor * (Cxy * grad_phi[0] + Cyy * grad_phi[1] + Cyz * grad_phi[2]);
+  T Fv_z = prefactor * (Cxz * grad_phi[0] + Cyz * grad_phi[1] + Czz * grad_phi[2]);
+
+  // Add F_v to NS FORCE
+  ns_cell.template get<FORCE<T, LatSet::d>>()[0] += Fv_x;
+  ns_cell.template get<FORCE<T, LatSet::d>>()[1] += Fv_y;
+  ns_cell.template get<FORCE<T, LatSet::d>>()[2] += Fv_z;
 }
 
 }  // namespace ff

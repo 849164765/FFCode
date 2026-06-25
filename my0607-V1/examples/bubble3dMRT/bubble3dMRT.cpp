@@ -70,10 +70,9 @@ void readParam() {
 
   rho_l = param_reader.getValue<T>("Two_Phase", "rho_l");
   rho_h = param_reader.getValue<T>("Two_Phase", "rho_h");
-  eta_l = param_reader.getValue<T>("Two_Phase", "eta_l");
-  eta_h = param_reader.getValue<T>("Two_Phase", "eta_h");
   Eo = param_reader.getValue<T>("Two_Phase", "Eo");
   Re = param_reader.getValue<T>("Two_Phase", "Re");
+  U_g = param_reader.getValue<T>("Two_Phase", "U_g");
 
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
@@ -83,23 +82,10 @@ void readParam() {
   // Eo = 4 * rho_h * g * r0^2 / sigma
   // If g/sigma/U_g are explicitly provided, they override the derived values.
 
-  T r0 = Bubble_Radius * Cell_Len;
-
-  if (param_reader.hasKey("Two_Phase", "g")) {
-    gravity = param_reader.getValue<T>("Two_Phase", "g");
-  } else {
-    gravity = std::pow(Re * eta_h / (rho_h * std::pow(T(2) * r0, T(1.5))), T(2));
-  }
-  if (param_reader.hasKey("Two_Phase", "sigma")) {
-    sigma = param_reader.getValue<T>("Two_Phase", "sigma");
-  } else {
-    sigma = T(4) * rho_h * gravity * r0 * r0 / Eo;
-  }
-  if (param_reader.hasKey("Two_Phase", "U_g")) {
-    U_g = param_reader.getValue<T>("Two_Phase", "U_g");
-  } else {
-    U_g = std::sqrt(gravity * T(2) * r0);
-  }
+  eta_l = T(0.6) / T(3500.0);                      // vis_low=0.6/3500 (dynamic)
+  eta_h = T(0.6) / T(35.0);                         // vis_high=0.6/35 (dynamic)
+  sigma = T(1.0e-4) * T(60.0) / T(125.0);           // surtencoefficent = 4.8e-5
+  gravity = T(1.0e-4) / T(60.0);                    // g = 1.667e-6 (positive)
 
   // Derived: Eq.(14) β=12σ/W, κ=3Wσ/2
   Beta = T(12.0) * sigma / Interface_Width;          // ~0.0612 (LB units)
@@ -124,7 +110,6 @@ void readParam() {
               << "  Center=(" << Bubble_Center[0] << ","
               << Bubble_Center[1] << "," << Bubble_Center[2] << ")\n";
     std::cout << "[Input]: rho_l=" << rho_l << " rho_h=" << rho_h
-              << " eta_l=" << eta_l << " eta_h=" << eta_h
               << " Re=" << Re << " Eo=" << Eo << "\n";
     std::cout << "[Derived]: g=" << gravity << " sigma=" << sigma
               << " U_g=" << U_g << " Ma=" << Ma << "\n";
@@ -153,6 +138,7 @@ int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag = std::uint8_t(1);
   constexpr std::uint8_t BulkFlag = std::uint8_t(2);
   constexpr std::uint8_t BouncebackFlag = std::uint8_t(4);
+  constexpr std::uint8_t PeriodicFlag = std::uint8_t(8);
 
   mpi().init(&argc, &argv);
   MPI_DEBUG_WAIT
@@ -175,6 +161,16 @@ int main(int argc, char* argv[]) {
   AABB<T, LatSet::d> domain(Vector<T, LatSet::d>(T(0), T(0), T(0)),
                             Vector<T, LatSet::d>(T(Ni * Cell_Len), T(Nj * Cell_Len), T(Nz * Cell_Len)));
 
+  // Side boundary layers (4 faces, no top/bottom)
+  AABB<T, LatSet::d> left(Vector<T, LatSet::d>(T(-Cell_Len), T(0), T(0)),
+                          Vector<T, LatSet::d>(T(0), T(Nj * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, LatSet::d> right(Vector<T, LatSet::d>(T(Ni * Cell_Len), T(0), T(0)),
+                           Vector<T, LatSet::d>(T((Ni + 1) * Cell_Len), T(Nj * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, LatSet::d> front(Vector<T, LatSet::d>(T(0), T(-Cell_Len), T(0)),
+                           Vector<T, LatSet::d>(T(Ni * Cell_Len), T(0), T(Nz * Cell_Len)));
+  AABB<T, LatSet::d> back(Vector<T, LatSet::d>(T(0), T(Nj * Cell_Len), T(0)),
+                          Vector<T, LatSet::d>(T(Ni * Cell_Len), T((Nj + 1) * Cell_Len), T(Nz * Cell_Len)));
+
   BlockGeometryHelper3D<T> GeoHelper(Ni, Nj, Nz, domain, Cell_Len, BlockCellLen);
   GeoHelper.CreateBlocks(1, mpi().getSize(), 1);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
@@ -186,6 +182,10 @@ int main(int argc, char* argv[]) {
   BlockFieldManager<FLAG, T, LatSet::d> FlagFM(Geo, VoidFlag);
   FlagFM.forEach(domain,
                  [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+  FlagFM.forEach(left, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(right, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });               
+  FlagFM.forEach(front, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(back, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
   // No-slip on all six boundaries (Safi et al. TC2)
   FlagFM.template SetupBoundary<LatSet>(domain, BouncebackFlag);
 
@@ -201,8 +201,8 @@ int main(int argc, char* argv[]) {
   using NSFIELDS = TypePack<DENSITY<T>, VELOCITY<T, LatSet::d>, POP<T, LatSet::q>,
                             FORCE<T, LatSet::d>, OMEGA<T>, PRESSURE<T>>;
   T omega_ns_init = T{1} / Tau_ns;
-  ValuePack NSInitValues(T{1}, Vector<T, LatSet::d>{T{0}},
-                         T{}, Vector<T, LatSet::d>{T{0}}, omega_ns_init, T{});
+  ValuePack NSInitValues(T{1}, Vector<T, LatSet::d>{T{0}, T{0}, T{0}}, 
+                         T{}, Vector<T, LatSet::d>{T{0},T{0},T{0}}, omega_ns_init, T{});
   using NSCELL = Cell<T, LatSet, NSFIELDS>;
   BlockLatticeManager<T, LatSet, NSFIELDS> NSLattice(Geo, NSInitValues, BaseConv);
 
@@ -215,8 +215,8 @@ int main(int argc, char* argv[]) {
                             ff::DELTARHO<T>>;
   using PFFIELDREFS = TypePack<VELOCITY<T, LatSet::d>>;
   using PFFIELDPACK = TypePack<PFFIELDS, PFFIELDREFS>;
-  ValuePack PFInitValues(T{}, T{}, Vector<T, LatSet::d>{T{0}},
-                         Vector<T, LatSet::d>{T{0}}, Interface_Width,
+  ValuePack PFInitValues(T{}, T{}, Vector<T, LatSet::d>{T{0},T{0},T{0}},
+                         Vector<T, LatSet::d>{T{0},T{0},T{0}}, Interface_Width,
                          T{}, T{},
                          gravity, Beta, Kappa, rho_l, rho_h, eta_l, eta_h,
                          rho_h - rho_l);
@@ -242,6 +242,7 @@ int main(int argc, char* argv[]) {
   T W_phys = Interface_Width * Cell_Len;
 
   auto& phiField = PFLattice.getField<PHI<T>>();
+  #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
@@ -266,7 +267,7 @@ int main(int argc, char* argv[]) {
       }
     }
   }
-
+#pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int block_idx = 0; block_idx < Geo.getBlockNum(); ++block_idx) {
     auto& blockLat = PFLattice.getBlockLat(block_idx);
     auto& blockPhiField = phiField.getBlockField(block_idx);
@@ -300,6 +301,7 @@ int main(int argc, char* argv[]) {
   // Actual density enters via DENSITY field (set by FFRhoOmegaUpdate3D from phi).
   Vector<T, LatSet::d> u_zero{T{0}};
   T p_init = T{0};
+  #pragma omp parallel for num_threads(Thread_Num) schedule(static)
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
     const auto& proj = block.getProjection();
@@ -333,12 +335,35 @@ int main(int argc, char* argv[]) {
                             BlockFieldManager<FLAG, T, LatSet::d>>
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
-  // No periodic BCs: all boundaries are no-slip (Safi et al. TC2)
+  // Periodic BC on 4 side faces (X and Y directions)
+  using LM_NS = BlockLatticeManager<T, LatSet, NSFIELDS>;
+  using LM_PF = BlockLatticeManager<T, LatSet, PFFIELDPACK>;
+  using FM = BlockFieldManager<FLAG, T, LatSet::d>;
+
+  FixedPeriodicBoundaryManager<LM_NS, FM>
+    NS_Periodic("NS_Periodic", NSLattice, FlagFM, PeriodicFlag, VoidFlag);
+  NS_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  NS_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+  NS_Periodic.Setup(front, NbrDirection::YN, back, NbrDirection::YP);
+  NS_Periodic.Setup(back, NbrDirection::YP, front, NbrDirection::YN);
+
+  FixedPeriodicBoundaryManager<LM_PF, FM>
+    PF_Periodic("PF_Periodic", PFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  PF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  PF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+  PF_Periodic.Setup(front, NbrDirection::YN, back, NbrDirection::YP);
+  PF_Periodic.Setup(back, NbrDirection::YP, front, NbrDirection::YN);
+
+#ifdef MPI_ENABLED
+  NS_Periodic.SetupMPI(GeoHelper);
+  PF_Periodic.SetupMPI(GeoHelper);
+#endif
 
   // ------------------ define tasks ------------------
   // NS task: MRTForce with Guo force (moment-space equivalent of BGKForce)
   using NSBulkTask = tmp::Key_TypePair<BulkFlag, collision::MRTForce<NSCELL, FORCE<T, LatSet::d>>>;
-  using NSAllTasks = tmp::TupleWrapper<NSBulkTask>;
+  using NSPeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision ::PeriodicBoundary<NSCELL>>;
+  using NSAllTasks = tmp::TupleWrapper<NSBulkTask, NSPeriodicTask>;
   using NSTaskSelector = tmp::TaskSelector<NSAllTasks, std::uint8_t, NSCELL>;
 
   // PF tasks: FF3D (∇φ + n), FFLaplacian3D (∇²φ), FFChemPotential3D (λ)
@@ -360,7 +385,8 @@ int main(int argc, char* argv[]) {
       NORMAL<T, LatSet::d>,
       true,    // WriteToField
       true>>;  // UseCHRelaxation (Fortran-aligned rtvec)
-  using PFAllTasks = tmp::TupleWrapper<PFCollisionTask>;
+  using PFPeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision::PeriodicBoundary<PFCELL>>;
+  using PFAllTasks = tmp::TupleWrapper<PFCollisionTask, PFPeriodicTask>;
   using PFCollisionTaskSelector = tmp::TaskSelector<PFAllTasks, std::uint8_t, PFCELL>;
 
   // ---- Coupling tasks (PF → NS) ----
@@ -383,7 +409,7 @@ int main(int argc, char* argv[]) {
   BlockLatManagerCoupling RhoOmegaCoupling(PFLattice, NSLattice);
 
   using PreForceTask =
-    tmp::Key_TypePair<BulkFlag, ff::FFPreForce3D<PFCELL, NSCELL>>;
+    tmp::Key_TypePair<BulkFlag, ff::FFPreForce3DM<PFCELL, NSCELL>>;
   using PreForceTaskSelector =
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PreForceTask>;
   BlockLatManagerCoupling PreForceCoupling(PFLattice, NSLattice);
@@ -465,10 +491,105 @@ int main(int argc, char* argv[]) {
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
     PF_BB.Apply(MainLoopTimer());
+    // D1a: Set PF Z ghost cell POPs to wall cell POPs
+    // Z ghost cells at physical walls are not in any SharedComm and are
+    // corrupted by pointer rotation (streaming). Their stale POPs are pulled
+    // into wall cells during streaming, causing pressure/phi errors that
+    // propagate to internal cells and eventually cause NaN.
+    // Fix: copy wall cell POPs to ghost cell POPs (zero-gradient condition).
+    {
+      T Lz_global = T(Nz) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockLat = PFLattice.getBlockLat(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int nz = block.getNz();
+        int overlap = block.getOverlap();
+        T minZ = block.getMin()[2];
+        T maxZ = block.getMax()[2];
+        if (minZ < Cell_Len * T(1.5)) {
+          for (int k = 0; k < overlap; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                std::size_t id_wall = overlap * proj[2] + j * proj[1] + i;
+                PFCELL ghost_cell(id_ghost, blockLat);
+                PFCELL wall_cell(id_wall, blockLat);
+                for (unsigned int kk = 0; kk < LatSet::q; ++kk) {
+                  ghost_cell[kk] = wall_cell[kk];
+                }
+              }
+            }
+          }
+        }
+        if (maxZ > Lz_global - Cell_Len * T(1.5)) {
+          for (int k = nz - overlap; k < nz; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                std::size_t id_wall = (nz - 1 - overlap) * proj[2] + j * proj[1] + i;
+                PFCELL ghost_cell(id_ghost, blockLat);
+                PFCELL wall_cell(id_wall, blockLat);
+                for (unsigned int kk = 0; kk < LatSet::q; ++kk) {
+                  ghost_cell[kk] = wall_cell[kk];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
     // D2: NS bounceback + stream
     NS_BB.Apply(MainLoopTimer());
+    // D2a: Set NS Z ghost cell POPs to wall cell POPs (same rationale as D1a)
+    {
+      T Lz_global = T(Nz) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockLat = NSLattice.getBlockLat(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int nz = block.getNz();
+        int overlap = block.getOverlap();
+        T minZ = block.getMin()[2];
+        T maxZ = block.getMax()[2];
+        if (minZ < Cell_Len * T(1.5)) {
+          for (int k = 0; k < overlap; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                std::size_t id_wall = overlap * proj[2] + j * proj[1] + i;
+                NSCELL ghost_cell(id_ghost, blockLat);
+                NSCELL wall_cell(id_wall, blockLat);
+                for (unsigned int kk = 0; kk < LatSet::q; ++kk) {
+                  ghost_cell[kk] = wall_cell[kk];
+                }
+              }
+            }
+          }
+        }
+        if (maxZ > Lz_global - Cell_Len * T(1.5)) {
+          for (int k = nz - overlap; k < nz; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                std::size_t id_wall = (nz - 1 - overlap) * proj[2] + j * proj[1] + i;
+                NSCELL ghost_cell(id_ghost, blockLat);
+                NSCELL wall_cell(id_wall, blockLat);
+                for (unsigned int kk = 0; kk < LatSet::q; ++kk) {
+                  ghost_cell[kk] = wall_cell[kk];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
     NSLattice.Stream();
     NSLattice.NormalCommunicate();
 
@@ -580,6 +701,46 @@ int main(int argc, char* argv[]) {
     }
     // E2a: Re-communicate PHI after wall modification (ghost cells need updated phi)
     PFLattice.getField<PHI<T>>().Communicate();
+
+    // E2b: Set PHI at Z ghost cells (physical wall ghost cells are NOT in any
+    // SharedComm — they are "三不管" zones: block comm doesn't cover them,
+    // BBLikeFixedBlockBdManager only processes internal cells, and no diagonal
+    // neighbor can fill them. FF3D::apply reads PHI from all neighbors
+    // including these stale ghost cells, causing incorrect gradient at wall
+    // cells and eventual NaN.)
+    {
+      auto& phiField = PFLattice.getField<PHI<T>>();
+      T Lz_global = T(Nz) * Cell_Len;
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockPhi = phiField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int nz = block.getNz();
+        int overlap = block.getOverlap();
+        T minZ = block.getMin()[2];
+        T maxZ = block.getMax()[2];
+        if (minZ < Cell_Len * T(1.5)) {
+          for (int k = 0; k < overlap; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                blockPhi.get(k * proj[2] + j * proj[1] + i) = T{1};
+              }
+            }
+          }
+        }
+        if (maxZ > Lz_global - Cell_Len * T(1.5)) {
+          for (int k = nz - overlap; k < nz; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                blockPhi.get(k * proj[2] + j * proj[1] + i) = T{1};
+              }
+            }
+          }
+        }
+      }
+    }
 
     // E3: Gradients, normal, laplacian, chempot (Fortran computeOrderMacro)
     PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
@@ -764,6 +925,55 @@ int main(int argc, char* argv[]) {
     }
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
+    // E4a: Extrapolate GRAD, NORMAL, CHEMPOT to Z ghost cells
+    // (same "三不管" issue as E2b — these fields are not in SharedComm at
+    // physical wall ghost cells, so they remain stale after Communicate)
+    {
+      T Lz_global = T(Nz) * Cell_Len;
+      auto& gradField = PFLattice.getField<GRAD<T, LatSet::d>>();
+      auto& normField = PFLattice.getField<NORMAL<T, LatSet::d>>();
+      auto& chmField = PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockGrad = gradField.getBlockField(blockid);
+        auto& blockNorm = normField.getBlockField(blockid);
+        auto& blockChm = chmField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int nz = block.getNz();
+        int overlap = block.getOverlap();
+        T minZ = block.getMin()[2];
+        T maxZ = block.getMax()[2];
+        if (minZ < Cell_Len * T(1.5)) {
+          for (int k = 0; k < overlap; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_wall = overlap * proj[2] + j * proj[1] + i;
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                blockGrad.get(id_ghost) = blockGrad.get(id_wall);
+                blockNorm.get(id_ghost) = blockNorm.get(id_wall);
+                blockChm.get(id_ghost) = blockChm.get(id_wall);
+              }
+            }
+          }
+        }
+        if (maxZ > Lz_global - Cell_Len * T(1.5)) {
+          for (int k = nz - overlap; k < nz; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_wall = (nz - 1 - overlap) * proj[2] + j * proj[1] + i;
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                blockGrad.get(id_ghost) = blockGrad.get(id_wall);
+                blockNorm.get(id_ghost) = blockNorm.get(id_wall);
+                blockChm.get(id_ghost) = blockChm.get(id_wall);
+              }
+            }
+          }
+        }
+      }
+    }
+
     // E5: NS macro from streamed pops (Fortran computeMacro: p=Σf, u=Σe*f+0.5*F/ρ)
     {
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -800,6 +1010,68 @@ int main(int argc, char* argv[]) {
               }
               blockPres.get(id) = pres;
               blockVel.get(id) = u;
+            }
+          }
+        }
+      }
+    }
+
+    // E5a: Communicate NS macro fields to ghost cells every step
+    // (PF collision references NS velocity; PreForce references PRESSURE;
+    //  ViscoForce/MRTForce reference DENSITY and OMEGA; stale ghost values
+    //  cause feedback loop leading to exponential growth and NaN)
+    NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
+    NSLattice.getField<PRESSURE<T>>().Communicate();
+    NSLattice.getField<DENSITY<T>>().Communicate();
+    NSLattice.getField<OMEGA<T>>().Communicate();
+
+    // E5b: Extrapolate NS macro fields to Z ghost cells
+    // (same "三不管" issue — VELOCITY is read from neighbors by bounceback BC,
+    // and all NS fields need correct ghost values for coupling calculations)
+    {
+      T Lz_global = T(Nz) * Cell_Len;
+      auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
+      auto& presField = NSLattice.getField<PRESSURE<T>>();
+      auto& rhoField = NSLattice.getField<DENSITY<T>>();
+      auto& omegaField = NSLattice.getField<OMEGA<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockVel = velField.getBlockField(blockid);
+        auto& blockPres = presField.getBlockField(blockid);
+        auto& blockRho = rhoField.getBlockField(blockid);
+        auto& blockOmega = omegaField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int nz = block.getNz();
+        int overlap = block.getOverlap();
+        T minZ = block.getMin()[2];
+        T maxZ = block.getMax()[2];
+        if (minZ < Cell_Len * T(1.5)) {
+          for (int k = 0; k < overlap; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_wall = overlap * proj[2] + j * proj[1] + i;
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                blockVel.get(id_ghost) = blockVel.get(id_wall);
+                blockPres.get(id_ghost) = blockPres.get(id_wall);
+                blockRho.get(id_ghost) = blockRho.get(id_wall);
+                blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+              }
+            }
+          }
+        }
+        if (maxZ > Lz_global - Cell_Len * T(1.5)) {
+          for (int k = nz - overlap; k < nz; ++k) {
+            for (int j = 0; j < ny; ++j) {
+              for (int i = 0; i < nx; ++i) {
+                std::size_t id_wall = (nz - 1 - overlap) * proj[2] + j * proj[1] + i;
+                std::size_t id_ghost = k * proj[2] + j * proj[1] + i;
+                blockVel.get(id_ghost) = blockVel.get(id_wall);
+                blockPres.get(id_ghost) = blockPres.get(id_wall);
+                blockRho.get(id_ghost) = blockRho.get(id_wall);
+                blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+              }
             }
           }
         }
