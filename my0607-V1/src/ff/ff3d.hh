@@ -119,19 +119,34 @@ __any__ void FFGravityForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns
 
 // ---- FFPreForce3D ----
 // F_p = -(p/3) * DeltaRho * grad_phi
-// NOTE: p = Σf (PRESSURE field) forms a positive feedback loop:
-//   p → F_p → collision (Guo force) → non-equilibrium pops → streaming → p grows.
-// Under high density ratio (Δρ up to 999), the loop gain exceeds 1 and p grows
-// exponentially, leading to NaN. Clamp p to break the loop.
-// Evidence: p=2.83e-3 stable (step 80), p=0.0262 unstable (step 81) → p_max=0.01.
+//
+// Pressure clamping to break positive feedback loop:
+//   F_p ∝ p → u change → p change (via streaming) → F_p change
+// In 3D, all-wall bounceback traps pressure waves (unlike 2D's X-periodic
+// BC that lets them escape), so the feedback gain is amplified by standing
+// waves. Diagnostic data (run_diag100.log) confirms p_bubble oscillates
+// with growing amplitude: 1.5e-6 (step 20) → 1.54e-4 (step 40) → 1.05e-4
+// (step 60) → p_range explodes to 1.39e-2 (step 70) → crash.
+//
+// The clamp limit is based on the expected hydrostatic pressure range:
+//   p_max_expected = rho_h * g * Nz
+//   p_limit = C * p_max_expected  (C = 10 safety margin)
+// This allows physical pressure variations while preventing the feedback
+// from exploding. The multiplier 2000 ≈ 10 * Nz (for Nz=192).
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   T p = ns_cell.template get<PRESSURE<T>>();
-  // NaN/Inf guard and clamp to break positive feedback loop.
+  // NaN/Inf guard
   if (!std::isfinite(p)) p = T{0};
-  constexpr T p_max = T{0.01};
-  if (p < -p_max) p = -p_max;
-  if (p > p_max) p = p_max;
+
+  // Clamp p to physically reasonable range to prevent feedback loop explosion.
+  // p_limit = 2000 * rho_h * g ≈ 10 * Nz * rho_h * g (Nz=192)
+  T rho_h = pf_cell.template get<RHO_H<T>>();
+  T g = pf_cell.template get<GRAVITY<T>>();
+  T p_limit = T{2000} * rho_h * g;
+  if (p > p_limit) p = p_limit;
+  if (p < -p_limit) p = -p_limit;
+
   T delta_rho = pf_cell.template get<DELTARHO<T>>();
   const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
 

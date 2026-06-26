@@ -149,15 +149,15 @@ void readParam() {
 
 }
 
-// Set phi=1 on all no-slip wall cells, including the domain-boundary ghost
-// layers, edges and corners.  Called once during init and again each time step
-// after phi is reconstructed from the PF populations.
+// Set phi=1 on Z-direction no-slip wall cells (top/bottom), including ghost
+// layers.  X/Y boundaries are periodic, so their ghost cells are filled by
+// FixedPeriodicBoundaryManager, NOT set to phi=1 here.
+// Called once during init and again each time step after phi is reconstructed
+// from the PF populations.
 template <typename T, typename LatSet>
 void applyWallPhi(BlockGeometry3D<T>& Geo,
                   BlockFieldManager<GenericField<GenericArray<T>, PHIBase>, T, LatSet::d>& phiField,
                   T Cell_Len) {
-  T Lx_global = T(Geo.getNx()) * Cell_Len;
-  T Ly_global = T(Geo.getNy()) * Cell_Len;
   T Lz_global = T(Geo.getNz()) * Cell_Len;
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
@@ -167,56 +167,8 @@ void applyWallPhi(BlockGeometry3D<T>& Geo,
     int ny = block.getNy();
     int nz = block.getNz();
     int overlap = block.getOverlap();
-    T minX = block.getMin()[0];
-    T maxX = block.getMax()[0];
-    T minY = block.getMin()[1];
-    T maxY = block.getMax()[1];
     T minZ = block.getMin()[2];
     T maxZ = block.getMax()[2];
-    // x = 0 face (full y/z range, including edges/corners)
-    if (minX < Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k) {
-        for (int j = 0; j < ny; ++j) {
-          for (int i = 0; i <= overlap; ++i) {
-            std::size_t id = k * proj[2] + j * proj[1] + i;
-            blockPhi.get(id) = T{1};
-          }
-        }
-      }
-    }
-    // x = Ni-1 face
-    if (maxX > Lx_global - Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k) {
-        for (int j = 0; j < ny; ++j) {
-          for (int i = nx - 1 - overlap; i <= nx - 1; ++i) {
-            std::size_t id = k * proj[2] + j * proj[1] + i;
-            blockPhi.get(id) = T{1};
-          }
-        }
-      }
-    }
-    // y = 0 face
-    if (minY < Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k) {
-        for (int j = 0; j <= overlap; ++j) {
-          for (int i = 0; i < nx; ++i) {
-            std::size_t id = k * proj[2] + j * proj[1] + i;
-            blockPhi.get(id) = T{1};
-          }
-        }
-      }
-    }
-    // y = Nj-1 face
-    if (maxY > Ly_global - Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k) {
-        for (int j = ny - 1 - overlap; j <= ny - 1; ++j) {
-          for (int i = 0; i < nx; ++i) {
-            std::size_t id = k * proj[2] + j * proj[1] + i;
-            blockPhi.get(id) = T{1};
-          }
-        }
-      }
-    }
     // z = 0 face
     if (minZ < Cell_Len * T(1.5)) {
       for (int k = 0; k <= overlap; ++k) {
@@ -242,18 +194,17 @@ void applyWallPhi(BlockGeometry3D<T>& Geo,
   }
 }
 
-// Reset domain-boundary ghost-layer POP to correct equilibrium values after
-// stream.  Stream (PULL scheme) leaves domain-boundary ghost cells reading
-// out-of-domain memory, and NormalCommunicate does not fill them (no
-// neighbour).  Without this reset the corrupted POP propagates inward each
-// step, producing the boundary shadow that diffuses toward the centre.
+// Reset Z-direction domain-boundary ghost-layer POP to correct equilibrium
+// values after stream.  X/Y ghost layers are filled by
+// FixedPeriodicBoundaryManager (periodic), so only Z (top/bottom walls) need
+// this reset.
+// Stream (PULL scheme) leaves domain-boundary ghost cells reading out-of-domain
+// memory, and NormalCommunicate does not fill them (no neighbour).
 //
 // PF POP  ← w[i] * 1          (phi_wall = 1, u = 0)
 // NS POP  ← 0                 (IncompressibleSecondOrder p = 0, u = 0)
 template <typename T, typename LatSet, typename PFLATMAN, typename NSLATMAN>
 void applyWallPop(BlockGeometry3D<T>& Geo, PFLATMAN& PFLattice, NSLATMAN& NSLattice, T Cell_Len) {
-  T Lx_global = T(Geo.getNx()) * Cell_Len;
-  T Ly_global = T(Geo.getNy()) * Cell_Len;
   T Lz_global = T(Geo.getNz()) * Cell_Len;
   for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
     const auto& block = Geo.getBlock(blockid);
@@ -262,19 +213,11 @@ void applyWallPop(BlockGeometry3D<T>& Geo, PFLATMAN& PFLattice, NSLATMAN& NSLatt
     int ny = block.getNy();
     int nz = block.getNz();
     int overlap = block.getOverlap();
-    T minX = block.getMin()[0];
-    T maxX = block.getMax()[0];
-    T minY = block.getMin()[1];
-    T maxY = block.getMax()[1];
     T minZ = block.getMin()[2];
     T maxZ = block.getMax()[2];
 
     auto& pfPopField = PFLattice.getBlockLat(blockid).template getField<POP<T, LatSet::q>>();
     auto& nsPopField = NSLattice.getBlockLat(blockid).template getField<POP<T, LatSet::q>>();
-    // Also reset other NS fields at domain-boundary ghost layers to prevent
-    // stale/contaminated values from being written to VTI or used by future
-    // computations.  PRESSURE=0 (IncompressibleSecondOrder p=0), VELOCITY=0
-    // (no-slip wall), DENSITY=rho_h (phi=1 corresponds to heavy fluid).
     auto& nsPresField = NSLattice.template getField<PRESSURE<T>>().getBlockField(blockid);
     auto& nsVelField = NSLattice.template getField<VELOCITY<T, LatSet::d>>().getBlockField(blockid);
     auto& nsDensField = NSLattice.template getField<DENSITY<T>>().getBlockField(blockid);
@@ -289,34 +232,6 @@ void applyWallPop(BlockGeometry3D<T>& Geo, PFLATMAN& PFLattice, NSLATMAN& NSLatt
       nsDensField.get(id) = rho_h;
     };
 
-    // x = 0 face ghost layers (i = 0 .. overlap-1)
-    if (minX < Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k)
-        for (int j = 0; j < ny; ++j)
-          for (int i = 0; i < overlap; ++i)
-            setWallPop(k * proj[2] + j * proj[1] + i);
-    }
-    // x = Ni-1 face
-    if (maxX > Lx_global - Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k)
-        for (int j = 0; j < ny; ++j)
-          for (int i = nx - overlap; i < nx; ++i)
-            setWallPop(k * proj[2] + j * proj[1] + i);
-    }
-    // y = 0 face
-    if (minY < Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k)
-        for (int j = 0; j < overlap; ++j)
-          for (int i = 0; i < nx; ++i)
-            setWallPop(k * proj[2] + j * proj[1] + i);
-    }
-    // y = Nj-1 face
-    if (maxY > Ly_global - Cell_Len * T(1.5)) {
-      for (int k = 0; k < nz; ++k)
-        for (int j = ny - overlap; j < ny; ++j)
-          for (int i = 0; i < nx; ++i)
-            setWallPop(k * proj[2] + j * proj[1] + i);
-    }
     // z = 0 face
     if (minZ < Cell_Len * T(1.5)) {
       for (int k = 0; k < overlap; ++k)
@@ -338,6 +253,7 @@ int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag = std::uint8_t(1);
   constexpr std::uint8_t BulkFlag = std::uint8_t(2);
   constexpr std::uint8_t BouncebackFlag = std::uint8_t(4);
+  constexpr std::uint8_t PeriodicFlag = std::uint8_t(8);
 
   mpi().init(&argc, &argv);
   MPI_DEBUG_WAIT
@@ -359,6 +275,16 @@ int main(int argc, char* argv[]) {
   // ------------------ define geometry ------------------
   AABB<T, LatSet::d> domain(Vector<T, LatSet::d>(T(0), T(0), T(0)),
                             Vector<T, LatSet::d>(T(Ni * Cell_Len), T(Nj * Cell_Len), T(Nz * Cell_Len)));
+  // X-periodic ghost layers (left/right)
+  AABB<T, LatSet::d> leftX(Vector<T, LatSet::d>(T(-Cell_Len), T(0), T(0)),
+                           Vector<T, LatSet::d>(T(0), T(Nj * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, LatSet::d> rightX(Vector<T, LatSet::d>(T(Ni * Cell_Len), T(0), T(0)),
+                            Vector<T, LatSet::d>(T((Ni + 1) * Cell_Len), T(Nj * Cell_Len), T(Nz * Cell_Len)));
+  // Y-periodic ghost layers (front/back)
+  AABB<T, LatSet::d> leftY(Vector<T, LatSet::d>(T(0), T(-Cell_Len), T(0)),
+                           Vector<T, LatSet::d>(T(Ni * Cell_Len), T(0), T(Nz * Cell_Len)));
+  AABB<T, LatSet::d> rightY(Vector<T, LatSet::d>(T(0), T(Nj * Cell_Len), T(0)),
+                            Vector<T, LatSet::d>(T(Ni * Cell_Len), T((Nj + 1) * Cell_Len), T(Nz * Cell_Len)));
 
   BlockGeometryHelper3D<T> GeoHelper(Ni, Nj, Nz, domain, Cell_Len, BlockCellLen);
   GeoHelper.CreateBlocks();
@@ -371,8 +297,49 @@ int main(int argc, char* argv[]) {
   BlockFieldManager<FLAG, T, LatSet::d> FlagFM(Geo, VoidFlag);
   FlagFM.forEach(domain,
                  [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
-  // No-slip on all six boundaries (Safi et al. TC2)
+  // Z-direction remains no-slip (bounceback on top/bottom walls)
+  // SetupBoundary marks domain-boundary cells as BouncebackFlag AND calls
+  // AllNormalCommunicate, which syncs flags across inter-block ghost layers.
+  // PeriodicFlag must be set AFTER SetupBoundary so AllNormalCommunicate
+  // doesn't overwrite it.
   FlagFM.template SetupBoundary<LatSet>(domain, BouncebackFlag);
+
+  // Fix: SetupBoundary marks ALL domain-boundary cells as BouncebackFlag,
+  // including X/Y periodic boundaries.  Reset X/Y boundary INTERNAL cells
+  // (excluding Z walls) back to BulkFlag so they participate in collision.
+  // Without this, X/Y boundary cells are skipped by ApplyInnerCellDynamics,
+  // and their POP retains constructor defaults (w[i]), producing p=1/6.
+  {
+    T z_inner_min = Cell_Len;
+    T z_inner_max = T(Nz - 1) * Cell_Len;
+    AABB<T, LatSet::d> xMinBulk(
+      Vector<T, LatSet::d>(T(0), T(0), z_inner_min),
+      Vector<T, LatSet::d>(Cell_Len, T(Nj) * Cell_Len, z_inner_max));
+    AABB<T, LatSet::d> xMaxBulk(
+      Vector<T, LatSet::d>(T(Ni - 1) * Cell_Len, T(0), z_inner_min),
+      Vector<T, LatSet::d>(T(Ni) * Cell_Len, T(Nj) * Cell_Len, z_inner_max));
+    AABB<T, LatSet::d> yMinBulk(
+      Vector<T, LatSet::d>(T(0), T(0), z_inner_min),
+      Vector<T, LatSet::d>(T(Ni) * Cell_Len, Cell_Len, z_inner_max));
+    AABB<T, LatSet::d> yMaxBulk(
+      Vector<T, LatSet::d>(T(0), T(Nj - 1) * Cell_Len, z_inner_min),
+      Vector<T, LatSet::d>(T(Ni) * Cell_Len, T(Nj) * Cell_Len, z_inner_max));
+    FlagFM.forEach(xMinBulk, [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+    FlagFM.forEach(xMaxBulk, [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+    FlagFM.forEach(yMinBulk, [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+    FlagFM.forEach(yMaxBulk, [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+  }
+
+  // Mark X/Y periodic ghost cells AFTER SetupBoundary (which calls
+  // AllNormalCommunicate).  This prevents AllNormalCommunicate from
+  // overwriting PeriodicFlag with the neighbour block's internal flag.
+  // BBLikeFixedBlockBdManager only bounce-backs directions where the
+  // neighbour is VoidFlag; since periodic ghost cells are PeriodicFlag
+  // (not VoidFlag), X/Y directions are exempt.
+  FlagFM.forEach(leftX, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(rightX, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(leftY, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(rightY, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
 
   // Write flag geometry for verification
   vtmo::ScalarWriter FlagWriter("flag", FlagFM);
@@ -518,7 +485,71 @@ int main(int argc, char* argv[]) {
                             BlockFieldManager<FLAG, T, LatSet::d>>
     PF_BB("PF_BB", PFLattice, FlagFM, BouncebackFlag, VoidFlag);
 
-  // No periodic BCs: all boundaries are no-slip (Safi et al. TC2)
+  // X/Y periodic BCs (Z remains no-slip walls).
+  // Lets pressure waves escape in X/Y, preventing the standing-wave feedback
+  // loop that caused p_range explosion in the all-bounceback configuration.
+  using LM_NS = BlockLatticeManager<T, LatSet, NSFIELDS>;
+  using LM_PF = BlockLatticeManager<T, LatSet, PFFIELDPACK>;
+  using FM = BlockFieldManager<FLAG, T, LatSet::d>;
+
+  FixedPeriodicBoundaryManager<LM_NS, FM>
+      NS_PeriodicX("NS_PeriodicX", NSLattice, FlagFM, PeriodicFlag, VoidFlag);
+  NS_PeriodicX.Setup(leftX, NbrDirection::XN, rightX, NbrDirection::XP);
+  NS_PeriodicX.Setup(rightX, NbrDirection::XP, leftX, NbrDirection::XN);
+
+  FixedPeriodicBoundaryManager<LM_NS, FM>
+      NS_PeriodicY("NS_PeriodicY", NSLattice, FlagFM, PeriodicFlag, VoidFlag);
+  NS_PeriodicY.Setup(leftY, NbrDirection::YN, rightY, NbrDirection::YP);
+  NS_PeriodicY.Setup(rightY, NbrDirection::YP, leftY, NbrDirection::YN);
+
+  FixedPeriodicBoundaryManager<LM_PF, FM>
+      PF_PeriodicX("PF_PeriodicX", PFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  PF_PeriodicX.Setup(leftX, NbrDirection::XN, rightX, NbrDirection::XP);
+  PF_PeriodicX.Setup(rightX, NbrDirection::XP, leftX, NbrDirection::XN);
+
+  FixedPeriodicBoundaryManager<LM_PF, FM>
+      PF_PeriodicY("PF_PeriodicY", PFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  PF_PeriodicY.Setup(leftY, NbrDirection::YN, rightY, NbrDirection::YP);
+  PF_PeriodicY.Setup(rightY, NbrDirection::YP, leftY, NbrDirection::YN);
+
+  // Set up MPI communication for cross-process periodic pairs.
+  // X periodic is same-block (X not split), but Y periodic is cross-block
+  // (Y split into 2 blocks on different processes).  Without SetupMPI,
+  // Y periodic ghost cells retain constructor defaults (w[i]), corrupting
+  // the first stream and producing p=1/6 at Y-boundary cells.
+  NS_PeriodicX.SetupMPI(GeoHelper);
+  NS_PeriodicY.SetupMPI(GeoHelper);
+  PF_PeriodicX.SetupMPI(GeoHelper);
+  PF_PeriodicY.SetupMPI(GeoHelper);
+
+  // Diagnostic: check ghost cell flags on each rank
+  {
+    int myRank = mpi().getRank();
+    for (int bi = 0; bi < Geo.getBlockNum(); ++bi) {
+      const auto& block = Geo.getBlock(bi);
+      const auto& proj = block.getProjection();
+      int nx = block.getNx();
+      int ny = block.getNy();
+      int nz = block.getNz();
+      int overlap = block.getOverlap();
+      auto& flagField = FlagFM.getBlockField(bi);
+      // Check X-max ghost (i=nx-1) and Y-min ghost (j=0) at k=overlap
+      std::size_t id_xmax = (overlap) * proj[2] + (overlap) * proj[1] + (nx - 1);
+      std::size_t id_ymin = (overlap) * proj[2] + 0 * proj[1] + overlap;
+      std::size_t id_xmin = (overlap) * proj[2] + (overlap) * proj[1] + 0;
+      std::size_t id_ymax = (overlap) * proj[2] + (ny - 1) * proj[1] + overlap;
+      std::cout << "[FLAG_DIAG] Rank=" << myRank << " block=" << bi
+                << " nx=" << nx << " ny=" << ny << " nz=" << nz
+                << " X-min-ghost(flag=" << int(flagField.get(0 * proj[2] + overlap * proj[1] + overlap)) << ")"
+                << " X-max-ghost(flag=" << int(flagField.get(id_xmax)) << ")"
+                << " Y-min-ghost(flag=" << int(flagField.get(id_ymin)) << ")"
+                << " Y-max-ghost(flag=" << int(flagField.get(id_ymax)) << ")"
+                << " BulkFlag=" << int(BulkFlag)
+                << " PeriodicFlag=" << int(PeriodicFlag)
+                << " BouncebackFlag=" << int(BouncebackFlag)
+                << std::endl;
+    }
+  }
 
   // ------------------ define tasks ------------------
   // NS task: MRTForce with Guo force (moment-space equivalent of BGKForce)
@@ -600,9 +631,16 @@ int main(int argc, char* argv[]) {
   PFLattice.NormalCommunicate();
   NSLattice.NormalCommunicate();
 
-  // Reset domain-boundary ghost-layer POP to equilibrium values.
+  // Fill X/Y periodic ghost cells with initial POP from opposite side.
+  // Must be called before applyWallPop (which only resets Z ghost cells).
+  PF_PeriodicX.Apply();
+  PF_PeriodicY.Apply();
+  NS_PeriodicX.Apply();
+  NS_PeriodicY.Apply();
+
+  // Reset Z-direction domain-boundary ghost-layer POP to equilibrium values.
   // NormalCommunicate only fills inter-block ghost cells (that have a
-  // neighbour); domain-boundary ghost cells have no neighbour and retain
+  // neighbour); Z domain-boundary ghost cells have no neighbour and retain
   // whatever stream left there.  Without this reset the corrupted POP
   // propagates inward each step, producing the boundary shadow.
   applyWallPop<T, LatSet, decltype(PFLattice), decltype(NSLattice)>(Geo, PFLattice, NSLattice, Cell_Len);
@@ -640,57 +678,9 @@ int main(int argc, char* argv[]) {
   while (MainLoopTimer() < MaxStep) {
     // ===== Fortran-aligned: force → PF collision → NS collision → stream → macro =====
 
-    // #region debug-point A:track-cell-start
-    // Track cell (27,44,43) in block 0 at each step to diagnose NS pop NaN
-    // Only process 0 (block 0 owner) outputs
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
-      auto& dbg_nsRho = NSLattice.getField<DENSITY<T>>().getBlockField(dbg_block);
-      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
-      auto& dbg_pfPhi = PFLattice.getField<PHI<T>>().getBlockField(dbg_block);
-      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
-      T dbg_ns_sum = T{0};
-      T dbg_ns_max = T{0};
-      for (unsigned int q = 0; q < LatSet::q; ++q) {
-        dbg_ns_sum += dbg_nscell[q];
-        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
-      }
-      T dbg_rho = dbg_nsRho.get(dbg_id);
-      T dbg_phi = dbg_pfPhi.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=preA1"
-                << " phi=" << dbg_phi
-                << " rho=" << dbg_rho
-                << " ns_sum=" << dbg_ns_sum
-                << " ns_max=" << dbg_ns_max
-                << std::endl;
-    }
-    // #endregion
-
     // ---- Phase A: Force setup (Fortran computeForce) ----
     // A1: Update per-cell rho and omega from phi
     RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // #region debug-point B:after-A1
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsRho = NSLattice.getField<DENSITY<T>>().getBlockField(dbg_block);
-      T dbg_rho = dbg_nsRho.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterA1"
-                << " rho=" << dbg_rho
-                << std::endl;
-    }
-    // #endregion
 
     // A2: Clear NS FORCE to zero
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, LatSet::d>{T{0}});
@@ -698,95 +688,30 @@ int main(int argc, char* argv[]) {
     // A3: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
     STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // #region debug-point C:after-A3
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
-      const auto& F = dbg_nsForce.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterA3_Fs"
-                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
-                << std::endl;
-    }
-    // #endregion
-
     // A4: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
     GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
     PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // #region debug-point D:after-A5
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
-      const auto& F = dbg_nsForce.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterA5_FsFbFp"
-                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
-                << std::endl;
-    }
-    // #endregion
-
     // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
 
     // ---- Phase B: PF collision (Fortran collisionOrderDF2D) ----
     PFLattice.template ApplyInnerCellDynamics<PFCollisionTaskSelector>(FlagFM);
+    // Copy post-collision POP+PHI from opposite side to X/Y periodic ghost cells
+    PF_PeriodicX.Apply();
+    PF_PeriodicY.Apply();
 
     // ---- Phase C: NS collision (Fortran collisionDenDF2D) ----
     // C1: Viscous force F_v from non-equilibrium moments
     ViscoForceCoupling.ApplyInnerCellDynamics<ViscoForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // #region debug-point E:after-C1
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsForce = NSLattice.getField<FORCE<T, LatSet::d>>().getBlockField(dbg_block);
-      const auto& F = dbg_nsForce.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterC1_Ftotal"
-                << " F=[" << F[0] << "," << F[1] << "," << F[2] << "]"
-                << std::endl;
-    }
-    // #endregion
-
     // C2: MRTForce with total accumulated FORCE (F_s+F_b+F_p+F_v)
     NSLattice.template ApplyInnerCellDynamics<NSTaskSelector>(FlagFM);
-
-    // #region debug-point F:after-C2
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
-      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
-      T dbg_ns_sum = T{0};
-      T dbg_ns_max = T{0};
-      for (unsigned int q = 0; q < LatSet::q; ++q) {
-        dbg_ns_sum += dbg_nscell[q];
-        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
-      }
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterC2_collision"
-                << " ns_sum=" << dbg_ns_sum
-                << " ns_max=" << dbg_ns_max
-                << std::endl;
-    }
-    // #endregion
+    // Copy post-collision POP+DENSITY from opposite side to X/Y periodic ghost cells
+    NS_PeriodicX.Apply();
+    NS_PeriodicY.Apply();
 
     // ---- Phase D: Streaming (Fortran streamOrderDF + streamDenDF) ----
     // D1: PF bounceback + stream
@@ -804,29 +729,6 @@ int main(int argc, char* argv[]) {
     // this reset the corrupted POP propagates inward each step, producing
     // the boundary shadow that diffuses toward the centre.
     applyWallPop<T, LatSet, decltype(PFLattice), decltype(NSLattice)>(Geo, PFLattice, NSLattice, Cell_Len);
-
-    // #region debug-point G:after-stream
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsLat = NSLattice.getBlockLat(dbg_block);
-      NSCELL dbg_nscell(dbg_id, dbg_nsLat);
-      T dbg_ns_sum = T{0};
-      T dbg_ns_max = T{0};
-      for (unsigned int q = 0; q < LatSet::q; ++q) {
-        dbg_ns_sum += dbg_nscell[q];
-        if (std::abs(dbg_nscell[q]) > dbg_ns_max) dbg_ns_max = std::abs(dbg_nscell[q]);
-      }
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterStream"
-                << " ns_sum=" << dbg_ns_sum
-                << " ns_max=" << dbg_ns_max
-                << std::endl;
-    }
-    // #endregion
 
     // ---- Phase E: Macro update (Fortran: computeOrderMacro + computeMacro + setMacroOrderBC) ----
     // E1: phi from PF pops (Fortran: phi = Σ ddg)
@@ -860,6 +762,7 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
+
     // E2: phi=1 at all no-slip walls (including ghost layers, edges and corners)
     applyWallPhi<T, LatSet>(Geo, PFLattice.getField<PHI<T>>(), Cell_Len);
     // E2a: Re-communicate PHI after wall modification (ghost cells need updated phi)
@@ -874,11 +777,10 @@ int main(int argc, char* argv[]) {
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
     // E3a: Wall grad_phi special handling: copy normal component from first interior cell
-    // Only apply to blocks that actually touch a global domain boundary
+    // Only Z-direction walls (top/bottom).  X/Y are periodic, so grad at X/Y
+    // boundaries is computed normally from periodic ghost-cell phi.
     {
       auto& gradField = PFLattice.getField<GRAD<T, LatSet::d>>();
-      T Lx_global = T(Ni) * Cell_Len;
-      T Ly_global = T(Nj) * Cell_Len;
       T Lz_global = T(Nz) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
@@ -888,52 +790,8 @@ int main(int argc, char* argv[]) {
         int ny = block.getNy();
         int nz = block.getNz();
         int overlap = block.getOverlap();
-        T minX = block.getMin()[0];
-        T maxX = block.getMax()[0];
-        T minY = block.getMin()[1];
-        T maxY = block.getMax()[1];
         T minZ = block.getMin()[2];
         T maxZ = block.getMax()[2];
-        // x = 0 face: copy grad[0]
-        if (minX < Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int j = overlap; j < ny - overlap; ++j) {
-              std::size_t id0 = k * proj[2] + j * proj[1] + overlap;
-              std::size_t id1 = k * proj[2] + j * proj[1] + (overlap + 1);
-              blockGrad.get(id0)[0] = blockGrad.get(id1)[0];
-            }
-          }
-        }
-        // x = Ni-1 face
-        if (maxX > Lx_global - Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int j = overlap; j < ny - overlap; ++j) {
-              std::size_t id0 = k * proj[2] + j * proj[1] + (nx - 1 - overlap);
-              std::size_t id1 = k * proj[2] + j * proj[1] + (nx - 2 - overlap);
-              blockGrad.get(id0)[0] = blockGrad.get(id1)[0];
-            }
-          }
-        }
-        // y = 0 face: copy grad[1]
-        if (minY < Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int i = overlap; i < nx - overlap; ++i) {
-              std::size_t id0 = k * proj[2] + overlap * proj[1] + i;
-              std::size_t id1 = k * proj[2] + (overlap + 1) * proj[1] + i;
-              blockGrad.get(id0)[1] = blockGrad.get(id1)[1];
-            }
-          }
-        }
-        // y = Nj-1 face
-        if (maxY > Ly_global - Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int i = overlap; i < nx - overlap; ++i) {
-              std::size_t id0 = k * proj[2] + (ny - 1 - overlap) * proj[1] + i;
-              std::size_t id1 = k * proj[2] + (ny - 2 - overlap) * proj[1] + i;
-              blockGrad.get(id0)[1] = blockGrad.get(id1)[1];
-            }
-          }
-        }
         // z = 0 face: copy grad[2]
         if (minZ < Cell_Len * T(1.5)) {
           for (int j = overlap; j < ny - overlap; ++j) {
@@ -957,12 +815,10 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // E4: Chempot extrapolation at all walls (Fortran setMacroOrderBC chpoten)
-    // Only apply to blocks that actually touch a global domain boundary
+    // E4: Chempot extrapolation at Z walls (Fortran setMacroOrderBC chpoten)
+    // Only Z-direction walls.  X/Y are periodic.
     {
       auto& chpotenField = PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
-      T Lx_global = T(Ni) * Cell_Len;
-      T Ly_global = T(Nj) * Cell_Len;
       T Lz_global = T(Nz) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
@@ -972,56 +828,8 @@ int main(int argc, char* argv[]) {
         int ny = block.getNy();
         int nz = block.getNz();
         int overlap = block.getOverlap();
-        T minX = block.getMin()[0];
-        T maxX = block.getMax()[0];
-        T minY = block.getMin()[1];
-        T maxY = block.getMax()[1];
         T minZ = block.getMin()[2];
         T maxZ = block.getMax()[2];
-        // x = 0 face
-        if (minX < Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int j = overlap; j < ny - overlap; ++j) {
-              std::size_t id1 = k * proj[2] + j * proj[1] + overlap;
-              std::size_t id2 = k * proj[2] + j * proj[1] + (overlap + 1);
-              std::size_t id3 = k * proj[2] + j * proj[1] + (overlap + 2);
-              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
-            }
-          }
-        }
-        // x = Ni-1 face
-        if (maxX > Lx_global - Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int j = overlap; j < ny - overlap; ++j) {
-              std::size_t id1 = k * proj[2] + j * proj[1] + (nx - 1 - overlap);
-              std::size_t id2 = k * proj[2] + j * proj[1] + (nx - 2 - overlap);
-              std::size_t id3 = k * proj[2] + j * proj[1] + (nx - 3 - overlap);
-              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
-            }
-          }
-        }
-        // y = 0 face
-        if (minY < Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int i = overlap; i < nx - overlap; ++i) {
-              std::size_t id1 = k * proj[2] + overlap * proj[1] + i;
-              std::size_t id2 = k * proj[2] + (overlap + 1) * proj[1] + i;
-              std::size_t id3 = k * proj[2] + (overlap + 2) * proj[1] + i;
-              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
-            }
-          }
-        }
-        // y = Nj-1 face
-        if (maxY > Ly_global - Cell_Len * T(1.5)) {
-          for (int k = overlap; k < nz - overlap; ++k) {
-            for (int i = overlap; i < nx - overlap; ++i) {
-              std::size_t id1 = k * proj[2] + (ny - 1 - overlap) * proj[1] + i;
-              std::size_t id2 = k * proj[2] + (ny - 2 - overlap) * proj[1] + i;
-              std::size_t id3 = k * proj[2] + (ny - 3 - overlap) * proj[1] + i;
-              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
-            }
-          }
-        }
         // z = 0 face
         if (minZ < Cell_Len * T(1.5)) {
           for (int j = overlap; j < ny - overlap; ++j) {
@@ -1090,25 +898,6 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // #region debug-point H:after-E5
-    if (mpi().isMainProcessor() && MainLoopTimer() >= 75) {
-      int dbg_block = 0;
-      int dbg_i = 27, dbg_j = 44, dbg_k = 43;
-      const auto& dbg_block_ref = Geo.getBlock(dbg_block);
-      const auto& dbg_proj = dbg_block_ref.getProjection();
-      std::size_t dbg_id = dbg_k * dbg_proj[2] + dbg_j * dbg_proj[1] + dbg_i;
-      auto& dbg_nsPres = NSLattice.getField<PRESSURE<T>>().getBlockField(dbg_block);
-      auto& dbg_nsVel = NSLattice.getField<VELOCITY<T, LatSet::d>>().getBlockField(dbg_block);
-      T dbg_pres = dbg_nsPres.get(dbg_id);
-      const auto& dbg_vel = dbg_nsVel.get(dbg_id);
-      std::cout << "[DBG] Step=" << MainLoopTimer()
-                << " phase=afterE5_macro"
-                << " pres=" << dbg_pres
-                << " vel=[" << dbg_vel[0] << "," << dbg_vel[1] << "," << dbg_vel[2] << "]"
-                << std::endl;
-    }
-    // #endregion
-
     // E5a: Zero out velocity at BouncebackFlag cells (wall cells should have u=0)
     // E5 computes u = u_raw + 0.5*F/rho for ALL internal cells including
     // BouncebackFlag, but BouncebackFlag cells are not collided (no MRTForce),
@@ -1134,6 +923,233 @@ int main(int argc, char* argv[]) {
           }
         }
       }
+    }
+
+    // ===== [DIAG] pressure profile along z-axis (x=48.5, y=48.5) =====
+    // Checks pressure at bottom (z=0.5), bubble (z=48.5), mid (z=95.5), top (z=191.5)
+    // Pressure wave travels at cs≈0.577 grid/step, so from bottom (z=0) to
+    // bubble (z=48) takes ~83 steps.  Run for 200 steps to see gradient form
+    // and verify p clamping stabilizes the feedback loop.
+    if (MainLoopTimer() < 200 && MainLoopTimer() % 20 == 0) {
+      T p_bottom = T{0}, p_bubble = T{0}, p_mid = T{0}, p_top = T{0};
+      T pmin_l = T(1e30), pmax_l = T(-1e30);
+      // Track pmax cell location for step-0 diagnosis
+      T pmax_x = T{0}, pmax_y = T{0}, pmax_z = T{0};
+      int pmax_block = -1, pmax_li = -1, pmax_lj = -1, pmax_lk = -1;
+      auto& presField = NSLattice.getField<PRESSURE<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockPres = presField.getBlockField(blockid);
+        int overlap = block.getOverlap();
+        T gx = block.getMinCenter()[0];
+        T gy = block.getMinCenter()[1];
+        T gz = block.getMinCenter()[2];
+        int nx = block.getNx(), ny = block.getNy(), nz = block.getNz();
+        for (int k = overlap; k < nz - overlap; ++k) {
+          for (int j = overlap; j < ny - overlap; ++j) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              T x = gx + T(i) * Cell_Len;
+              T y = gy + T(j) * Cell_Len;
+              T z = gz + T(k) * Cell_Len;
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              T p = blockPres.get(id);
+              if (p < pmin_l) pmin_l = p;
+              if (p > pmax_l) {
+                pmax_l = p;
+                pmax_x = x; pmax_y = y; pmax_z = z;
+                pmax_block = blockid;
+                pmax_li = i; pmax_lj = j; pmax_lk = k;
+              }
+              if (std::abs(x - T{48.5}) < T{0.5} && std::abs(y - T{48.5}) < T{0.5}) {
+                if (std::abs(z - T{0.5}) < T{0.5}) p_bottom = p;
+                else if (std::abs(z - T{48.5}) < T{0.5}) p_bubble = p;
+                else if (std::abs(z - T{95.5}) < T{0.5}) p_mid = p;
+                else if (std::abs(z - T{191.5}) < T{0.5}) p_top = p;
+              }
+            }
+          }
+        }
+      }
+#ifdef MPI_ENABLED
+      mpi().reduceAndBcast<T>(pmin_l, MPI_MIN);
+      mpi().reduceAndBcast<T>(pmax_l, MPI_MAX);
+      mpi().reduceAndBcast<T>(p_bottom, MPI_SUM);
+      mpi().reduceAndBcast<T>(p_bubble, MPI_SUM);
+      mpi().reduceAndBcast<T>(p_mid, MPI_SUM);
+      mpi().reduceAndBcast<T>(p_top, MPI_SUM);
+#endif
+      if (mpi().isMainProcessor()) {
+        T dpdz_bubble = (p_top - p_bottom) / T{191};
+        std::cout << "[DIAG] Step=" << MainLoopTimer()
+                  << " p_range=[" << pmin_l << "," << pmax_l << "]"
+                  << " p_bottom=" << p_bottom
+                  << " p_bubble=" << p_bubble
+                  << " p_mid=" << p_mid
+                  << " p_top=" << p_top
+                  << " dpdz_full=" << dpdz_bubble
+                  << " (expected ~" << -rho_h * gravity << ")" << std::endl;
+      }
+      // ===== Step-0 pmax detailed diagnosis =====
+      // Print pmax cell's POP values to identify the source of p=1/6 anomaly
+      if (MainLoopTimer() == 0) {
+        // Find pmax cell again on the rank that owns it
+        T local_pmax = T(-1e30);
+        int local_pmax_block = -1;
+        int local_pmax_li = -1, local_pmax_lj = -1, local_pmax_lk = -1;
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& blockPres = presField.getBlockField(blockid);
+          int overlap = block.getOverlap();
+          int nx = block.getNx(), ny = block.getNy(), nz = block.getNz();
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              for (int i = overlap; i < nx - overlap; ++i) {
+                std::size_t id = k * proj[2] + j * proj[1] + i;
+                T p = blockPres.get(id);
+                if (p > local_pmax) {
+                  local_pmax = p;
+                  local_pmax_block = blockid;
+                  local_pmax_li = i; local_pmax_lj = j; local_pmax_lk = k;
+                }
+              }
+            }
+          }
+        }
+        // Gather all local pmax values to find the global winner
+        struct PmaxInfo { T val; int rank; int block; int li; int lj; int lk; };
+        PmaxInfo my_info{local_pmax, mpi().getRank(), local_pmax_block,
+                         local_pmax_li, local_pmax_lj, local_pmax_lk};
+#ifdef MPI_ENABLED
+        PmaxInfo all_info[8];
+        MPI_Allgather(&my_info, sizeof(PmaxInfo), MPI_BYTE,
+                      all_info, sizeof(PmaxInfo), MPI_BYTE, MPI_COMM_WORLD);
+        int winner = 0;
+        for (int r = 1; r < mpi().getSize(); ++r) {
+          if (all_info[r].val > all_info[winner].val) winner = r;
+        }
+#else
+        PmaxInfo all_info[1] = {my_info};
+        int winner = 0;
+#endif
+        // The winning rank prints its pmax cell details
+        if (mpi().getRank() == all_info[winner].rank) {
+          const auto& block = Geo.getBlock(all_info[winner].block);
+          const auto& proj = block.getProjection();
+          auto& blockLat = NSLattice.getBlockLat(all_info[winner].block);
+          auto& blockPres2 = presField.getBlockField(all_info[winner].block);
+          auto& blockFlag = FlagFM.getBlockField(all_info[winner].block);
+          int overlap = block.getOverlap();
+          int li = all_info[winner].li, lj = all_info[winner].lj, lk = all_info[winner].lk;
+          std::size_t id = lk * proj[2] + lj * proj[1] + li;
+          T gx = block.getMinCenter()[0], gy = block.getMinCenter()[1], gz = block.getMinCenter()[2];
+          T x = gx + T(li) * Cell_Len, y = gy + T(lj) * Cell_Len, z = gz + T(lk) * Cell_Len;
+
+          std::cout << "[PMAX_DIAG] Step=0 pmax=" << blockPres2.get(id)
+                    << " at global=(" << x << "," << y << "," << z << ")"
+                    << " block=" << all_info[winner].block
+                    << " local=(" << li << "," << lj << "," << lk << ")"
+                    << " overlap=" << overlap
+                    << " nx=" << block.getNx() << " ny=" << block.getNy() << " nz=" << block.getNz()
+                    << " flag=" << int(blockFlag.get(id))
+                    << std::endl;
+
+          // Print all 19 POP values
+          NSCELL cell(id, blockLat);
+          T p_sum = T{0};
+          std::cout << "[PMAX_DIAG] POP values:" << std::endl;
+          for (unsigned int qi = 0; qi < LatSet::q; ++qi) {
+            const auto& ci = latset::c<LatSet>(qi);
+            T wi = latset::w<LatSet>(qi);
+            T fi = cell[qi];
+            p_sum += fi;
+            std::cout << "  i=" << qi
+                      << " c=(" << int(ci[0]) << "," << int(ci[1]) << "," << int(ci[2]) << ")"
+                      << " w=" << wi
+                      << " f=" << fi
+                      << " (f-w=" << (fi - wi) << ")"
+                      << std::endl;
+          }
+          std::cout << "[PMAX_DIAG] sum_f=" << p_sum << " pressure_field=" << blockPres2.get(id) << std::endl;
+
+          // Also check if this cell is near a block boundary
+          int dist_to_min_x = li - overlap;
+          int dist_to_min_y = lj - overlap;
+          int dist_to_min_z = lk - overlap;
+          int dist_to_max_x = block.getNx() - 1 - overlap - li;
+          int dist_to_max_y = block.getNy() - 1 - overlap - lj;
+          int dist_to_max_z = block.getNz() - 1 - overlap - lk;
+          std::cout << "[PMAX_DIAG] dist_to_boundary: x_min=" << dist_to_min_x
+                    << " x_max=" << dist_to_max_x
+                    << " y_min=" << dist_to_min_y
+                    << " y_max=" << dist_to_max_y
+                    << " z_min=" << dist_to_min_z
+                    << " z_max=" << dist_to_max_z
+                    << " (0=first internal, 1=second internal)" << std::endl;
+
+          // Check block's global position
+          std::cout << "[PMAX_DIAG] block min=(" << block.getMin()[0] << "," << block.getMin()[1] << "," << block.getMin()[2] << ")"
+                    << " max=(" << block.getMax()[0] << "," << block.getMax()[1] << "," << block.getMax()[2] << ")"
+                    << " minCenter=(" << block.getMinCenter()[0] << "," << block.getMinCenter()[1] << "," << block.getMinCenter()[2] << ")"
+                    << std::endl;
+        }
+      }
+    }
+
+    // ===== phi 切片诊断（每 20 步打印界面锐度统计）=====
+    if (MainLoopTimer() % 20 == 0 && MainLoopTimer() > 0) {
+        // 打印 y=48 切片的 phi 值（x-z 平面）
+        auto& phiField = PFLattice.getField<PHI<T>>();
+        T phi_min_l = T(2), phi_max_l = T(-1);
+        T phi_sum_l = T{0};
+        int phi_count_l = 0;
+        // 统计 phi < 0.1 和 phi > 0.9 的格点数（检查界面锐度）
+        int phi_low_count_l = 0;  // phi < 0.1（气泡内部）
+        int phi_high_count_l = 0;  // phi > 0.9（重流体）
+        int phi_mid_count_l = 0;   // 0.1 <= phi <= 0.9（界面）
+
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+            const auto& block = Geo.getBlock(blockid);
+            const auto& proj = block.getProjection();
+            auto& blockPhi = phiField.getBlockField(blockid);
+            int overlap = block.getOverlap();
+            int nx = block.getNx(), ny = block.getNy(), nz = block.getNz();
+            for (int k = overlap; k < nz - overlap; ++k) {
+                for (int j = overlap; j < ny - overlap; ++j) {
+                    for (int i = overlap; i < nx - overlap; ++i) {
+                        std::size_t id = k * proj[2] + j * proj[1] + i;
+                        T phi = blockPhi.get(id);
+                        if (phi < phi_min_l) phi_min_l = phi;
+                        if (phi > phi_max_l) phi_max_l = phi;
+                        phi_sum_l += phi;
+                        phi_count_l++;
+                        if (phi < T{0.1}) phi_low_count_l++;
+                        else if (phi > T{0.9}) phi_high_count_l++;
+                        else phi_mid_count_l++;
+                    }
+                }
+            }
+        }
+#ifdef MPI_ENABLED
+        mpi().reduceAndBcast<T>(phi_min_l, MPI_MIN);
+        mpi().reduceAndBcast<T>(phi_max_l, MPI_MAX);
+        mpi().reduceAndBcast<T>(phi_sum_l, MPI_SUM);
+        mpi().reduceAndBcast<int>(phi_count_l, MPI_SUM);
+        mpi().reduceAndBcast<int>(phi_low_count_l, MPI_SUM);
+        mpi().reduceAndBcast<int>(phi_high_count_l, MPI_SUM);
+        mpi().reduceAndBcast<int>(phi_mid_count_l, MPI_SUM);
+#endif
+        if (mpi().isMainProcessor()) {
+            T phi_avg = phi_sum_l / T(phi_count_l);
+            std::cout << "[SHAPE] Step=" << MainLoopTimer()
+                      << " phi_avg=" << phi_avg
+                      << " low(<0.1)=" << phi_low_count_l
+                      << " mid(0.1-0.9)=" << phi_mid_count_l
+                      << " high(>0.9)=" << phi_high_count_l
+                      << " ratio=" << T(phi_mid_count_l) / T(phi_count_l)
+                      << std::endl;
+        }
     }
 
     ++MainLoopTimer;
@@ -1184,99 +1200,70 @@ int main(int argc, char* argv[]) {
       }
       // === END TEMP VERIFICATION ===
 
-      // === NaN/Inf DIAGNOSTIC: locate first occurrence of non-finite values ===
+      // 气泡形状监控：计算质心、等效半径、体积（使用全局/物理坐标）
+      // 与气泡初始化一致：x = block.getMinCenter()[0] + i*voxelSize
+      // 这样跨块 MPI_SUM 才有意义，且中心可直接与 Bubble_Center=(48,48,48) 比较
       {
-        static bool nan_detected = false;
-        if (!nan_detected) {
-          bool local_nan = false;
-          std::string nan_field;
-          int nan_block = -1;
-          int nan_i = -1, nan_j = -1, nan_k = -1;
-          T nan_val = T{0};
+        T sum_phi = T{0};
+        T sum_phi_x = T{0}, sum_phi_y = T{0}, sum_phi_z = T{0};
+        int bubble_count = 0;
 
-          auto check_scalar = [&](const std::string& name, T val, int bid, int i, int j, int k) {
-            if (!local_nan && !std::isfinite(val)) {
-              local_nan = true;
-              nan_field = name;
-              nan_block = bid;
-              nan_i = i; nan_j = j; nan_k = k;
-              nan_val = val;
-            }
-          };
-          auto check_vec = [&](const std::string& name, const Vector<T, LatSet::d>& v, int bid, int i, int j, int k) {
-            for (int d = 0; d < LatSet::d; ++d) {
-              if (!local_nan && !std::isfinite(v[d])) {
-                local_nan = true;
-                nan_field = name + "[" + std::to_string(d) + "]";
-                nan_block = bid;
-                nan_i = i; nan_j = j; nan_k = k;
-                nan_val = v[d];
-              }
-            }
-          };
-
-          auto& phiField = PFLattice.getField<PHI<T>>();
-          auto& densField = NSLattice.getField<DENSITY<T>>();
-          auto& presField = NSLattice.getField<PRESSURE<T>>();
-          auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
-          auto& forceField = NSLattice.getField<FORCE<T, LatSet::d>>();
-
-          for (int blockid = 0; blockid < Geo.getBlockNum() && !local_nan; ++blockid) {
-            const auto& block = Geo.getBlock(blockid);
-            const auto& proj = block.getProjection();
-            auto& blockPhi = phiField.getBlockField(blockid);
-            auto& blockDens = densField.getBlockField(blockid);
-            auto& blockPres = presField.getBlockField(blockid);
-            auto& blockVel = velField.getBlockField(blockid);
-            auto& blockForce = forceField.getBlockField(blockid);
-            auto& blockPFLat = PFLattice.getBlockLat(blockid);
-            auto& blockNSLat = NSLattice.getBlockLat(blockid);
-            int overlap = block.getOverlap();
-            for (int k = overlap; k < block.getNz() - overlap && !local_nan; ++k) {
-              for (int j = overlap; j < block.getNy() - overlap && !local_nan; ++j) {
-                for (int i = overlap; i < block.getNx() - overlap && !local_nan; ++i) {
-                  std::size_t id = k * proj[2] + j * proj[1] + i;
-                  check_scalar("PHI", blockPhi.get(id), blockid, i, j, k);
-                  check_scalar("DENSITY", blockDens.get(id), blockid, i, j, k);
-                  check_scalar("PRESSURE", blockPres.get(id), blockid, i, j, k);
-                  check_vec("VELOCITY", blockVel.get(id), blockid, i, j, k);
-                  check_vec("FORCE", blockForce.get(id), blockid, i, j, k);
-                  // Check PF pops and NS pops
-                  if (!local_nan) {
-                    PFCELL pfcell(id, blockPFLat);
-                    for (unsigned int q = 0; q < LatSet::q && !local_nan; ++q) {
-                      check_scalar("PF_POP[" + std::to_string(q) + "]", pfcell[q], blockid, i, j, k);
-                    }
-                  }
-                  if (!local_nan) {
-                    NSCELL nscell(id, blockNSLat);
-                    for (unsigned int q = 0; q < LatSet::q && !local_nan; ++q) {
-                      check_scalar("NS_POP[" + std::to_string(q) + "]", nscell[q], blockid, i, j, k);
-                    }
-                  }
+        auto& phiField = PFLattice.getField<PHI<T>>();
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& blockPhi = phiField.getBlockField(blockid);
+          int overlap = block.getOverlap();
+          int nx = block.getNx(), ny = block.getNy(), nz = block.getNz();
+          T voxelSize = block.getVoxelSize();
+          // 块的全局起始物理坐标（含 overlap 偏移），与初始化公式完全一致
+          T gx0 = block.getMinCenter()[0];
+          T gy0 = block.getMinCenter()[1];
+          T gz0 = block.getMinCenter()[2];
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              for (int i = overlap; i < nx - overlap; ++i) {
+                std::size_t id = k * proj[2] + j * proj[1] + i;
+                T phi = blockPhi.get(id);
+                // phi < 0.5 是气泡内部（轻流体）
+                T bubble_indicator = T{1} - phi;  // 气泡指示器：1=气泡内，0=气泡外
+                if (bubble_indicator > T{0.5}) {
+                  bubble_count++;
+                  sum_phi += bubble_indicator;
+                  // 全局物理坐标 = MinCenter + 局部索引 * voxelSize
+                  sum_phi_x += bubble_indicator * (gx0 + T(i) * voxelSize);
+                  sum_phi_y += bubble_indicator * (gy0 + T(j) * voxelSize);
+                  sum_phi_z += bubble_indicator * (gz0 + T(k) * voxelSize);
                 }
               }
             }
           }
+        }
 
+        // MPI reduce
 #ifdef MPI_ENABLED
-          int any_nan = local_nan ? 1 : 0;
-          mpi().reduceAndBcast<int>(any_nan, MPI_LOR);
-          local_nan = (any_nan != 0);
+        mpi().reduceAndBcast<T>(sum_phi, MPI_SUM);
+        mpi().reduceAndBcast<T>(sum_phi_x, MPI_SUM);
+        mpi().reduceAndBcast<T>(sum_phi_y, MPI_SUM);
+        mpi().reduceAndBcast<T>(sum_phi_z, MPI_SUM);
+        mpi().reduceAndBcast<int>(bubble_count, MPI_SUM);
 #endif
-          if (local_nan) {
-            nan_detected = true;
-            if (mpi().isMainProcessor()) {
-              std::cout << "[Step " << MainLoopTimer() << "] *** FIRST NaN/Inf DETECTED ***"
-                        << " field=" << nan_field
-                        << " block=" << nan_block
-                        << " coord=(" << nan_i << "," << nan_j << "," << nan_k << ")"
-                        << " value=" << nan_val << std::endl;
-            }
-          }
+
+        if (mpi().isMainProcessor() && bubble_count > 0) {
+          T cx = sum_phi_x / sum_phi;
+          T cy = sum_phi_y / sum_phi;
+          T cz = sum_phi_z / sum_phi;
+          T volume = sum_phi;  // 近似体积
+          T r_eff = std::pow(T{3} * volume / (T{4} * M_PI), T{1}/T{3});  // 等效半径
+          std::cout << "[BUBBLE] Step=" << MainLoopTimer()
+                    << " center=(" << cx << "," << cy << "," << cz << ")"
+                    << " volume=" << volume
+                    << " r_eff=" << r_eff
+                    << " count=" << bubble_count
+                    << std::endl;
         }
       }
-      // === END NaN/Inf DIAGNOSTIC ===
+
       OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
       Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());
