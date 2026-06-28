@@ -4,23 +4,9 @@
 // D2Q5 lattice for magnetic potential, D2Q9 for PF/NS
 // No AMR, MPI parallel
 //
-// Diagnostic flags:
-//   DIAGNOSTIC_FREEZE_PHI — freeze phase field, output u and F_m in solvent
-//   DIAGNOSTIC_H_LINE     — output H field (Hx,Hy) along centerline
-
-// ========== DIAGNOSTIC FLAGS ==========
-// #define DIAGNOSTIC_FREEZE_PHI
-// #define DIAGNOSTIC_H_LINE
-// ======================================
-
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
-
-#ifdef DIAGNOSTIC_FREEZE_PHI
-#include <fstream>
-#include <iomanip>
-#endif
 
 using T = FLOAT;
 using LatSet = D2Q9<T>;
@@ -329,31 +315,6 @@ int main(int argc, char* argv[]) {
 
   PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
 
-#ifdef DIAGNOSTIC_FREEZE_PHI
-  // Save snapshot of initial phi for diagnostic freeze
-  IF_MPI_RANK(0) {
-    std::cout << "[DIAGNOSTIC] Freezing phase field at initial state\n";
-  }
-  std::vector<std::vector<T>> frozenPhi(Geo.getBlockNum());
-  {
-    auto& phiField = PFLattice.getField<PHI<T>>();
-    for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-      const auto& block = Geo.getBlock(blockid);
-      const auto& proj = block.getProjection();
-      const auto& blockPhi = phiField.getBlockField(blockid);
-      int nx = block.getNx();
-      int ny = block.getNy();
-      frozenPhi[blockid].resize(static_cast<std::size_t>(nx) * ny);
-      for (int j = 0; j < ny; ++j) {
-        for (int i = 0; i < nx; ++i) {
-          std::size_t id = j * proj[1] + i;
-          frozenPhi[blockid][id] = blockPhi.get(id);
-        }
-      }
-    }
-  }
-#endif
-
   // Initialize NS populations to equilibrium
   Vector<T, 2> u_zero{T{0}, T{0}};
   T ns_rho_init = BaseConv.getLatRhoInit();
@@ -547,25 +508,6 @@ int main(int argc, char* argv[]) {
       }
     }
     PFLattice.getField<PHI<T>>().Communicate();
-
-#ifdef DIAGNOSTIC_FREEZE_PHI
-    // Restore phi from frozen snapshot — locks the phase field
-    {
-      auto& phiField = PFLattice.getField<PHI<T>>();
-      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-        const auto& block = Geo.getBlock(blockid);
-        const auto& proj = block.getProjection();
-        auto& blockPhi = phiField.getBlockField(blockid);
-        for (int j = 0; j < block.getNy(); ++j) {
-          for (int i = 0; i < block.getNx(); ++i) {
-            std::size_t id = j * proj[1] + i;
-            blockPhi.get(id) = frozenPhi[blockid][id];
-          }
-        }
-      }
-    }
-    PFLattice.getField<PHI<T>>().Communicate();
-#endif
 
     // Step 2: Compute GRAD, NORMAL, LAPLACIAN, CHEMICALPOTENTIAL
     PFLattice.template ApplyCellDynamics<FFNormalSelector>(FlagFM);
@@ -808,12 +750,10 @@ int main(int argc, char* argv[]) {
     NSLattice.NormalCommunicate();
 
     // ---- PF collision and streaming ----
-#ifndef DIAGNOSTIC_FREEZE_PHI
     PFLattice.template ApplyCellDynamics<PFCollisionTaskSelector>(FlagFM);
     PF_BB.Apply(MainLoopTimer());
     PFLattice.Stream();
     PFLattice.NormalCommunicate();
-#endif
 
     ++MainLoopTimer;
     ++OutputTimer;
@@ -832,187 +772,8 @@ int main(int argc, char* argv[]) {
       Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());
 
-#ifdef DIAGNOSTIC_FREEZE_PHI
-      // Write diagnostic text output: centerline cut of u and F_m
-      {
-        auto& velField = NSLattice.getField<VELOCITY<T, 2>>();
-        auto& forceField = NSLattice.getField<FORCE<T, 2>>();
-        auto& phiField = PFLattice.getField<PHI<T>>();
-        auto& chiField = MFLattice.getField<ff::CHI<T>>();
-
-        // Find which block contains the bubble center y-line
-        T y_target = Bubble_Center[1] * Cell_Len;
-
-        std::ostringstream fname;
-        fname << "diagnose_force_step" << std::setw(6) << std::setfill('0')
-              << MainLoopTimer() << ".csv";
-        std::ofstream diagFile(fname.str());
-        diagFile << "# Diagnostic: frozen phi, u and F_m along y=" << y_target << "\n";
-        diagFile << "# step,x,y,ux,uy,Fmx,Fmy,phi,chi\n";
-
-        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-          const auto& block = Geo.getBlock(blockid);
-          const auto& proj = block.getProjection();
-          T voxelSize = block.getVoxelSize();
-          const auto& blockVel = velField.getBlockField(blockid);
-          const auto& blockForce = forceField.getBlockField(blockid);
-          const auto& blockPhi = phiField.getBlockField(blockid);
-          const auto& blockChi = chiField.getBlockField(blockid);
-          int overlap = block.getOverlap();
-          T y_min = block.getMin()[1];
-
-          // Find j index closest to y_target
-          int j_target = -1;
-          T best_dist = T(999);
-          for (int j = overlap; j < block.getNy() - overlap; ++j) {
-            T y = y_min + static_cast<T>(j) * voxelSize;
-            T dist = std::abs(y - y_target);
-            if (dist < best_dist) {
-              best_dist = dist;
-              j_target = j;
-            }
-          }
-
-          if (j_target >= overlap && j_target < block.getNy() - overlap) {
-            for (int i = overlap; i < block.getNx() - overlap; ++i) {
-              std::size_t id = j_target * proj[1] + i;
-              T x = block.getMin()[0] + static_cast<T>(i) * voxelSize;
-              T y = y_min + static_cast<T>(j_target) * voxelSize;
-              const auto& vel = blockVel.get(id);
-              const auto& force = blockForce.get(id);
-              T phi = blockPhi.get(id);
-              T chi = blockChi.get(id);
-              diagFile << MainLoopTimer() << ","
-                       << x << "," << y << ","
-                       << vel[0] << "," << vel[1] << ","
-                       << force[0] << "," << force[1] << ","
-                       << phi << "," << chi << "\n";
-            }
-          }
-        }
-        diagFile.close();
-        IF_MPI_RANK(0) {
-          std::cout << "[DIAGNOSTIC] Wrote " << fname.str() << "\n";
-        }
-      }
-#endif
-
-#ifdef DIAGNOSTIC_H_LINE
-      // Write H-field centerline: Hx, Hy along y = bubble_center_y
-      {
-        auto& hField = MFLattice.getField<ff::H_FIELD<T, 2>>();
-        auto& phiField = PFLattice.getField<PHI<T>>();
-        auto& psiField = MFLattice.getField<ff::PSI<T>>();
-
-        T y_target = Bubble_Center[1] * Cell_Len;
-
-        std::ostringstream fnameH;
-        fnameH << "diagnose_H_line_step" << std::setw(6) << std::setfill('0')
-               << MainLoopTimer() << ".csv";
-        std::ofstream hFile(fnameH.str());
-        hFile << "# Diagnostic: H = -grad(psi) along y=" << y_target << "\n";
-        hFile << "# step,x,y,Hx,Hy,psi,phi\n";
-
-        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-          const auto& block = Geo.getBlock(blockid);
-          const auto& proj = block.getProjection();
-          T voxelSize = block.getVoxelSize();
-          const auto& blockH = hField.getBlockField(blockid);
-          const auto& blockPsi = psiField.getBlockField(blockid);
-          const auto& blockPhi = phiField.getBlockField(blockid);
-          int overlap = block.getOverlap();
-          T y_min = block.getMin()[1];
-
-          int j_target = -1;
-          T best_dist = T(999);
-          for (int j = overlap; j < block.getNy() - overlap; ++j) {
-            T y = y_min + static_cast<T>(j) * voxelSize;
-            T dist = std::abs(y - y_target);
-            if (dist < best_dist) {
-              best_dist = dist;
-              j_target = j;
-            }
-          }
-
-          if (j_target >= overlap && j_target < block.getNy() - overlap) {
-            for (int i = overlap; i < block.getNx() - overlap; ++i) {
-              std::size_t id = j_target * proj[1] + i;
-              T x = block.getMin()[0] + static_cast<T>(i) * voxelSize;
-              T y = y_min + static_cast<T>(j_target) * voxelSize;
-              const auto& H = blockH.get(id);
-              T psi = blockPsi.get(id);
-              T phi = blockPhi.get(id);
-              hFile << MainLoopTimer() << ","
-                    << x << "," << y << ","
-                    << H[0] << "," << H[1] << ","
-                    << psi << "," << phi << "\n";
-            }
-          }
-        }
-        hFile.close();
-        IF_MPI_RANK(0) {
-          std::cout << "[DIAGNOSTIC-H] Wrote " << fnameH.str() << "\n";
-        }
-      }
-#endif
-
     }
   }
-
-#ifdef DIAGNOSTIC_FREEZE_PHI
-  // Print summary of spurious forces in solvent (chi≈0) region
-  {
-    auto& forceField = NSLattice.getField<FORCE<T, 2>>();
-    auto& velField = NSLattice.getField<VELOCITY<T, 2>>();
-    auto& phiField = PFLattice.getField<PHI<T>>();
-
-    T max_F_solvent = T{0}, max_u_solvent = T{0};
-    T max_F_all = T{0}, max_u_all = T{0};
-    int solvent_count = 0;
-    for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-      const auto& block = Geo.getBlock(blockid);
-      const auto& proj = block.getProjection();
-      const auto& blockForce = forceField.getBlockField(blockid);
-      const auto& blockVel = velField.getBlockField(blockid);
-      const auto& blockPhi = phiField.getBlockField(blockid);
-      int overlap = block.getOverlap();
-      for (int j = overlap; j < block.getNy() - overlap; ++j) {
-        for (int i = overlap; i < block.getNx() - overlap; ++i) {
-          std::size_t id = j * proj[1] + i;
-          T phi = blockPhi.get(id);
-          const auto& F = blockForce.get(id);
-          const auto& u = blockVel.get(id);
-          T Fmag = std::sqrt(F[0]*F[0] + F[1]*F[1]);
-          T umag = std::sqrt(u[0]*u[0] + u[1]*u[1]);
-          if (Fmag > max_F_all) max_F_all = Fmag;
-          if (umag > max_u_all) max_u_all = umag;
-          // Solvent = non-magnetic region (phi < 0.05, chi ≈ 0)
-          if (phi < T{0.05}) {
-            ++solvent_count;
-            if (Fmag > max_F_solvent) max_F_solvent = Fmag;
-            if (umag > max_u_solvent) max_u_solvent = umag;
-          }
-        }
-      }
-    }
-    IF_MPI_RANK(0) {
-      std::cout << "\n[DIAGNOSTIC SUMMARY] Final state (phi frozen, MF active):\n";
-      std::cout << "  Solvent region (phi<0.05, " << solvent_count << " cells):\n";
-      std::cout << "    max |F_m| = " << max_F_solvent << "\n";
-      std::cout << "    max |u|   = " << max_u_solvent << "\n";
-      std::cout << "  Full domain:\n";
-      std::cout << "    max |F_m| = " << max_F_all << "\n";
-      std::cout << "    max |u|   = " << max_u_all << "\n";
-      if (max_F_solvent > T{1e-10}) {
-        std::cout << "  => SPURIOUS FORCES DETECTED in solvent region!\n";
-        std::cout << "     Suspect 1 (MST divergence error) is active.\n";
-      } else {
-        std::cout << "  => No spurious forces in solvent region.\n";
-      }
-      std::cout << std::endl;
-    }
-  }
-#endif
 
   Printer::Print_BigBanner(std::string("Calculation Complete!"));
   MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
