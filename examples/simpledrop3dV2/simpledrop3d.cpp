@@ -1,0 +1,682 @@
+// simpledrop3d.cpp
+// 3D phase-field droplet simulation with multiple test cases
+
+#include "freelb.h"
+#include "freelb.hh"
+#include "ff/ff2d.h"
+
+using T = FLOAT;
+using LatSet = D3Q19<T>;
+
+Vector<T, LatSet::d> Droplet_Velocity_Global;
+T Beta_Global;
+T Kappa_Global;
+T Mobility_Global;
+T Omega_phi_Global;
+std::string TestCase_Global;
+T U0_Global;
+T SlotWidth_Global;
+T SlotHeight_Global;
+T Tf_Global;
+
+int Nx, Ny, Nz;
+T Cell_Len;
+int BlockCellLen;
+int Thread_Num;
+T Droplet_Radius;
+Vector<T, LatSet::d> Droplet_Center;
+Vector<T, LatSet::d> Droplet_Velocity;
+T Droplet_Velocity_Mag;
+
+T Mobility;
+T Kappa;
+T Beta;
+T Sigma;
+T Interface_Width;
+T Tau_phi;
+T Omega_phi;
+T epsilon = T(1e-6);
+int MaxStep;
+int OutputStep;
+
+void readParam() {
+  iniReader param_reader("simpledrop3d.ini");
+  Thread_Num = param_reader.getValue<int>("parallel", "thread_num");
+
+  Nx = param_reader.getValue<int>("Mesh", "Nx");
+  Ny = param_reader.getValue<int>("Mesh", "Ny");
+  Nz = param_reader.getValue<int>("Mesh", "Nz");
+  Cell_Len = param_reader.getValue<T>("Mesh", "Cell_Len");
+  BlockCellLen = param_reader.getValue<int>("Mesh", "BlockCellLen");
+
+  Droplet_Radius = param_reader.getValue<T>("Droplet", "Radius");
+  Droplet_Center[0] = param_reader.getValue<T>("Droplet", "CenterX");
+  Droplet_Center[1] = param_reader.getValue<T>("Droplet", "CenterY");
+  Droplet_Center[2] = param_reader.getValue<T>("Droplet", "CenterZ");
+  Droplet_Velocity[0] = param_reader.getValue<T>("Droplet", "VelocityX");
+  Droplet_Velocity[1] = param_reader.getValue<T>("Droplet", "VelocityY");
+  Droplet_Velocity[2] = param_reader.getValue<T>("Droplet", "VelocityZ");
+  Droplet_Velocity_Mag = std::sqrt(Droplet_Velocity[0]*Droplet_Velocity[0] +
+                                  Droplet_Velocity[1]*Droplet_Velocity[1] +
+                                  Droplet_Velocity[2]*Droplet_Velocity[2]);
+
+  Interface_Width = param_reader.getValue<T>("Phase_Field", "Interface_Width");
+  Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
+  Sigma = param_reader.getValue<T>("Phase_Field", "Sigma");
+  Kappa = T(3.0) * Interface_Width * Sigma * T(0.5);
+  Beta = T(12.0) * Sigma / Interface_Width;
+
+  T Gamma = Mobility;
+  T cs2 = LatSet::cs2;
+  Tau_phi = T(0.5) + Gamma / cs2;
+  Omega_phi = T(1.0) / Tau_phi;
+
+  OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
+  TestCase_Global = param_reader.getValue<std::string>("Simulation_Settings", "TestCase");
+  U0_Global = param_reader.getValue<T>("Simulation_Settings", "U0");
+  SlotWidth_Global = param_reader.getValue<T>("SlottedSphere", "SlotWidth");
+  SlotHeight_Global = param_reader.getValue<T>("SlottedSphere", "SlotHeight");
+
+  if (TestCase_Global == "slotted_sphere") {
+    Tf_Global = param_reader.getValue<T>("SlottedSphere", "Tf");
+  } else if (TestCase_Global == "vortex") {
+    Tf_Global = param_reader.getValue<T>("Vortex", "Tf");
+  } else if (TestCase_Global == "deformation") {
+    Tf_Global = param_reader.getValue<T>("Deformation", "Tf");
+  } else if (TestCase_Global == "shear") {
+    Tf_Global = param_reader.getValue<T>("Shear", "Tf");
+  } else {
+    Tf_Global = T(1);
+  }
+
+  MaxStep = static_cast<int>(Tf_Global * static_cast<T>(Nx) / U0_Global);
+
+  MPI_RANK(0) {
+    std::cout << "------------Phase Field 3D Droplet Simulation:-------------\n" << std::endl;
+    std::cout << "[Phase Field Parameters]:" << std::endl;
+    std::cout << "  Interface Width:  " << Interface_Width << " lu" << std::endl;
+    std::cout << "  Mobility:         " << Mobility << std::endl;
+    std::cout << "  Sigma:            " << Sigma << std::endl;
+    std::cout << "  Kappa:            " << Kappa << std::endl;
+    std::cout << "  Beta:             " << Beta << std::endl;
+    std::cout << "  Tau_phi:          " << Tau_phi << std::endl;
+    std::cout << "  Omega_phi:        " << Omega_phi << std::endl;
+    std::cout << "[Simulation_Settings]:\n"
+              << "  TotalStep:        " << MaxStep << "\n"
+              << "  OutputStep:       " << OutputStep << "\n"
+              << "  Grid:             " << Nx << " x " << Ny << " x " << Nz << "\n"
+              << "  U0:               " << U0_Global << "\n"
+              << "  TestCase:         " << TestCase_Global << "\n"
+              << "  Tf:               " << Tf_Global << "\n"
+              << "  MaxStep (auto):   " << MaxStep << "\n"
+#ifdef _OPENMP
+              << "  Running on " << Thread_Num << " threads\n"
+#endif
+#ifdef MPI_ENABLED
+               << "  Running on " << mpi().getSize() << " processes\n"
+#endif
+              << "----------------------------------------------" << std::endl;
+  }
+}
+
+int main(int argc, char* argv[]) {
+  constexpr std::uint8_t VoidFlag = std::uint8_t(1);
+  constexpr std::uint8_t BulkFlag = std::uint8_t(2);
+  constexpr std::uint8_t PeriodicFlag = std::uint8_t(4);
+
+  mpi().init(&argc, &argv);
+
+  MPI_DEBUG_WAIT
+
+  Printer::Print_BigBanner(std::string("Initializing Simple 3D Droplet Simulation..."));
+
+  readParam();
+
+  Droplet_Velocity_Global = Droplet_Velocity;
+  Beta_Global = Beta;
+  Kappa_Global = Kappa;
+  Mobility_Global = Mobility;
+  Omega_phi_Global = Omega_phi;
+
+  BaseConverter<T> dummyConv(LatSet::cs2);
+  dummyConv.Converter(T(1), T(1), T(1), T(Nx), T(1), T(0.1));
+  PhaseFieldConverter<T> phiConv(dummyConv);
+  dummyConv.ConvertFromRT(1.0, Tau_phi, 1.0, 100, 0.01, 0.001);
+  phiConv.Converter(4.0, 0.01, 0.072);
+
+  bool isSlottedSphere = false;//(TestCase_Global == "slotted_sphere");
+  bool isVortex = true;//(TestCase_Global == "vortex");
+  bool isDeformation = false;//(TestCase_Global == "deformation");
+  bool isShear = false;//(TestCase_Global == "shear");
+  bool isPeriodic = true;//(isVortex || isDeformation);
+
+  AABB<T, 3> domain(Vector<T, 3>(T(0), T(0), T(0)),
+                    Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(Nz * Cell_Len)));
+
+  // 6 face boxes
+  AABB<T, 3> left_box(Vector<T, 3>(T(-Cell_Len), T(0), T(0)),
+                      Vector<T, 3>(T(0), T(Ny * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, 3> right_box(Vector<T, 3>(T(Nx * Cell_Len), T(0), T(0)),
+                       Vector<T, 3>(T((Nx+1) * Cell_Len), T(Ny * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, 3> front_box(Vector<T, 3>(T(0), T(-Cell_Len), T(0)),
+                       Vector<T, 3>(T(Nx * Cell_Len), T(0), T(Nz * Cell_Len)));
+  AABB<T, 3> back_box(Vector<T, 3>(T(0), T(Ny * Cell_Len), T(0)),
+                      Vector<T, 3>(T(Nx * Cell_Len), T((Ny+1) * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, 3> bottom_box(Vector<T, 3>(T(0), T(0), T(-Cell_Len)),
+                        Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(0)));
+  AABB<T, 3> top_box(Vector<T, 3>(T(0), T(0), T(Nz * Cell_Len)),
+                     Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T((Nz+1) * Cell_Len)));
+
+  // 12 edge boxes
+  AABB<T, 3> left_front_box(Vector<T, 3>(T(-Cell_Len), T(-Cell_Len), T(0)),
+                            Vector<T, 3>(T(0), T(0), T(Nz * Cell_Len)));
+  AABB<T, 3> right_front_box(Vector<T, 3>(T(Nx * Cell_Len), T(-Cell_Len), T(0)),
+                             Vector<T, 3>(T((Nx+1) * Cell_Len), T(0), T(Nz * Cell_Len)));
+  AABB<T, 3> left_back_box(Vector<T, 3>(T(-Cell_Len), T(Ny * Cell_Len), T(0)),
+                           Vector<T, 3>(T(0), T((Ny+1) * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, 3> right_back_box(Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(0)),
+                            Vector<T, 3>(T((Nx+1) * Cell_Len), T((Ny+1) * Cell_Len), T(Nz * Cell_Len)));
+  AABB<T, 3> left_bottom_box(Vector<T, 3>(T(-Cell_Len), T(0), T(-Cell_Len)),
+                             Vector<T, 3>(T(0), T(Ny * Cell_Len), T(0)));
+  AABB<T, 3> right_bottom_box(Vector<T, 3>(T(Nx * Cell_Len), T(0), T(-Cell_Len)),
+                              Vector<T, 3>(T((Nx+1) * Cell_Len), T(Ny * Cell_Len), T(0)));
+  AABB<T, 3> left_top_box(Vector<T, 3>(T(-Cell_Len), T(0), T(Nz * Cell_Len)),
+                          Vector<T, 3>(T(0), T(Ny * Cell_Len), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> right_top_box(Vector<T, 3>(T(Nx * Cell_Len), T(0), T(Nz * Cell_Len)),
+                           Vector<T, 3>(T((Nx+1) * Cell_Len), T(Ny * Cell_Len), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> front_bottom_box(Vector<T, 3>(T(0), T(-Cell_Len), T(-Cell_Len)),
+                              Vector<T, 3>(T(Nx * Cell_Len), T(0), T(0)));
+  AABB<T, 3> back_bottom_box(Vector<T, 3>(T(0), T(Ny * Cell_Len), T(-Cell_Len)),
+                             Vector<T, 3>(T(Nx * Cell_Len), T((Ny+1) * Cell_Len), T(0)));
+  AABB<T, 3> front_top_box(Vector<T, 3>(T(0), T(-Cell_Len), T(Nz * Cell_Len)),
+                           Vector<T, 3>(T(Nx * Cell_Len), T(0), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> back_top_box(Vector<T, 3>(T(0), T(Ny * Cell_Len), T(Nz * Cell_Len)),
+                          Vector<T, 3>(T(Nx * Cell_Len), T((Ny+1) * Cell_Len), T((Nz+1) * Cell_Len)));
+
+  // 8 corner boxes
+  AABB<T, 3> left_front_bottom_box(Vector<T, 3>(T(-Cell_Len), T(-Cell_Len), T(-Cell_Len)),
+                                   Vector<T, 3>(T(0), T(0), T(0)));
+  AABB<T, 3> right_front_bottom_box(Vector<T, 3>(T(Nx * Cell_Len), T(-Cell_Len), T(-Cell_Len)),
+                                    Vector<T, 3>(T((Nx+1) * Cell_Len), T(0), T(0)));
+  AABB<T, 3> left_back_bottom_box(Vector<T, 3>(T(-Cell_Len), T(Ny * Cell_Len), T(-Cell_Len)),
+                                  Vector<T, 3>(T(0), T((Ny+1) * Cell_Len), T(0)));
+  AABB<T, 3> right_back_bottom_box(Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(-Cell_Len)),
+                                   Vector<T, 3>(T((Nx+1) * Cell_Len), T((Ny+1) * Cell_Len), T(0)));
+  AABB<T, 3> left_front_top_box(Vector<T, 3>(T(-Cell_Len), T(-Cell_Len), T(Nz * Cell_Len)),
+                                Vector<T, 3>(T(0), T(0), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> right_front_top_box(Vector<T, 3>(T(Nx * Cell_Len), T(-Cell_Len), T(Nz * Cell_Len)),
+                                 Vector<T, 3>(T((Nx+1) * Cell_Len), T(0), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> left_back_top_box(Vector<T, 3>(T(-Cell_Len), T(Ny * Cell_Len), T(Nz * Cell_Len)),
+                               Vector<T, 3>(T(0), T((Ny+1) * Cell_Len), T((Nz+1) * Cell_Len)));
+  AABB<T, 3> right_back_top_box(Vector<T, 3>(T(Nx * Cell_Len), T(Ny * Cell_Len), T(Nz * Cell_Len)),
+                                Vector<T, 3>(T((Nx+1) * Cell_Len), T((Ny+1) * Cell_Len), T((Nz+1) * Cell_Len)));
+
+  BlockGeometryHelper3D<T> GeoHelper(Nx, Ny, Nz, domain, Cell_Len, BlockCellLen);
+  GeoHelper.CreateBlocks(1, mpi().getSize(), 1);
+  GeoHelper.AdaptiveOptimization(mpi().getSize());
+  GeoHelper.LoadBalancing(mpi().getSize());
+
+  BlockGeometry3D<T> Geo(GeoHelper);
+
+  BlockFieldManager<FLAG, T, LatSet::d> FlagFM(Geo, VoidFlag);
+
+  FlagFM.forEach(
+    domain, [&](FLAG& field, std::size_t id) { field.SetField(id, BulkFlag); });
+
+  FlagFM.forEach(
+    left_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    front_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    back_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+
+  FlagFM.forEach(
+    left_front_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_front_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_back_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_back_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    front_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    back_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    front_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    back_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+
+  FlagFM.forEach(
+    left_front_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_front_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_back_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_back_bottom_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_front_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_front_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    left_back_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+  FlagFM.forEach(
+    right_back_top_box, [&](FLAG& field, std::size_t id) { field.SetField(id, PeriodicFlag); });
+
+  FlagFM.template SetupBoundary<LatSet>(domain, PeriodicFlag);
+
+  using FIELDS = TypePack<PHI<T>, POP<T, LatSet::q>, VELOCITY<T, LatSet::d>, GRAD<T, LatSet::d>, NORMAL<T, LatSet::d>, INTERFACEWIDTH<T>>;
+  using CELL = Cell<T, LatSet, FIELDS>;
+
+  ValuePack InitValues(T{}, T{}, T{}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, Vector<T, LatSet::d>{T(0), T(0), T(0)}, Interface_Width);
+
+  BlockLatticeManager<T, LatSet, FIELDS> DropletLattice(Geo, InitValues, dummyConv);
+
+  auto& phiField = DropletLattice.getField<PHI<T>>();
+  T d = static_cast<T>(Nx) * Cell_Len;
+  T phi_cx, phi_cy, phi_cz, phi_R;
+  if (isSlottedSphere) {
+    phi_cx = T(0.5) * d;
+    phi_cy = T(0.75) * d;
+    phi_cz = T(0.5) * d;
+    phi_R = T(0.15) * d;
+  } else if (isVortex) {
+    phi_cx = T(0.35) * d;
+    phi_cy = T(0.35) * d;
+    phi_cz = T(0.35) * d;
+    phi_R = T(0.15) * d;
+  } else if (isDeformation) {
+    phi_cx = T(0.5) * d;
+    phi_cy = T(0.5) * d;
+    phi_cz = T(0.5) * d;
+    phi_R = T(0.2) * d;
+  } else if (isShear) {
+    phi_cx = T(0.3) * d;
+    phi_cy = T(0.3) * d;
+    phi_cz = T(0.5) * d;
+    phi_R = T(0.2) * d;
+  } else {
+    phi_cx = Droplet_Center[0];
+    phi_cy = Droplet_Center[1];
+    phi_cz = Droplet_Center[2];
+    phi_R = Droplet_Radius;
+  }
+
+  for(int blockid = 0; blockid < Geo.getBlockNum(); ++blockid){
+    const auto& block = Geo.getBlock(blockid);
+    const auto& proj = block.getProjection();
+    auto& blockPhi = phiField.getBlockField(blockid);
+    T voxelSize = block.getVoxelSize();
+    int overlap = 0;
+    for (int k = overlap; k < block.getNz() - overlap; ++k) {
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          std::size_t id = k * proj[2] + j * proj[1] + i;
+          T x = block.getMin()[0] + static_cast<T>(i) * voxelSize;
+          T y = block.getMin()[1] + static_cast<T>(j) * voxelSize;
+          T z = block.getMin()[2] + static_cast<T>(k) * voxelSize;
+
+          T phi;
+          if (isSlottedSphere) {
+            T half_slot = SlotWidth_Global * T(0.5) * d;
+            T slot_bottom = (phi_cy + phi_R) - SlotHeight_Global * d;
+            T dist = std::sqrt((x - phi_cx) * (x - phi_cx) + (y - phi_cy) * (y - phi_cy) + (z - phi_cz) * (z - phi_cz));
+            T phi_sphere = T(0.5) * (T(1) - std::tanh(T(2) * (dist - phi_R) / Interface_Width));
+            T notch_x = T(0.5) * (T(1) - std::tanh(T(2) * (std::abs(x - phi_cx) - half_slot) / Interface_Width));
+            T notch_y = T(0.5) * (T(1) + std::tanh(T(2) * (y - slot_bottom) / Interface_Width));
+            phi = phi_sphere * (T(1) - notch_x * notch_y);
+          } else {
+            T dist = std::sqrt((x - phi_cx)*(x - phi_cx) +
+                              (y - phi_cy)*(y - phi_cy) +
+                              (z - phi_cz)*(z - phi_cz));
+            phi = T(0.5) * (T(1) - std::tanh(T(2) * (dist - phi_R) / Interface_Width));
+          }
+          blockPhi.get(id) = phi;
+        }
+      }
+    }
+  }
+
+  BlockFieldManager<PHI<T>, T, LatSet::d> phiInitialFM(phiField);
+
+  auto& velocityField = DropletLattice.getField<VELOCITY<T, LatSet::d>>();
+  for (int block_idx = 0; block_idx < Geo.getBlockNum(); ++block_idx) {
+    auto& blockLat = DropletLattice.getBlockLat(block_idx);
+    auto& blockPhiField = phiField.getBlockField(block_idx);
+    auto& blockVelocity = velocityField.getBlockField(block_idx);
+    const auto& block = Geo.getBlock(block_idx);
+    int overlap = 0;
+    const auto& proj = block.getProjection();
+    T voxelSize = block.getVoxelSize();
+
+    for (int k = overlap; k < block.getNz() - overlap; ++k) {
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          std::size_t id = k * proj[2] + j * proj[1] + i;
+          CELL cell(id, blockLat);
+          T phi = blockPhiField.get(id);
+
+          Vector<T, LatSet::d> vel;
+          if (isSlottedSphere) {
+            T x_norm = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d;
+            T y_norm = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d;
+            T ux = T(2) * M_PI * U0_Global * (T(0.5) - y_norm);
+            T uy = T(2) * M_PI * U0_Global * (x_norm - T(0.5));
+            T uz = T(0);
+            vel = Vector<T, 3>(ux, uy, uz);
+          } else if (isVortex) {
+            T x_norm = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d;
+            T y_norm = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d;
+            T z_norm = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d;
+            T sin2_pi_x = std::pow(std::sin(M_PI * x_norm), T(2));
+            T sin2_pi_y = std::pow(std::sin(M_PI * y_norm), T(2));
+            T sin2_pi_z = std::pow(std::sin(M_PI * z_norm), T(2));
+            T sin_2pi_x = std::sin(T(2) * M_PI * x_norm);
+            T sin_2pi_y = std::sin(T(2) * M_PI * y_norm);
+            T sin_2pi_z = std::sin(T(2) * M_PI * z_norm);
+            T ux = T(2) * U0_Global * sin2_pi_x * sin_2pi_y * sin_2pi_z;
+            T uy = -U0_Global * sin2_pi_y * sin_2pi_z * sin_2pi_x;
+            T uz = -U0_Global * sin2_pi_z * sin_2pi_x * sin_2pi_y;
+            vel = Vector<T, 3>(ux, uy, uz);
+          } else if (isDeformation) {
+            T xh = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d - T(0.5);
+            T yh = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d - T(0.5);
+            T zh = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d - T(0.5);
+            T ux = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*xh)*std::sin(T(4)*M_PI*yh) + std::cos(T(4)*M_PI*zh)*std::cos(T(4)*M_PI*xh));
+            T uy = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*yh)*std::sin(T(4)*M_PI*zh) + std::cos(T(4)*M_PI*xh)*std::cos(T(4)*M_PI*yh));
+            T uz = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*zh)*std::sin(T(4)*M_PI*xh) + std::cos(T(4)*M_PI*yh)*std::cos(T(4)*M_PI*zh));
+            vel = Vector<T, 3>(ux, uy, uz);
+          } else if (isShear) {
+            T xh = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d - T(0.5);
+            T yh = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d - T(0.5);
+            T zh = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d - T(0.5);
+            T ux = M_PI * U0_Global * std::cos(M_PI * xh) * (std::sin(M_PI * zh) - std::sin(M_PI * yh));
+            T uy = M_PI * U0_Global * std::cos(M_PI * yh) * (std::sin(M_PI * xh) - std::sin(M_PI * zh));
+            T uz = M_PI * U0_Global * std::cos(M_PI * zh) * (std::sin(M_PI * yh) - std::sin(M_PI * xh));
+            vel = Vector<T, 3>(ux, uy, uz);
+          } else {
+            vel = Droplet_Velocity_Global;
+          }
+          blockVelocity.get(id) = vel;
+
+          T usqr = vel.getnorm2();
+          for (unsigned int q = 0; q < LatSet::q; ++q) {
+             T cu = latset::c<LatSet>(q) * vel;
+             cell[q] = latset::w<LatSet>(q) * phi *
+               (T(1) + LatSet::InvCs2 * cu + cu * cu * T(0.5) * LatSet::InvCs4 -
+                LatSet::InvCs2 * usqr * T(0.5));
+          }
+        }
+      }
+    }
+  }
+
+  FixedPeriodicBoundaryManager<BlockLatticeManager<T, LatSet, FIELDS>, BlockFieldManager<FLAG, T, 3>>
+    Drop_Periodic("Drop_Periodic", DropletLattice, FlagFM, PeriodicFlag, VoidFlag);
+
+  if (isPeriodic) {
+    Drop_Periodic.Setup(left_box, NbrDirection::XN, right_box, NbrDirection::XP);
+    Drop_Periodic.Setup(front_box, NbrDirection::YN, back_box, NbrDirection::YP);
+    Drop_Periodic.Setup(bottom_box, NbrDirection::ZN, top_box, NbrDirection::ZP);
+
+    Drop_Periodic.Setup(left_front_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YN), right_back_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YP));
+    Drop_Periodic.Setup(right_front_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YN), left_back_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YP));
+    Drop_Periodic.Setup(left_bottom_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::ZN), right_top_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::ZP));
+    Drop_Periodic.Setup(right_bottom_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::ZN), left_top_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::ZP));
+    Drop_Periodic.Setup(front_bottom_box, static_cast<NbrDirection>(NbrDirection::YN | NbrDirection::ZN), back_top_box, static_cast<NbrDirection>(NbrDirection::YP | NbrDirection::ZP));
+    Drop_Periodic.Setup(back_bottom_box, static_cast<NbrDirection>(NbrDirection::YP | NbrDirection::ZN), front_top_box, static_cast<NbrDirection>(NbrDirection::YN | NbrDirection::ZP));
+
+    Drop_Periodic.Setup(left_front_bottom_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YN | NbrDirection::ZN), right_back_top_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YP | NbrDirection::ZP));
+    Drop_Periodic.Setup(right_front_bottom_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YN | NbrDirection::ZN), left_back_top_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YP | NbrDirection::ZP));
+    Drop_Periodic.Setup(left_back_bottom_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YP | NbrDirection::ZN), right_front_top_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YN | NbrDirection::ZP));
+    Drop_Periodic.Setup(right_back_bottom_box, static_cast<NbrDirection>(NbrDirection::XP | NbrDirection::YP | NbrDirection::ZN), left_front_top_box, static_cast<NbrDirection>(NbrDirection::XN | NbrDirection::YN | NbrDirection::ZP));
+
+#ifdef MPI_ENABLED
+    Drop_Periodic.SetupMPI(GeoHelper);
+#endif
+  }
+
+  using NormalTask = tmp::Key_TypePair<BulkFlag, ff::FF3D<CELL>>;
+  using NormalTaskCollection = tmp::TupleWrapper<NormalTask>;
+  using DropletNormalTask = tmp::TaskSelector<NormalTaskCollection, std::uint8_t, CELL>;
+
+  using BulkTask = tmp::Key_TypePair<BulkFlag,
+                                     collision::BGKSource<
+                                                 equilibrium::SecondOrder<CELL>,
+                                                 NORMAL<T, LatSet::d>,
+                                                  true
+                                                        >
+                                    >;
+  using CollisionTaskCollection = tmp::TupleWrapper<BulkTask>;
+  using DropletCollisionTask = tmp::TaskSelector<CollisionTaskCollection, std::uint8_t, CELL>;
+
+  Timer MainLoopTimer;
+  Timer OutputTimer;
+
+  vtmo::ScalarWriter PHIWriter("PHI", DropletLattice.getField<PHI<T>>());
+  vtmo::VectorWriter GRADWriter("GRAD", DropletLattice.getField<GRAD<T, 3>>());
+  vtmo::VectorWriter VELOCITYWriter("VELOCITY", DropletLattice.getField<VELOCITY<T, LatSet::d>>());
+  vtmo::vtmWriter<T, 3> MainWriter("simpledrop3d", Geo);
+  MainWriter.addWriterSet(PHIWriter, GRADWriter, VELOCITYWriter);
+  MainWriter.WriteBinary(MainLoopTimer());
+
+  Drop_Periodic.Apply();
+  DropletLattice.NormalCommunicate();
+
+  Printer::Print_BigBanner(std::string("Start Simple 3D Droplet Simulation..."));
+
+  while (MainLoopTimer() < MaxStep) {
+    T t = static_cast<T>(MainLoopTimer());
+    T T_period = d / U0_Global;
+    T cos_pi_t = std::cos(M_PI * t / T_period);
+
+    if (isSlottedSphere) {
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        auto& blockVelocity = velocityField.getBlockField(blockid);
+        T voxelSize = block.getVoxelSize();
+        const auto& proj = block.getProjection();
+
+        for (int k = 0; k < block.getNz(); ++k) {
+          for (int j = 0; j < block.getNy(); ++j) {
+            for (int i = 0; i < block.getNx(); ++i) {
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              T x_norm = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d;
+              T y_norm = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d;
+              T ux = T(2) * M_PI * U0_Global * (T(0.5) - y_norm);
+              T uy = T(2) * M_PI * U0_Global * (x_norm - T(0.5));
+              T uz = T(0);
+              blockVelocity.get(id) = Vector<T, 3>(ux, uy, uz);
+            }
+          }
+        }
+      }
+    } else if (isVortex) {
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        auto& blockVelocity = velocityField.getBlockField(blockid);
+        T voxelSize = block.getVoxelSize();
+        const auto& proj = block.getProjection();
+
+        for (int k = 0; k < block.getNz(); ++k) {
+          for (int j = 0; j < block.getNy(); ++j) {
+            for (int i = 0; i < block.getNx(); ++i) {
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              T x_norm = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d;
+              T y_norm = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d;
+              T z_norm = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d;
+              T sin2_pi_x = std::pow(std::sin(M_PI * x_norm), T(2));
+              T sin2_pi_y = std::pow(std::sin(M_PI * y_norm), T(2));
+              T sin2_pi_z = std::pow(std::sin(M_PI * z_norm), T(2));
+              T sin_2pi_x = std::sin(T(2) * M_PI * x_norm);
+              T sin_2pi_y = std::sin(T(2) * M_PI * y_norm);
+              T sin_2pi_z = std::sin(T(2) * M_PI * z_norm);
+              T ux = T(2) * U0_Global * sin2_pi_x * sin_2pi_y * sin_2pi_z * cos_pi_t;
+              T uy = -U0_Global * sin2_pi_y * sin_2pi_z * sin_2pi_x * cos_pi_t;
+              T uz = -U0_Global * sin2_pi_z * sin_2pi_x * sin_2pi_y * cos_pi_t;
+              blockVelocity.get(id) = Vector<T, 3>(ux, uy, uz);
+            }
+          }
+        }
+      }
+    } else if (isDeformation) {
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        auto& blockVelocity = velocityField.getBlockField(blockid);
+        T voxelSize = block.getVoxelSize();
+        const auto& proj = block.getProjection();
+
+        for (int k = 0; k < block.getNz(); ++k) {
+          for (int j = 0; j < block.getNy(); ++j) {
+            for (int i = 0; i < block.getNx(); ++i) {
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              T xh = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d - T(0.5);
+              T yh = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d - T(0.5);
+              T zh = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d - T(0.5);
+              T ux = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*xh)*std::sin(T(4)*M_PI*yh) + std::cos(T(4)*M_PI*zh)*std::cos(T(4)*M_PI*xh)) * cos_pi_t;
+              T uy = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*yh)*std::sin(T(4)*M_PI*zh) + std::cos(T(4)*M_PI*xh)*std::cos(T(4)*M_PI*yh)) * cos_pi_t;
+              T uz = (U0_Global / T(2)) * (std::sin(T(4)*M_PI*zh)*std::sin(T(4)*M_PI*xh) + std::cos(T(4)*M_PI*yh)*std::cos(T(4)*M_PI*zh)) * cos_pi_t;
+              blockVelocity.get(id) = Vector<T, 3>(ux, uy, uz);
+            }
+          }
+        }
+      }
+    } else if (isShear) {
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        auto& blockVelocity = velocityField.getBlockField(blockid);
+        T voxelSize = block.getVoxelSize();
+        const auto& proj = block.getProjection();
+
+        for (int k = 0; k < block.getNz(); ++k) {
+          for (int j = 0; j < block.getNy(); ++j) {
+            for (int i = 0; i < block.getNx(); ++i) {
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              T xh = (block.getMin()[0] + static_cast<T>(i) * voxelSize) / d - T(0.5);
+              T yh = (block.getMin()[1] + static_cast<T>(j) * voxelSize) / d - T(0.5);
+              T zh = (block.getMin()[2] + static_cast<T>(k) * voxelSize) / d - T(0.5);
+              T ux = M_PI * U0_Global * std::cos(M_PI * xh) * (std::sin(M_PI * zh) - std::sin(M_PI * yh)) * cos_pi_t;
+              T uy = M_PI * U0_Global * std::cos(M_PI * yh) * (std::sin(M_PI * xh) - std::sin(M_PI * zh)) * cos_pi_t;
+              T uz = M_PI * U0_Global * std::cos(M_PI * zh) * (std::sin(M_PI * yh) - std::sin(M_PI * xh)) * cos_pi_t;
+              blockVelocity.get(id) = Vector<T, 3>(ux, uy, uz);
+            }
+          }
+        }
+      }
+    }
+    DropletLattice.getField<VELOCITY<T, 3>>().Communicate();
+
+    for (int block_idx = 0; block_idx < Geo.getBlockNum(); ++block_idx) {
+        auto& blockLat = DropletLattice.getBlockLat(block_idx);
+        auto& blockPhiField = phiField.getBlockField(block_idx);
+        for (std::size_t id = 0; id < blockLat.getVoxNum(); ++id) {
+          CELL cell(id, blockLat);
+          T phi_new = T(0);
+          for (unsigned int q = 0; q < LatSet::q; ++q) {
+              phi_new += cell[q];
+          }
+          blockPhiField.get(id) = phi_new;
+        }
+    }
+
+    DropletLattice.getField<PHI<T>>().Communicate();
+
+    DropletLattice.template ApplyCellDynamics<DropletNormalTask>(FlagFM);
+    DropletLattice.getField<NORMAL<T, LatSet::d>>().Communicate();
+    DropletLattice.template ApplyCellDynamics<DropletCollisionTask>(FlagFM);
+
+    DropletLattice.Stream();
+
+    if (isPeriodic) {
+      Drop_Periodic.Apply();
+    } else {
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        auto& blockPhi = phiField.getBlockField(blockid);
+        auto& blockLat = DropletLattice.getBlockLat(blockid);
+        const auto& block = Geo.getBlock(blockid);
+        const auto& flagarr = FlagFM.getBlockField(blockid).getField(0);
+        int overlap = block.getOverlap();
+        const auto& proj = block.getProjection();
+        for (int k = overlap; k < block.getNz() - overlap; ++k) {
+          for (int j = overlap; j < block.getNy() - overlap; ++j) {
+            for (int i = overlap; i < block.getNx() - overlap; ++i) {
+              std::size_t id = k * proj[2] + j * proj[1] + i;
+              if (util::isFlag(flagarr[id], PeriodicFlag)) {
+                T phi_bulk = blockPhi.get(id);
+                CELL cell(id, blockLat);
+                for (unsigned int q = 0; q < LatSet::q; ++q) {
+                  cell[q] = latset::w<LatSet>(q) * phi_bulk;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    DropletLattice.NormalCommunicate();
+
+    ++MainLoopTimer;
+    ++OutputTimer;
+
+    if (MainLoopTimer() % OutputStep == 0) {
+      DropletLattice.getField<GRAD<T, LatSet::d>>().Communicate();
+      DropletLattice.getField<VELOCITY<T, 3>>().Communicate();
+      DropletLattice.getField<PHI<T>>().Communicate();
+      OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
+      Printer::Endl();
+      MainWriter.WriteBinary(MainLoopTimer());
+    }
+  }
+
+  Printer::Print_BigBanner(std::string("Simple 3D Droplet Simulation Complete!"));
+  MainWriter.WriteBinary(MainLoopTimer());
+  MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
+  Printer::Print("Total PhysTime", dummyConv.getPhysTime(MainLoopTimer()));
+  Printer::Endl();
+
+  T l2_sum = T(0);
+  T L0 = static_cast<T>(Nx);
+  for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+    auto& blockPhi = phiField.getBlockField(blockid);
+    auto& blockPhiInit = phiInitialFM.getBlockField(blockid);
+    const auto& block = Geo.getBlock(blockid);
+    int overlap = block.getOverlap();
+    const auto& proj = block.getProjection();
+    for (int k = overlap; k < block.getNz() - overlap; ++k) {
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          std::size_t id = k * proj[2] + j * proj[1] + i;
+          T diff = blockPhi.get(id) - blockPhiInit.get(id);
+          l2_sum += diff * diff;
+        }
+      }
+    }
+  }
+  T l2_norm = std::sqrt(l2_sum);
+  T l2_error = l2_norm / (L0 * L0);
+  IF_MPI_RANK(0) {
+    std::cout << "============ L2 Error ============" << std::endl;
+    std::cout << "  L2 norm:           " << l2_norm << std::endl;
+    std::cout << "  L0^2:              " << L0 * L0 << std::endl;
+    std::cout << "  L2 error (paper):  " << l2_error << std::endl;
+    std::cout << "==================================" << std::endl;
+  }
+
+  return 0;
+}

@@ -1,0 +1,114 @@
+// ini_reader.h
+
+#pragma once
+
+#include <stdio.h>
+
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+
+#include "utils/util.h"
+
+// Read an INI file into easy-to-access name/value pairs.
+// file example
+
+/*
+[int]            ; comment
+intx = 25       ; comment
+; comment
+*/
+
+/*
+[section]
+key=value
+*/
+
+// handle inline comments
+// std::size_t end = line.find(';');
+// if (end != std::string::npos) {
+//   line = line.substr(0, end);
+// }
+
+class iniReader {
+ private:
+  std::map<std::string, std::map<std::string, std::string>> iniContent;
+
+ public:
+  iniReader(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file) {
+      std::cerr << "[iniReader] Can't open file: " << filename << std::endl;
+      exit(1);
+    }
+    std::string line, section;
+    while (std::getline(file, line)) {
+      // Ignore comments
+      if (line[0] == ';') continue;
+
+      if (line[0] == '[') {
+        // read section
+        section = line.substr(1, line.find(']') - 1);
+      } else {
+        // read key-value pair
+        std::istringstream is_line(line);
+        std::string key;
+        if (std::getline(is_line, key, '=')) {
+          std::string value;
+          if (std::getline(is_line, value)) {
+            key = util::trim(key);
+            value = util::trim(value);
+            iniContent[section][key] = value;
+          }
+        }
+      }
+    }
+  }
+
+  // check if a key exists in a section
+  bool hasKey(const std::string& section, const std::string& name) const {
+    auto secIt = iniContent.find(section);
+    if (secIt == iniContent.end()) return false;
+    return secIt->second.find(name) != secIt->second.end();
+  }
+
+  // get value from section and key
+  template <typename T>
+  T getValue(const std::string& section, const std::string& name) {
+    // find if section exists
+    if (iniContent.find(section) == iniContent.end()) {
+      std::cerr << "[iniReader] Section: [" << section << "] not found" << std::endl;
+      exit(1);
+    }
+    // find if key exists
+    if (iniContent[section].find(name) == iniContent[section].end()) {
+      std::cerr << "[iniReader] Key: \"" << name << "\" not found" << std::endl;
+      exit(1);
+    }
+    // read
+    std::string value = iniContent[section][name];
+    std::istringstream is_value(value);
+    T val;
+    is_value >> val;
+    return val;
+  }
+
+  // get all values from a section
+  template <typename T>
+  void getVector(const std::string& section, std::vector<T>& vec) {
+    for (auto& it : iniContent[section]) {
+      std::istringstream is_value(it.second);
+      T val;
+      is_value >> val;
+      vec.push_back(val);
+    }
+  }
+};
+
+// avoid unnecessary conversion
+template <>
+std::string iniReader::getValue<std::string>(const std::string& section,
+                                             const std::string& name) {
+  return iniContent[section][name];
+}

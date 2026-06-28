@@ -1,0 +1,25 @@
+# Build artifacts
+*.o
+*.exe
+compile_commands.json
+
+# Debug logs
+*.log
+debug-*
+diag_*
+run_*
+sim_output*
+split_*
+
+# Archives
+*.tar.gz
+
+# IDE / Editor
+.claude/
+.trae/
+.trae-cn/
+.vscode/
+
+# Debug notes
+Recall.md
+Rising.md
