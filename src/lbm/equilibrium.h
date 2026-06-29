@@ -213,33 +213,5 @@ struct PhaseFieldEquilibrium {
 };
 
 
-// Magnetic field equilibrium (paper Eq. 40):
-//   h_α^eq = ω_α^mag * ψ,  where ψ = Σ h_α
-// For D2Q5: all ω_α = 0.2, independent of the lattice quadrature weights.
-// The magnetic equation is a pure diffusion equation —
-// no advection term, no velocity dependence in the equilibrium.
-template <typename CELLTYPE>
-struct MagEquilibrium {
-  using CELL = CELLTYPE;
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-
-  // Compute equilibrium from scalar psi
-  __any__ static inline void apply(std::array<T, LatSet::q>& feq, const T psi) {
-    constexpr T w_eq = T{1} / T{LatSet::q};  // = 0.2 for D2Q5, 1/7 for D3Q7
-    for (unsigned int k = 0; k < LatSet::q; ++k) {
-      feq[k] = w_eq * psi;
-    }
-  }
-
-  // Compute equilibrium from cell populations (psi = Σ cell[k])
-  __any__ static inline void apply(CELL& cell, std::array<T, LatSet::q>& feq) {
-    T psi = T{};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      psi += cell[i];
-    }
-    apply(feq, psi);
-  }
-};
 
 }  // namespace equilibrium

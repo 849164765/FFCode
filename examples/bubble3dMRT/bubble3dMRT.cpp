@@ -629,10 +629,12 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // E2: phi=1 at Z-no-slip walls (top/bottom)
-    // X/Y are periodic - phi evolves naturally, aligned with bubble2dMRT behavior
+    // E2: phi=1 at all no-slip walls
+    // Only apply to blocks that actually touch a global domain boundary
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
+      T Lx_global = T(Ni) * Cell_Len;
+      T Ly_global = T(Nj) * Cell_Len;
       T Lz_global = T(Nz) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
@@ -642,8 +644,48 @@ int main(int argc, char* argv[]) {
         int ny = block.getNy();
         int nz = block.getNz();
         int overlap = block.getOverlap();
+        T minX = block.getMin()[0];
+        T maxX = block.getMax()[0];
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
         T minZ = block.getMin()[2];
         T maxZ = block.getMax()[2];
+        // x = 0 face
+        if (minX < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id = k * proj[2] + j * proj[1] + overlap;
+              blockPhi.get(id) = T{1};
+            }
+          }
+        }
+        // x = Ni-1 face
+        if (maxX > Lx_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id = k * proj[2] + j * proj[1] + (nx - 1 - overlap);
+              blockPhi.get(id) = T{1};
+            }
+          }
+        }
+        // y = 0 face
+        if (minY < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id = k * proj[2] + overlap * proj[1] + i;
+              blockPhi.get(id) = T{1};
+            }
+          }
+        }
+        // y = Nj-1 face
+        if (maxY > Ly_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id = k * proj[2] + (ny - 1 - overlap) * proj[1] + i;
+              blockPhi.get(id) = T{1};
+            }
+          }
+        }
         // z = 0 face
         if (minZ < Cell_Len * T(1.5)) {
           for (int j = overlap; j < ny - overlap; ++j) {
@@ -716,9 +758,11 @@ int main(int argc, char* argv[]) {
     ff::CommunicateAllSelfFields<T>(PFLattice);
 
     // E3a: Wall grad_phi special handling: copy normal component from first interior cell
-    // Only Z-direction walls (top/bottom). X/Y are periodic.
+    // Only apply to blocks that actually touch a global domain boundary
     {
       auto& gradField = PFLattice.getField<GRAD<T, LatSet::d>>();
+      T Lx_global = T(Ni) * Cell_Len;
+      T Ly_global = T(Nj) * Cell_Len;
       T Lz_global = T(Nz) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
@@ -728,8 +772,52 @@ int main(int argc, char* argv[]) {
         int ny = block.getNy();
         int nz = block.getNz();
         int overlap = block.getOverlap();
+        T minX = block.getMin()[0];
+        T maxX = block.getMax()[0];
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
         T minZ = block.getMin()[2];
         T maxZ = block.getMax()[2];
+        // x = 0 face: copy grad[0]
+        if (minX < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id0 = k * proj[2] + j * proj[1] + overlap;
+              std::size_t id1 = k * proj[2] + j * proj[1] + (overlap + 1);
+              blockGrad.get(id0)[0] = blockGrad.get(id1)[0];
+            }
+          }
+        }
+        // x = Ni-1 face
+        if (maxX > Lx_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id0 = k * proj[2] + j * proj[1] + (nx - 1 - overlap);
+              std::size_t id1 = k * proj[2] + j * proj[1] + (nx - 2 - overlap);
+              blockGrad.get(id0)[0] = blockGrad.get(id1)[0];
+            }
+          }
+        }
+        // y = 0 face: copy grad[1]
+        if (minY < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id0 = k * proj[2] + overlap * proj[1] + i;
+              std::size_t id1 = k * proj[2] + (overlap + 1) * proj[1] + i;
+              blockGrad.get(id0)[1] = blockGrad.get(id1)[1];
+            }
+          }
+        }
+        // y = Nj-1 face
+        if (maxY > Ly_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id0 = k * proj[2] + (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id1 = k * proj[2] + (ny - 2 - overlap) * proj[1] + i;
+              blockGrad.get(id0)[1] = blockGrad.get(id1)[1];
+            }
+          }
+        }
         // z = 0 face: copy grad[2]
         if (minZ < Cell_Len * T(1.5)) {
           for (int j = overlap; j < ny - overlap; ++j) {
@@ -753,10 +841,12 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // E4: Chempot extrapolation at Z walls (Fortran setMacroOrderBC chpoten)
-    // Only Z-direction walls. X/Y are periodic.
+    // E4: Chempot extrapolation at all walls (Fortran setMacroOrderBC chpoten)
+    // Only apply to blocks that actually touch a global domain boundary
     {
       auto& chpotenField = PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
+      T Lx_global = T(Ni) * Cell_Len;
+      T Ly_global = T(Nj) * Cell_Len;
       T Lz_global = T(Nz) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
@@ -766,8 +856,56 @@ int main(int argc, char* argv[]) {
         int ny = block.getNy();
         int nz = block.getNz();
         int overlap = block.getOverlap();
+        T minX = block.getMin()[0];
+        T maxX = block.getMax()[0];
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
         T minZ = block.getMin()[2];
         T maxZ = block.getMax()[2];
+        // x = 0 face
+        if (minX < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id1 = k * proj[2] + j * proj[1] + overlap;
+              std::size_t id2 = k * proj[2] + j * proj[1] + (overlap + 1);
+              std::size_t id3 = k * proj[2] + j * proj[1] + (overlap + 2);
+              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+            }
+          }
+        }
+        // x = Ni-1 face
+        if (maxX > Lx_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int j = overlap; j < ny - overlap; ++j) {
+              std::size_t id1 = k * proj[2] + j * proj[1] + (nx - 1 - overlap);
+              std::size_t id2 = k * proj[2] + j * proj[1] + (nx - 2 - overlap);
+              std::size_t id3 = k * proj[2] + j * proj[1] + (nx - 3 - overlap);
+              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+            }
+          }
+        }
+        // y = 0 face
+        if (minY < Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id1 = k * proj[2] + overlap * proj[1] + i;
+              std::size_t id2 = k * proj[2] + (overlap + 1) * proj[1] + i;
+              std::size_t id3 = k * proj[2] + (overlap + 2) * proj[1] + i;
+              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+            }
+          }
+        }
+        // y = Nj-1 face
+        if (maxY > Ly_global - Cell_Len * T(1.5)) {
+          for (int k = overlap; k < nz - overlap; ++k) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id1 = k * proj[2] + (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id2 = k * proj[2] + (ny - 2 - overlap) * proj[1] + i;
+              std::size_t id3 = k * proj[2] + (ny - 3 - overlap) * proj[1] + i;
+              blockChpoten.get(id1) = (T{4} * blockChpoten.get(id2) - blockChpoten.get(id3)) / T{3};
+            }
+          }
+        }
         // z = 0 face
         if (minZ < Cell_Len * T(1.5)) {
           for (int j = overlap; j < ny - overlap; ++j) {

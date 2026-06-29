@@ -82,40 +82,6 @@ __constexpr__ int shearIndexes<2,9> = 2;
 template <>
 __constexpr__ int shearViscIndexes<2,9>[shearIndexes<2,9>] = { 7, 8};
 
-// ===================================================================
-// D2Q5 MRT — magnetic field potential solver (M_5 from Guo et al. 2025, Eq. 41)
-// Moments: m = (ψ, J_x, J_y, e, p_xx)
-// ψ: conserved (zeroth moment)
-// J_x, J_y: flux moments (relaxed with s_h)
-// e, p_xx: higher-order moments (relaxed with s=1)
-// (InvM_5 kept at original values — verified to produce working simulation.
-//  True inverse differs; original values absorbed into parameter calibration.)
-// ===================================================================
-
-template <>
-__constexpr__ Fraction<> M<2,5>[5][5] = {
-  { 1,  1,  1,  1,  1},
-  { 0,  1, -1,  0,  0},
-  { 0,  0,  0,  1, -1},
-  { 4, -1, -1, -1, -1},
-  { 0,  1,  1, -1, -1}
-};
-
-template <>
-__constexpr__ Fraction<> InvM<2,5>[5][5] = {
-  {{1, 5},       0,       0,  {1, 5},       0},
-  {{1, 5},  {2, 5},       0, {-1, 5},  {1, 5}},
-  {{1, 5}, {-2, 5},       0, {-1, 5},  {1, 5}},
-  {{1, 5},       0,  {2, 5}, {-1, 5}, {-1, 5}},
-  {{1, 5},       0, {-2, 5}, {-1, 5}, {-1, 5}}
-};
-
-template <>
-__constexpr__ int shearIndexes<2,5> = 0;
-
-template <>
-__constexpr__ int shearViscIndexes<2,5>[0] = {};
-
 template <>
 __constexpr__ Fraction<> M<3,19>[19][19] = {
 { 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1},
@@ -302,10 +268,6 @@ struct MRTSource {
     const Vector<T, LatSet::d>& n = cell.template get<NORMAL>();
 
     T phi = cell.template get<GenericRho>();
-    // Clamp phi to [0,1] with NaN/Inf guard before Allen-Cahn source term.
-    // IEEE 754 makes NaN<x false, so isfinite must be checked first.
-    if (!std::isfinite(phi) || phi < T{0}) phi = T{0};
-    if (phi > T{1}) phi = T{1};
     std::array<T, LatSet::q> feq;
     EquilibriumScheme::apply(feq, phi, u);
 
@@ -490,40 +452,52 @@ struct MRTForce {
       cell.template get<GenericRho>() = rho;
     }
     cell.template get<VELOCITY<T, LatSet::d>>() = uc;
-
-    // 3. MRT relaxation time vector
-    //    D3Q19: s_q for q-moments, omega for others (Fortran-aligned)
-    //    D2Q9: aligned with Fortran BubbleRising.f90 L773/L817
-    //          Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
-    //    其他格子：全设为 omega，使 MRTForce 数值等价于 BGKForce
-    //    稳定后可按需调大指定矩的 s_k 来利用 MRT 优势
     T rtvec[LatSet::q] {};
     if constexpr (std::is_same_v<LatSet, D3Q19<T>>) {
-      // D3Q19 MRT relaxation: s_q for q-moments, omega for others
-      T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
-      rtvec[0] = T{0};       // rho
-      rtvec[1] = omega;      // e
-      rtvec[2] = omega;      // epsilon
-      rtvec[3] = T{0};       // jx
-      rtvec[4] = s_q;        // qx
-      rtvec[5] = T{0};       // jy
-      rtvec[6] = s_q;        // qy
-      rtvec[7] = T{0};       // jz
-      rtvec[8] = s_q;        // qz
-      for (unsigned int i = 9; i < LatSet::q; ++i) rtvec[i] = omega;  // stress/higher-order
+      // =====================================================================
+      // 3D Multiphase MRT Relaxation Vector (Based on Premnath 2007 & Fakhari 2017)
+      // 核心原则：解耦物理剪切粘度与数值耗散，镇压 3D 界面高频噪声与声波！
+      // =====================================================================
+      
+      // 放弃 2D 魔法公式，固定为常数以提供稳定的界面耗散
+      T s_q_fixed = T{1.1}; 
+      T s_bulk = T{1.1};     // 控制体粘度，用于快速衰减界面声波
+      T s_ghost = T{1.2};    // 幽灵矩强制耗散，充当高频噪声垃圾桶
+
+      rtvec[0] = T{0};       // rho (守恒)
+      rtvec[1] = s_bulk;     // e (能量 -> 控制体粘度，必须 > omega！)
+      rtvec[2] = s_bulk;     // epsilon (控制体粘度)
+      rtvec[3] = T{0};       // jx (守恒)
+      rtvec[4] = s_q_fixed;  // qx (能量通量)
+      rtvec[5] = T{0};       // jy (守恒)
+      rtvec[6] = s_q_fixed;  // qy (能量通量)
+      rtvec[7] = T{0};       // jz (守恒)
+      rtvec[8] = s_q_fixed;  // qz (能量通量)
+      
+      // 剪切应力矩 (控制物理剪切粘度，必须严格绑定 omega)
+      // 对应库里的 shearViscIndexes: 9, 11, 13, 14, 15
+      rtvec[9]  = omega;     // 3cx^2 - r^2 (剪切)
+      rtvec[11] = omega;     // cy^2 - cz^2 (剪切)
+      rtvec[13] = omega;     // xy (剪切)
+      rtvec[14] = omega;     // xz (剪切)
+      rtvec[15] = omega;     // yz (剪切)
+
+      // 幽灵矩 / 高阶非流体力学矩 (无宏观物理意义，强制拉满以耗散 3D 噪声)
+      // 对应索引: 10, 12, 16, 17, 18
+      rtvec[10] = s_ghost;   // Ghost moment (MAXIMUM DISSIPATION)
+      rtvec[12] = s_ghost;   // Ghost moment
+      rtvec[16] = s_ghost;   // Ghost moment
+      rtvec[17] = s_ghost;   // Ghost moment
+      rtvec[18] = s_ghost;   // Ghost moment
+      // =====================================================================
+
     } else if constexpr (std::is_same_v<LatSet, D2Q9<T>>) {
-      // D2Q9 MRT relaxation: aligned with Fortran BubbleRising.f90 L773/L817
-      // Sf = (0, omega, omega, 0, s_q, 0, s_q, omega, omega)
+      // 2D 保持你原有的逻辑（2D 矩空间紧凑，原有逻辑已足够稳定）
       T s_q = T{8} * (T{2} - omega) / (T{8} - omega);
-      rtvec[0] = T{0};       // rho
-      rtvec[1] = omega;      // e
-      rtvec[2] = omega;      // eps
-      rtvec[3] = T{0};       // jx
-      rtvec[4] = s_q;        // qx
-      rtvec[5] = T{0};       // jy
-      rtvec[6] = s_q;        // qy
-      rtvec[7] = omega;      // pxx
-      rtvec[8] = omega;      // pxy
+      rtvec[0] = T{0}; rtvec[1] = omega; rtvec[2] = omega;
+      rtvec[3] = T{0}; rtvec[4] = s_q;
+      rtvec[5] = T{0}; rtvec[6] = s_q;
+      rtvec[7] = omega; rtvec[8] = omega;
     } else {
       for (unsigned int i = 0; i < LatSet::q; ++i) rtvec[i] = omega;
     }
@@ -585,70 +559,6 @@ struct MRTForce {
         source += invM_ij * (T{1} - rtvec[j] / T{2}) * force_m[j];
       }
       cell[i] = cell[i] - coll + source;
-    }
-  }
-};
-
-// MRT collision for magnetic field potential equation (D2Q5).
-//
-// Solves (1/ε) ∂ψ/∂t = ∇·(μ∇ψ) via pseudo-time relaxation.
-// M_5 moments: m = (ψ, J_x, J_y, e, p_xx).
-// Relaxation: S = diag(1, ω_mag, ω_mag, 1, 1).
-//   ψ:   conserved (s=1, equivalent to s=0 since m[0]=m_eq[0]=ψ identically)
-//   J_x, J_y: relaxed by ω_mag = 1/τ_mag (diffusion rate)
-//   e, p_xx:  fully relaxed to equilibrium (=0) with s=1
-//
-// Equilibrium: h_α^eq = w_eq * ψ with w_eq = 1/q.
-// All non-conserved equilibrium moments are identically zero (M_5 rows sum to 0
-// when acting on constant feq), so no explicit equilibrium computation is needed.
-template <typename CELL, bool WriteToField = false>
-struct MRTMag {
-  using T = typename CELL::FloatType;
-  using LatSet = typename CELL::LatticeSet;
-  using equilibriumscheme = equilibrium::MagEquilibrium<CELL>;
-  using GenericRho = typename CELL::GenericRho;
-
-  __any__ static void apply(CELL& cell) {
-    T omega_mag = cell.getOmega();  // ω = 1/τ, τ = 0.5 + ε·μ_avg/cs²
-
-    // Relaxation vector: S = (1, ω_mag, ω_mag, 1, 1)
-    T rtvec[LatSet::q];
-    rtvec[0] = T{1};
-    if constexpr (LatSet::q > 1) {
-      rtvec[1] = omega_mag;
-      rtvec[2] = omega_mag;
-      for (unsigned int i = 3; i < LatSet::q; ++i) rtvec[i] = T{1};
-    }
-
-    // Build InvM_S = InvM * diag(rtvec)
-    T InvM_S[LatSet::q][LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      for (unsigned int j = 0; j < LatSet::q; ++j) {
-        InvM_S[i][j] = mrt::InvM<LatSet>(i, j) * rtvec[j];
-      }
-    }
-
-    // Forward transform: m = M * f
-    T momenta[LatSet::q] {};
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      for (unsigned int j = 0; j < LatSet::q; ++j) {
-        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
-      }
-    }
-
-    // All non-conserved equilibrium moments are identically zero:
-    //   m_eq[j] = 0 for j > 0  (proven for constant feq with M_5)
-    //   m[0] = m_eq[0] = ψ   (conserved moment, s=1 → no relaxation)
-    //
-    // Collision: cell[i] -= Σ_{j>0} InvM_S[i][j] * m[j]
-    // The conserved moment j=0 is skipped because m[0] = m_eq[0] = ψ
-    // identically, so (m[0] - m_eq[0]) = 0 contributes nothing.
-    for (unsigned int i = 0; i < LatSet::q; ++i) {
-      T coll{};
-      for (unsigned int j = 1; j < LatSet::q; ++j) {
-        coll += InvM_S[i][j] * momenta[j];
-      }
-      cell[i] -= coll;
     }
   }
 };
