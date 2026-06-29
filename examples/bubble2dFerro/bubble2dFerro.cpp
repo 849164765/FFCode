@@ -12,6 +12,89 @@ using T = FLOAT;
 using LatSet = D2Q9<T>;
 using MFLatSet = D2Q5<T>;
 
+// ==================== PF MRT collision (D2Q9) ====================
+// Allen-Cahn MRT collision following Guo et al. Phys.Fluids 2025, Eq.15-23.
+// Only J_x (moment index 3) and J_y (index 5) are relaxed at rate ω_phi.
+// All other moments use s=1 (fully relaxed to equilibrium).
+// This eliminates the sublattice noise that BGK over-relaxation amplifies.
+template <typename CELL>
+struct PF_MRT_Collision {
+  using Tt = typename CELL::FloatType;
+  using LSet = typename CELL::LatticeSet;
+  using CELLTYPE = CELL;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static void apply(CELL& cell) {
+    Tt phi = cell.template get<GenericRho>();
+    const Vector<Tt, LSet::d>& n =
+        cell.template get<NORMAL<Tt, LSet::d>>();
+    Tt omega = cell.getOmega();
+    Tt width = cell.template get<INTERFACEWIDTH<Tt>>();
+
+    // Diagnostic: 5-point velocity filter (self + 4 cardinal neighbours)
+    Vector<Tt, LSet::d> u = cell.template get<VELOCITY<Tt, LSet::d>>();
+    for (int i = 1; i <= 4; ++i) {
+      u += cell.getNeighbor(i).template get<VELOCITY<Tt, LSet::d>>();
+    }
+    u /= Tt{5};
+
+    // 1. Build equilibrium f_eq (first-order, Eq.18)
+    std::array<Tt, 9> feq_arr{};
+    for (int i = 0; i < 9; ++i) {
+      Tt uc = u * latset::c<LSet>(i);
+      feq_arr[i] = latset::w<LSet>(i) * phi *
+                   (Tt{1} + uc * LSet::InvCs2);
+    }
+
+    // 2. Build source term F_β (Eq.19)
+    std::array<Tt, 9> F_arr{};
+    for (int i = 0; i < 9; ++i) {
+      Tt en = latset::c<LSet>(i) * n;
+      F_arr[i] = latset::w<LSet>(i) * en *
+                 (Tt{4} * phi * (Tt{1} - phi)) / width;
+    }
+
+    // 3. Transform f, f_eq, F to moment space (using code's M_9 matrix)
+    //    M_9 rows (per collisionMRT.h):
+    //    0: mass, 1: energy, 2: energy², 3: J_x, 4: q_x,
+    //    5: J_y, 6: q_y, 7: p_xx, 8: p_xy
+    Tt m[9]{}, meq[9]{}, mF[9]{};
+    for (int i = 0; i < 9; ++i) {
+      for (int j = 0; j < 9; ++j) {
+        Tt Mij = mrt::M<LSet>(i, j);
+        m[i]   += Mij * cell[j];
+        meq[i] += Mij * feq_arr[j];
+        mF[i]  += Mij * F_arr[j];
+      }
+    }
+
+    // 4. Relaxation vector (Eq.21-23): s = {1,1,1, ω,1, ω,1,1,1}
+    Tt s[9];
+    s[0] = Tt{1}; s[1] = Tt{1}; s[2] = Tt{1};
+    s[3] = omega;              // J_x → over-relaxed
+    s[4] = Tt{1};
+    s[5] = omega;              // J_y → over-relaxed
+    s[6] = Tt{1}; s[7] = Tt{1}; s[8] = Tt{1};
+
+    // 5. Collision: m_post = m - s·(m - m_eq) + (1 - s/2)·m_F
+    Tt m_post[9];
+    for (int i = 0; i < 9; ++i) {
+      m_post[i] = m[i] - s[i] * (m[i] - meq[i]) +
+                  (Tt{1} - Tt{0.5} * s[i]) * mF[i];
+    }
+
+    // 6. Transform back: f_new = InvM_9 * m_post
+    for (int i = 0; i < 9; ++i) {
+      Tt sum = Tt{0};
+      for (int j = 0; j < 9; ++j) {
+        sum += mrt::InvM<LSet>(i, j) * m_post[j];
+      }
+      cell[i] = sum;
+    }
+  }
+};
+// ================================================================
+
 /*----------------------------------------------
             Simulation Parameters
 -----------------------------------------------*/
@@ -404,10 +487,7 @@ int main(int argc, char* argv[]) {
 
   using PFCollisionTask = tmp::Key_TypePair<
     BulkFlag,
-    collision::BGKSource<
-      equilibrium::SecondOrder<PFCELL>,
-      NORMAL<T, LatSet::d>,
-      true>>;
+    PF_MRT_Collision<PFCELL>>;
   using PFCollisionTaskSelector = TaskSelector<std::uint8_t, PFCELL, PFCollisionTask>;
 
   // PF permeability update task (μ)
