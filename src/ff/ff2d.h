@@ -6,19 +6,6 @@
 namespace ff {
 
 // ===================================================================
-//  Utility: quintic smooth-step (Heaviside-like) function
-//  h(φ) = φ³(6φ² - 15φ + 10)
-//  Satisfies: h(0)=0, h(1)=1, h'(0)=h'(1)=0, h''(0)=h''(1)=0
-//  Provides smooth transition of magnetic properties across the interface.
-// ===================================================================
-template <typename T>
-__any__ T quinticSmoothStep(T phi) {
-  T phi2 = phi * phi;
-  T phi3 = phi2 * phi;
-  return phi3 * (T{6} * phi2 - T{15} * phi + T{10});
-}
-
-// ===================================================================
 //  Section 1: Self-Owned Field Base Definitions
 //  (cf. src/ca/zhu_stefanescu2d.h: STATEBase, FSBase, ...)
 //
@@ -52,7 +39,6 @@ struct HFieldBase : public FieldBase<1> {};
 struct HSqBase : public FieldBase<1> {};
 struct MuBase : public FieldBase<1> {};         // interpolated μ on PF lattice
 struct ChiBase : public FieldBase<1> {};         // interpolated χ on MF lattice
-struct FmBase : public FieldBase<1> {};          // magnetic force F_m = (χ/2)·∇|H|²
 
 // ===================================================================
 //  Section 2: Self-Owned Field Type Aliases
@@ -109,9 +95,6 @@ template <typename T>
 using MU = GenericField<GenericArray<T>, MuBase>;
 template <typename T>
 using CHI = GenericField<GenericArray<T>, ChiBase>;
-
-template <typename T, unsigned int D>
-using F_MAGNETIC = GenericField<GenericArray<Vector<T, D>>, FmBase>;
 
 // ===================================================================
 //  Section 3: Field Packs (self-owned + external, cf. CAFIELDS + REFFIELDS)
@@ -299,8 +282,7 @@ struct FFViscoForce3D {
 //  MFGradient2D:  H = -∇ψ using second-order central difference on D2Q5
 //  MFHsq2D:       |H|² = H_x² + H_y²
 //  MFForce2D:     F_m = (χ/2) ∇(|H|²) → add to NSCELL::FORCE
-//  FFMuUpdate2D:  μ = μ_l + (μ_h - μ_l) * h(φ)  with h(φ)=quinticSmoothStep
-//  Quintic smooth-step replaces linear interpolation for better stability
+//  FFMuUpdate2D:  μ = μ_l + φ(μ_h - μ_l) on PF lattice
 // ===================================================================
 
 template <typename MFCELL>

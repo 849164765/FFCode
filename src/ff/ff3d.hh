@@ -148,13 +148,12 @@ __any__ void FFRhoOmegaUpdate3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   ns_cell.template get<OMEGA<T>>() = omega;
 }
 
-// ---- FFViscoForce3D (Standard d'Humières D3Q19 Basis) ----
+// ---- FFViscoForce3D (Palabos/Latt Simplified D3Q19 Basis) ----
 
 // F_v = -3 * mu * DeltaRho / rho * (C · grad_phi)
 // C_ab = Σ_k c_ka * c_kb * mgneq_k
-// mgneq = InvM_std · S1 · (m - m_eq)   (first-pass MRT relaxation)
-// m = M_std * f,  m_eq = M_std * feq  (standard d'Humières 2002 basis)
-// S1 = diag(0, ω, ω, 0, s_q, 0, s_q, 0, s_q, ω, ..., ω)
+// mgneq = InvM · S1 · (m - m_eq)   (first-pass MRT relaxation)
+// S1 = diag(0, ω, ω, 0, s_q, 0, s_q, 0, s_q, ω, ω, ω, ω, ω, ω, ω, ω, ω, ω)
 //
 // Adds F_v to NS FORCE (which already contains F_s + F_b + F_p)
 
@@ -224,45 +223,86 @@ __any__ void FFViscoForce3DM<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_
     omega     // 18: 幽灵矩
   };
 
-  // Moments from populations using standard d'Humières MRT basis.
-  // m_raw = M_std * f  (matrix multiply, dimension-independent)
-  // Compute Σf (=zeroth moment / pressure) for incompressible equilibrium.
-  T zeroth = T{};
-  for (unsigned int k = 0; k < LatSet::q; ++k) zeroth += f[k];
-  T m_raw[LatSet::q] {};
-  for (unsigned int i = 0; i < LatSet::q; ++i) {
-    for (unsigned int j = 0; j < LatSet::q; ++j) {
-      m_raw[i] += mrt::M_standard<LatSet>(i, j) * f[j];
-    }
-  }
+  // Moments from populations (M·f, unrolled D3Q19 matching library M matrix)
+  T zeroth = rho; 
+  T m_raw[LatSet::q];
+  m_raw[0] = zeroth;
+  m_raw[1] = -f[0] + f[7] + f[8] + f[9] + f[10] + f[11] + f[12] + f[13] + f[14] + f[15] + f[16] + f[17] + f[18];
+  m_raw[2] = f[0] - T{2}*(f[1]+f[2]+f[3]+f[4]+f[5]+f[6]) + f[7]+f[8]+f[9]+f[10]+f[11]+f[12]+f[13]+f[14]+f[15]+f[16]+f[17]+f[18];
+  m_raw[3] = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+  m_raw[4] = -T{2}*f[1] + T{2}*f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+  m_raw[5] = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+  m_raw[6] = -T{2}*f[3] + T{2}*f[4] + f[7] - f[8] + f[11] - f[12] - f[13] + f[14] + f[17] - f[18];
+  m_raw[7] = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  m_raw[8] = -T{2}*f[5] + T{2}*f[6] + f[9] - f[10] + f[11] - f[12] - f[15] + f[16] - f[17] + f[18];
+  m_raw[9] = T{2}*(f[1]+f[2]) - (f[3]+f[4]+f[5]+f[6]) + (f[7]+f[8]+f[9]+f[10]) - T{2}*(f[11]+f[12]) + (f[13]+f[14]+f[15]+f[16]) - T{2}*(f[17]+f[18]);
+  m_raw[10] = -T{2}*(f[1]+f[2]) + (f[3]+f[4]+f[5]+f[6]) + (f[7]+f[8]+f[9]+f[10]) - T{2}*(f[11]+f[12]) + (f[13]+f[14]+f[15]+f[16]) - T{2}*(f[17]+f[18]);
+  m_raw[11] = f[3]+f[4] - (f[5]+f[6]) + f[7]+f[8] - (f[9]+f[10]) + f[13]+f[14] - (f[15]+f[16]);
+  m_raw[12] = -f[3]-f[4] + f[5]+f[6] + f[7]+f[8] - (f[9]+f[10]) + f[13]+f[14] - (f[15]+f[16]);
+  m_raw[13] = f[7]+f[8] - f[13]-f[14];
+  m_raw[14] = f[9]+f[10] - f[15]-f[16];
+  m_raw[15] = f[11]+f[12] - f[17]-f[18];
+  m_raw[16] = f[7]-f[8] - f[9]+f[10] + f[13]-f[14] - f[15]+f[16];
+  m_raw[17] = f[7]-f[8] - f[11]+f[12] - f[13]+f[14] - f[17]+f[18];
+  m_raw[18] = f[9]-f[10] - f[11]+f[12] - f[15]+f[16] + f[17]-f[18];
 
-  // Equilibrium in population space, then project to moment space.
-  // Uses incompressible (He-Luo, p=Σf) or compressible (ρ=Σf) formulation.
-  std::array<T, LatSet::q> feq{};
+  // Equilibrium moments: Palabos/Latt Simplified D3Q19 Basis
+  // NOTE: This basis naturally maintains Galilean invariance without O(u^3) corrections!
+  // Many higher-order moments are EXACTLY ZERO in equilibrium.
+  T ucx2 = ucx * ucx;
+  T ucy2 = ucy * ucy;
+  T ucz2 = ucz * ucz;
+  T uc2 = ucx2 + ucy2 + ucz2;
+  T m_eq[LatSet::q];
+  
   if constexpr (isIncompressible) {
-    Vector<T, LatSet::d> uc{ucx, ucy, ucz};
-    equilibrium::IncompressibleSecondOrder<NSCELL>::apply(feq, zeroth, uc);
+    m_eq[0] = zeroth;
+    m_eq[1] = zeroth * uc2;
+    m_eq[2] = T{0};
+    m_eq[3] = ucx;
+    m_eq[4] = T{0};
+    m_eq[5] = ucy;
+    m_eq[6] = T{0};
+    m_eq[7] = ucz;
+    m_eq[8] = T{0};
+    m_eq[9] = T{2} * ucx2 - ucy2 - ucz2;
+    m_eq[10] = T{0};
+    m_eq[11] = ucy2 - ucz2;
+    m_eq[12] = T{0};
+    m_eq[13] = ucx * ucy;
+    m_eq[14] = ucx * ucz;
+    m_eq[15] = ucy * ucz;
+    m_eq[16] = T{0}; m_eq[17] = T{0}; m_eq[18] = T{0};
   } else {
-    Vector<T, LatSet::d> uc{ucx, ucy, ucz};
-    equilibrium::SecondOrder<NSCELL>::apply(feq, rho, uc);
-  }
-  T m_eq[LatSet::q] {};
-  for (unsigned int i = 0; i < LatSet::q; ++i) {
-    for (unsigned int j = 0; j < LatSet::q; ++j) {
-      m_eq[i] += mrt::M_standard<LatSet>(i, j) * feq[j];
-    }
+    m_eq[0] = rho;
+    m_eq[1] = rho * uc2;
+    m_eq[2] = T{0};
+    m_eq[3] = rho * ucx;
+    m_eq[4] = T{0};
+    m_eq[5] = rho * ucy;
+    m_eq[6] = T{0};
+    m_eq[7] = rho * ucz;
+    m_eq[8] = T{0};
+    m_eq[9] = rho * (T{2} * ucx2 - ucy2 - ucz2);
+    m_eq[10] = T{0};
+    m_eq[11] = rho * (ucy2 - ucz2);
+    m_eq[12] = T{0};
+    m_eq[13] = rho * ucx * ucy;
+    m_eq[14] = rho * ucx * ucz;
+    m_eq[15] = rho * ucy * ucz;
+    m_eq[16] = T{0}; m_eq[17] = T{0}; m_eq[18] = T{0};
   }
 
   // Deviation in moment space
   T dm[LatSet::q];
   for (unsigned int i = 0; i < LatSet::q; ++i) dm[i] = m_raw[i] - m_eq[i];
 
-  // Non-equilibrium population: mgneq_i = Σ_j InvM_std(i,j) * S1(j) * dm_j
+  // Non-equilibrium population: mgneq_i = Σ_j InvM(i,j) * S1(j) * dm_j
   T mgneq[LatSet::q] {};
   for (unsigned int i = 0; i < LatSet::q; ++i) {
     mgneq[i] = T{};
     for (unsigned int j = 0; j < LatSet::q; ++j) {
-      mgneq[i] += mrt::InvM_standard<LatSet>(i, j) * rtvec1[j] * dm[j];
+      mgneq[i] += mrt::InvM<LatSet>(i, j) * rtvec1[j] * dm[j];
     }
   }
 

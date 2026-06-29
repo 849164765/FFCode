@@ -338,33 +338,19 @@ __any__ void FFViscoForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
 
 template <typename MFCELL>
 __any__ void MFGradient2D<MFCELL>::apply(MFCELL& mf_cell) {
-  // D2Q9 isotropic gradient stencil (Guo et al. 2002, Krüger et al. 2017)
-  // Includes diagonal directions to suppress 2Δx checkerboard mode.
-  // cs²(D2Q9)=1/3, orthogonal w=1/9, diagonal w=1/36.
-  constexpr T inv_cs2 = T{3};
-  constexpr T w_ortho = T{1} / T{9};
-  constexpr T w_diag  = T{1} / T{36};
+  Vector<T, LatSet::d> grad;
+  grad[0] = T{0};
+  grad[1] = T{0};
 
-  Vector<T, LatSet::d> grad{T{0}, T{0}};
-
-  // Orthogonal neighbours: D2Q5 indices 1–4, D2Q9 weights
   for (unsigned int i = 1; i < LatSet::q; ++i) {
     T psi_i = mf_cell.getNeighbor(i).template get<PSI<T>>();
+    T wi = latset::w<LatSet>(i);
     const auto& ci = latset::c<LatSet>(i);
-    grad[0] += w_ortho * ci[0] * psi_i;
-    grad[1] += w_ortho * ci[1] * psi_i;
+    grad[0] += wi * ci[0] * psi_i;
+    grad[1] += wi * ci[1] * psi_i;
   }
-
-  // Diagonal neighbours via generic Vector<int,2> interface
-  T psi_ne = mf_cell.getNeighbor(Vector<int,2>{1, 1}).template get<PSI<T>>();
-  T psi_sw = mf_cell.getNeighbor(Vector<int,2>{-1,-1}).template get<PSI<T>>();
-  T psi_se = mf_cell.getNeighbor(Vector<int,2>{1,-1}).template get<PSI<T>>();
-  T psi_nw = mf_cell.getNeighbor(Vector<int,2>{-1,1}).template get<PSI<T>>();
-  grad[0] += w_diag * (psi_ne + psi_se - psi_sw - psi_nw);
-  grad[1] += w_diag * (psi_ne - psi_se + psi_nw - psi_sw);
-
-  grad[0] *= inv_cs2;
-  grad[1] *= inv_cs2;
+  grad[0] /= LatSet::cs2;
+  grad[1] /= LatSet::cs2;
 
   // H = -∇ψ
   auto& H = mf_cell.template get<H_FIELD<T, LatSet::d>>();
@@ -386,64 +372,42 @@ __any__ void MFHsq2D<MFCELL>::apply(MFCELL& mf_cell) {
 // Force is added to NSCELL::FORCE
 template <typename MFCELL, typename NSCELL>
 __any__ void MFForce2D<MFCELL, NSCELL>::apply(MFCELL& mf_cell, NSCELL& ns_cell) {
-  // D2Q9 isotropic gradient of H_SQ (Guo et al. 2002, Krüger et al. 2017)
-  constexpr T inv_cs2 = T{3};
-  constexpr T w_ortho = T{1} / T{9};
-  constexpr T w_diag  = T{1} / T{36};
+  // Gradient of H_SQ using LBM-weighted stencil
+  Vector<T, LatSet::d> grad_hsq;
+  grad_hsq[0] = T{0};
+  grad_hsq[1] = T{0};
 
-  Vector<T, LatSet::d> grad_hsq{T{0}, T{0}};
-
-  // Orthogonal neighbours
   for (unsigned int i = 1; i < LatSet::q; ++i) {
     T hsq_i = mf_cell.getNeighbor(i).template get<H_SQ<T>>();
+    T wi = latset::w<LatSet>(i);
     const auto& ci = latset::c<LatSet>(i);
-    grad_hsq[0] += w_ortho * ci[0] * hsq_i;
-    grad_hsq[1] += w_ortho * ci[1] * hsq_i;
+    grad_hsq[0] += wi * ci[0] * hsq_i;
+    grad_hsq[1] += wi * ci[1] * hsq_i;
   }
-
-  // Diagonal neighbours
-  T hsq_ne = mf_cell.getNeighbor(Vector<int,2>{1, 1}).template get<H_SQ<T>>();
-  T hsq_sw = mf_cell.getNeighbor(Vector<int,2>{-1,-1}).template get<H_SQ<T>>();
-  T hsq_se = mf_cell.getNeighbor(Vector<int,2>{1,-1}).template get<H_SQ<T>>();
-  T hsq_nw = mf_cell.getNeighbor(Vector<int,2>{-1,1}).template get<H_SQ<T>>();
-  grad_hsq[0] += w_diag * (hsq_ne + hsq_se - hsq_sw - hsq_nw);
-  grad_hsq[1] += w_diag * (hsq_ne - hsq_se + hsq_nw - hsq_sw);
-
-  grad_hsq[0] *= inv_cs2;
-  grad_hsq[1] *= inv_cs2;
+  grad_hsq[0] /= LatSet::cs2;
+  grad_hsq[1] /= LatSet::cs2;
 
   // Read interpolated χ from MF cell
   T chi = mf_cell.template get<CHI<T>>();
 
   // F_m = (χ/2) * ∇(|H|²)
   T coeff = chi * T{0.5};
-  Vector<T, LatSet::d> f_m;
-  f_m[0] = coeff * grad_hsq[0];
-  f_m[1] = coeff * grad_hsq[1];
-
   auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
-  ns_force[0] += f_m[0];
-  ns_force[1] += f_m[1];
-
-  // Store pure magnetic force in MF cell for diagnostics
-  if constexpr (MFCELL::template hasField<F_MAGNETIC<T, LatSet::d>>()) {
-    mf_cell.template get<F_MAGNETIC<T, LatSet::d>>() = f_m;
-  }
+  ns_force[0] += coeff * grad_hsq[0];
+  ns_force[1] += coeff * grad_hsq[1];
 }
 
 // ---- FFMuUpdate2D ----
-// μ = μ_l + (μ_h - μ_l) * h(φ)
-// h(φ) = φ³(6φ² - 15φ + 10) — quintic smooth-step (Heaviside-like)
-// Replaces linear interpolation for smoother magnetic property transition.
+// μ = μ_l + φ(μ_h - μ_l)
 // Stores interpolated permeability in MU<T> field on PF lattice.
+// Uses GenericRho = PHI from PF cell.
 template <typename PFCELL>
 __any__ void FFMuUpdate2D<PFCELL>::apply(PFCELL& pf_cell) {
   T phi = pf_cell.template get<GenericRho>();
   T mu_l = pf_cell.template get<MU_L<T>>();
   T mu_h = pf_cell.template get<MU_H<T>>();
 
-  T h = quinticSmoothStep(phi);
-  pf_cell.template get<MU<T>>() = mu_l + (mu_h - mu_l) * h;
+  pf_cell.template get<MU<T>>() = mu_l + phi * (mu_h - mu_l);
 }
 
 }  // namespace ff

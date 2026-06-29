@@ -397,15 +397,16 @@ int main(int argc, char* argv[]) {
 
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
-  //vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
-  //vtmo::VectorWriter NormalWriter("NORMAL", PFLattice.getField<NORMAL<T, 2>>());
-  //vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
-  //vtmo::ScalarWriter DensityWriter("Density", NSLattice.getField<DENSITY<T>>());
-  //vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
-  //vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
+  vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
+  vtmo::VectorWriter NormalWriter("NORMAL", PFLattice.getField<NORMAL<T, 2>>());
+  vtmo::VectorWriter VecWriter("Velocity", NSLattice.getField<VELOCITY<T, 2>>());
+  vtmo::ScalarWriter DensityWriter("Density", NSLattice.getField<DENSITY<T>>());
+  vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
+  vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
-  MainWriter.addWriterSet(PHIWriter);
+  MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
+                          VecWriter, PressureWriter, DensityWriter, ForceWriter);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
