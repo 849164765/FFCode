@@ -142,6 +142,7 @@ struct RHOBase : public FieldBase<1> {};
 struct TEMPBase : public FieldBase<1> {};
 struct CONCBase : public FieldBase<1> {};
 struct PHIBase : public FieldBase<1> {};
+struct PsiBase : public FieldBase<1> {};  // ψ — magnetic scalar potential (same level as PHI)
 struct VELOCITYBase : public FieldBase<1> {};
 struct FLAGBase : public FieldBase<1> {};
 struct FORCEBase : public FieldBase<1> {};
@@ -195,6 +196,8 @@ template <typename T, unsigned int D>
 using NORMAL = GenericField<GenericArray<Vector<T, D>>, NORMALBase>;
 template <typename T>
 using PHI = GenericField<GenericArray<T>, PHIBase>;
+template <typename T>
+using PSI = GenericField<GenericArray<T>, PsiBase>;
 template <typename T>
 using INTERFACEWIDTH = GenericField<GenericArray<T>, WidthBase>;
 
@@ -265,6 +268,9 @@ template <typename T>
 using CONC = GenericField<GenericArray<T>, CONCBase>;
 template <typename T>
 using PHI = GenericField<GenericArray<T>, PHIBase>;
+
+template <typename T>
+using PSI = GenericField<GenericArray<T>, PsiBase>;
 
 template <typename T, unsigned int D>
 using GRAD = GenericField<GenericArray<Vector<T, D>>, GRADBase>;

@@ -439,14 +439,14 @@ struct FindGenericRhoType;
 template <typename T, typename First, typename... Rest>
 struct FindGenericRhoType<T, TypePack<First, Rest...>> {
   using type =
-    std::conditional_t<isOneOf<First, DENSITY<T>, RHO<T>, TEMP<T>, CONC<T>, PHI<T>>::value, First,
+    std::conditional_t<isOneOf<First, DENSITY<T>, RHO<T>, TEMP<T>, CONC<T>, PHI<T>, PSI<T>>::value, First,
                        typename FindGenericRhoType<T, TypePack<Rest...>>::type>;
 };
 
 template <typename T, typename First>
 struct FindGenericRhoType<T, TypePack<First>> {
   using type =
-    std::conditional_t<isOneOf<First, DENSITY<T>, RHO<T>, TEMP<T>, CONC<T>, PHI<T>>::value, First, void>;
+    std::conditional_t<isOneOf<First, DENSITY<T>, RHO<T>, TEMP<T>, CONC<T>, PHI<T>, PSI<T>>::value, First, void>;
 };
 
 namespace cudev{

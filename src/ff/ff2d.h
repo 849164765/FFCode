@@ -31,7 +31,7 @@ struct DeltaRhoBase : public FieldBase<1> {};
 // Magnetic field base types
 // ===================================================================
 // Per-cell ghost fields (on MF lattice)
-struct PsiBase : public FieldBase<1> {};        // ψ — magnetic scalar potential
+// PsiBase is now in utils/alias.h alongside PHIBase (for FindGenericRhoType)
 struct HFieldBase : public FieldBase<1> {};     // H vector — magnetic field
 struct HSqBase : public FieldBase<1> {};        // |H|²
 // Per-cell ghost fields (on PF lattice, for coupling)
@@ -91,8 +91,10 @@ template <typename T>
 using CHI_H = Data<T, ChiHBase>;
 
 // Magnetic field: per-cell ghost fields (GenericField<GenericArray<T>>)
+// PsiBase is now in utils/alias.h; re-export into ff namespace
+using ::PsiBase;
 template <typename T>
-using PSI = GenericField<GenericArray<T>, PsiBase>;
+using PSI = ::PSI<T>;
 template <typename T, unsigned int D>
 using H_FIELD = GenericField<GenericArray<Vector<T, D>>, HFieldBase>;
 template <typename T>
