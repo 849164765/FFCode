@@ -212,6 +212,32 @@ struct PhaseFieldEquilibrium {
   }
 };
 
+// ===================================================================
+// Magnetic field equilibrium — Hu & Li (2018) §II.D Eq.(41):
+//   h_α^eq = ω_α^mag · ψ          ψ = Σ h_α
+//   ω_α^mag = 1/q   (uniform, independent of lattice w_α)
+// Pure diffusion — no advection, no velocity dependence.
+// ===================================================================
+template <typename CELLTYPE>
+struct MagEquilibrium {
+  using CELL = CELLTYPE;
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
 
+  __any__ static inline void apply(std::array<T, LatSet::q>& feq, const T psi) {
+    constexpr T w_eq = T{1} / T{LatSet::q};
+    for (unsigned int k = 0; k < LatSet::q; ++k) {
+      feq[k] = w_eq * psi;
+    }
+  }
+
+  __any__ static inline void apply(CELL& cell, std::array<T, LatSet::q>& feq) {
+    T psi = T{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      psi += cell[i];
+    }
+    apply(feq, psi);
+  }
+};
 
 }  // namespace equilibrium

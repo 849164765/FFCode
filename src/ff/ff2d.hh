@@ -327,4 +327,97 @@ __any__ void FFViscoForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_c
   ns_cell.template get<FORCE<T, LatSet::d>>()[1] += Fv_y;
 }
 
+// ===================================================================
+//  Magnetic Field Functor Implementations
+//  Hu & Li (2018) Phys. Rev. E 98, 033301
+// ===================================================================
+
+// ---- MFGradient2D ----
+// H = -∇ψ  via LBM-weighted gradient stencil (Eq.46)
+// ∇ψ = (1/cs²) Σ_{α>0} w_α c_α ψ(x+e_α)
+// Works for both D2Q5 and D2Q9 lattices
+template <typename MFCELL>
+__any__ void MFGradient2D<MFCELL>::apply(MFCELL& mf_cell) {
+  Vector<T, LatSet::d> grad;
+  grad[0] = T{0};
+  grad[1] = T{0};
+
+  for (unsigned int i = 1; i < LatSet::q; ++i) {
+    T psi_i = mf_cell.getNeighbor(i).template get<PSI<T>>();
+    T wi = latset::w<LatSet>(i);
+    const auto& ci = latset::c<LatSet>(i);
+    grad[0] += wi * ci[0] * psi_i;
+    grad[1] += wi * ci[1] * psi_i;
+  }
+  grad[0] /= LatSet::cs2;
+  grad[1] /= LatSet::cs2;
+
+  // H = -∇ψ
+  auto& H = mf_cell.template get<H_FIELD<T, LatSet::d>>();
+  H[0] = -grad[0];
+  H[1] = -grad[1];
+}
+
+// ---- MFHsq2D ----
+// |H|² = H_x² + H_y²
+template <typename MFCELL>
+__any__ void MFHsq2D<MFCELL>::apply(MFCELL& mf_cell) {
+  auto& H = mf_cell.template get<H_FIELD<T, LatSet::d>>();
+  mf_cell.template get<H_SQ<T>>() = H[0] * H[0] + H[1] * H[1];
+}
+
+// ---- MFForce2D ----
+// F_m = (χ/2) ∇(|H|²)  — Eq.(10)
+// ∇(|H|²) via LBM-weighted stencil on MF lattice
+// χ from MF cell (interpolated via FFCchiUpdate2D)
+// Force added to NSCELL::FORCE
+template <typename MFCELL, typename NSCELL>
+__any__ void MFForce2D<MFCELL, NSCELL>::apply(MFCELL& mf_cell, NSCELL& ns_cell) {
+  // Gradient of H_SQ
+  Vector<T, LatSet::d> grad_hsq;
+  grad_hsq[0] = T{0};
+  grad_hsq[1] = T{0};
+
+  for (unsigned int i = 1; i < LatSet::q; ++i) {
+    T hsq_i = mf_cell.getNeighbor(i).template get<H_SQ<T>>();
+    T wi = latset::w<LatSet>(i);
+    const auto& ci = latset::c<LatSet>(i);
+    grad_hsq[0] += wi * ci[0] * hsq_i;
+    grad_hsq[1] += wi * ci[1] * hsq_i;
+  }
+  grad_hsq[0] /= LatSet::cs2;
+  grad_hsq[1] /= LatSet::cs2;
+
+  // χ from MF cell
+  T chi = mf_cell.template get<CHI<T>>();
+
+  // F_m = (χ/2) * ∇(|H|²)
+  T coeff = chi * T{0.5};
+  auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+  ns_force[0] += coeff * grad_hsq[0];
+  ns_force[1] += coeff * grad_hsq[1];
+}
+
+// ---- FFMuUpdate2D ----
+// μ = μ_l + φ·(μ_h − μ_l) — on PF lattice
+// Reads φ from GenericRho, MU_L/MU_H from Data fields
+template <typename PFCELL>
+__any__ void FFMuUpdate2D<PFCELL>::apply(PFCELL& pf_cell) {
+  T phi = pf_cell.template get<GenericRho>();
+  T mu_l = pf_cell.template get<MU_L<T>>();
+  T mu_h = pf_cell.template get<MU_H<T>>();
+  pf_cell.template get<MU<T>>() = mu_l + phi * (mu_h - mu_l);
+}
+
+// ---- FFCchiUpdate2D ----
+// χ = χ_l + φ·(χ_h − χ_l) — on MF lattice
+// Reads φ from PF cell, writes χ to MF cell
+template <typename PFCELL, typename MFCELL>
+__any__ void FFCchiUpdate2D<PFCELL, MFCELL>::apply(PFCELL& pf_cell, MFCELL& mf_cell) {
+  T phi = pf_cell.template get<typename PFCELL::GenericRho>();
+  T chi_l = mf_cell.template get<CHI_L<T>>();
+  T chi_h = mf_cell.template get<CHI_H<T>>();
+  mf_cell.template get<CHI<T>>() = chi_l + phi * (chi_h - chi_l);
+}
+
 }  // namespace ff

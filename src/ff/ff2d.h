@@ -28,6 +28,25 @@ struct EtaHBase : public FieldBase<1> {};
 struct DeltaRhoBase : public FieldBase<1> {};
 
 // ===================================================================
+// Magnetic field base types
+// ===================================================================
+// Per-cell ghost fields (on MF lattice)
+struct PsiBase : public FieldBase<1> {};        // ψ — magnetic scalar potential
+struct HFieldBase : public FieldBase<1> {};     // H vector — magnetic field
+struct HSqBase : public FieldBase<1> {};        // |H|²
+// Per-cell ghost fields (on PF lattice, for coupling)
+struct MuBase : public FieldBase<1> {};         // μ — interpolated permeability
+// Per-cell ghost fields (on MF lattice)
+struct ChiBase : public FieldBase<1> {};        // χ — interpolated susceptibility
+// Block-level constants (Data<T>)
+struct MuLBase : public FieldBase<1> {};        // μ_l — light fluid permeability
+struct MuHBase : public FieldBase<1> {};        // μ_h — heavy fluid permeability
+struct ChiLBase : public FieldBase<1> {};       // χ_l — light fluid susceptibility
+struct ChiHBase : public FieldBase<1> {};       // χ_h — heavy fluid susceptibility
+// Per-cell ghost field (on MF lattice)
+struct MagOmegaBase : public FieldBase<1> {};   // ω_mag — magnetic relaxation rate
+
+// ===================================================================
 //  Section 2: Self-Owned Field Type Aliases
 // ===================================================================
 
@@ -60,6 +79,32 @@ using ETA_H = Data<T, EtaHBase>;
 
 template <typename T>
 using DELTARHO = Data<T, DeltaRhoBase>;
+
+// Magnetic field: block-level constants (Data<T>)
+template <typename T>
+using MU_L = Data<T, MuLBase>;
+template <typename T>
+using MU_H = Data<T, MuHBase>;
+template <typename T>
+using CHI_L = Data<T, ChiLBase>;
+template <typename T>
+using CHI_H = Data<T, ChiHBase>;
+
+// Magnetic field: per-cell ghost fields (GenericField<GenericArray<T>>)
+template <typename T>
+using PSI = GenericField<GenericArray<T>, PsiBase>;
+template <typename T, unsigned int D>
+using H_FIELD = GenericField<GenericArray<Vector<T, D>>, HFieldBase>;
+template <typename T>
+using H_SQ = GenericField<GenericArray<T>, HSqBase>;
+template <typename T>
+using MU = GenericField<GenericArray<T>, MuBase>;
+template <typename T>
+using CHI = GenericField<GenericArray<T>, ChiBase>;
+
+// Magnetic relaxation rate (on MF lattice, distinct from NS OMEGA)
+template <typename T>
+using MAGOMEGA = GenericField<GenericArray<T>, MagOmegaBase>;
 
 // ===================================================================
 //  Section 3: Field Packs (self-owned + external, cf. CAFIELDS + REFFIELDS)
@@ -214,6 +259,51 @@ struct FFViscoForce3DM {
   using LatSet = typename NSCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell);
 };
+// ===================================================================
+//  Magnetic Field Functor Declarations
+//
+//  MFGradient2D:  H = -∇ψ  via LBM-weighted stencil (D2Q5 or D2Q9)
+//  MFHsq2D:       |H|² = H_x² + H_y²
+//  MFForce2D:     F_m = (χ/2) ∇(|H|²)  → add to NSCELL::FORCE
+//  FFMuUpdate2D:  μ = μ_l + φ(μ_h−μ_l)  on PF lattice
+//  FFCchiUpdate2D: χ = χ_l + φ(χ_h−χ_l)  on MF lattice (from PF's φ)
+// ===================================================================
+
+template <typename MFCELL>
+struct MFGradient2D {
+  using T = typename MFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(MFCELL& mf_cell);
+};
+
+template <typename MFCELL>
+struct MFHsq2D {
+  using T = typename MFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(MFCELL& mf_cell);
+};
+
+template <typename MFCELL, typename NSCELL>
+struct MFForce2D {
+  using T = typename MFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(MFCELL& mf_cell, NSCELL& ns_cell);
+};
+
+template <typename PFCELL>
+struct FFMuUpdate2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  using GenericRho = typename PFCELL::GenericRho;
+  __any__ static void apply(PFCELL& pf_cell);
+};
+
+template <typename PFCELL, typename MFCELL>
+struct FFCchiUpdate2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename PFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell);
+};
 template <typename PFCELL, typename NSCELL>
 struct FFViscoForce3D {
   using T = typename PFCELL::FloatType;
@@ -272,6 +362,37 @@ void BroadcastAllParams(LATTICE& lattice,
   lattice.template getField<GRAVITY<T>>().InitValue(gravity);
   lattice.template getField<BETA<T>>().InitValue(Beta);
   lattice.template getField<KAPPA<T>>().InitValue(Kappa);
+}
+
+// ===================================================================
+// Magnetic field communication & broadcast
+// ===================================================================
+
+// Communicate all per-cell ghost fields on MF lattice
+template <typename T, typename LATTICE>
+void CommunicateMagFields(LATTICE& lattice) {
+  lattice.template getField<PSI<T>>().Communicate();
+  lattice.template getField<H_FIELD<T, 2>>().Communicate();
+  lattice.template getField<H_SQ<T>>().Communicate();
+  lattice.template getField<CHI<T>>().Communicate();
+  lattice.template getField<MAGOMEGA<T>>().Communicate();
+}
+
+// Broadcast magnetic params from rank 0 and set uniform fields
+template <typename T, typename LATTICE>
+void BroadcastMagParams(LATTICE& lattice,
+                        T& mu_l, T& mu_h,
+                        T& chi_l, T& chi_h) {
+#ifdef MPI_ENABLED
+  mpi().bCast(mu_l, 0);
+  mpi().bCast(mu_h, 0);
+  mpi().bCast(chi_l, 0);
+  mpi().bCast(chi_h, 0);
+#endif
+  lattice.template getField<MU_L<T>>().InitValue(mu_l);
+  lattice.template getField<MU_H<T>>().InitValue(mu_h);
+  lattice.template getField<CHI_L<T>>().InitValue(chi_l);
+  lattice.template getField<CHI_H<T>>().InitValue(chi_h);
 }
 
 }  // namespace ff

@@ -4,6 +4,9 @@
 
 #include "lbm/moment.ur.h"
 
+// Forward declare magnetic field base types (defined in ff/ff2d.h)
+namespace ff { struct MagOmegaBase; }
+
 namespace mrtdata {
 // mrt transformation matrix: mapping from population to moment space
 template <unsigned int D, unsigned int Q>
@@ -81,6 +84,40 @@ __constexpr__ int shearIndexes<2,9> = 2;
 
 template <>
 __constexpr__ int shearViscIndexes<2,9>[shearIndexes<2,9>] = { 7, 8};
+
+// ===================================================================
+// D2Q5 MRT — magnetic field potential solver
+// Hu & Li (2018) Phys. Rev. E 98, 033301, §II.D
+// Moments: m = (ψ, Jx, Jy, e, pxx)
+//   ψ   = Σ h_i         (conserved)
+//   Jx  = h_1 - h_2     (flux x)
+//   Jy  = h_3 - h_4     (flux y)
+//   e   = 4h_0 - Σ_{i>0} h_i  (energy)
+//   pxx = (h_1+h_2) - (h_3+h_4) (normal stress diff)
+// ===================================================================
+template <>
+__constexpr__ Fraction<> M<2,5>[5][5] = {
+  { 1,  1,  1,  1,  1},
+  { 0,  1, -1,  0,  0},
+  { 0,  0,  0,  1, -1},
+  { 4, -1, -1, -1, -1},
+  { 0,  1,  1, -1, -1}
+};
+
+template <>
+__constexpr__ Fraction<> InvM<2,5>[5][5] = {
+  {{1, 5},       0,       0,  {1, 5},       0},
+  {{1, 5},  {1, 2},       0, {-1,20},  {1, 4}},
+  {{1, 5}, {-1, 2},       0, {-1,20},  {1, 4}},
+  {{1, 5},       0,  {1, 2}, {-1,20}, {-1, 4}},
+  {{1, 5},       0, {-1, 2}, {-1,20}, {-1, 4}}
+};
+
+template <>
+__constexpr__ int shearIndexes<2,5> = 0;
+
+template <>
+__constexpr__ int shearViscIndexes<2,5>[0] = {};
 
 template <>
 __constexpr__ Fraction<> M<3,19>[19][19] = {
@@ -563,4 +600,69 @@ struct MRTForce {
   }
 };
 
-}
+// ===================================================================
+// MRTMag — MRT collision for magnetic potential equation (D2Q5).
+// Hu & Li (2018) Phys. Rev. E 98, 033301, §II.D Eq.(40)-(44)
+//
+// Solves: ∂ψ/∂t = ∇·(εμ∇ψ) via pseudo-time relaxation.
+// Relaxation: S^h = diag(1, ω_mag, ω_mag, 1, 1)
+//   ψ (m₀):   conserved — s=1, m₀=m_eq₀=ψ identically
+//   Jx,Jy:    relaxed by ω_mag = 1/τ_mag (diffusion rate)
+//   e, pxx:   fully relaxed to equilibrium=0 with s=1
+//
+// Equilibrium: h_α^eq = w_eq·ψ  (uniform weights = 1/q)
+// Paper default: τ_mag = 4.0 → ω_mag = 0.25  (§III)
+// ===================================================================
+template <typename CELL, bool WriteToField = false>
+struct MRTMag {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using equilibriumscheme = equilibrium::MagEquilibrium<CELL>;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static void apply(CELL& cell) {
+    // Per-cell omega (spatially varying via Eq.43: τ = 0.5 + εμ/(c_s²·Δt))
+    // Falls back to block-level converter omega if no per-cell field
+    T omega_mag;
+    if constexpr (cell.template hasField<GenericField<GenericArray<T>, ff::MagOmegaBase>>()) {
+      omega_mag = cell.template get<GenericField<GenericArray<T>, ff::MagOmegaBase>>();
+    } else {
+      omega_mag = cell.getOmega();
+    }
+
+    // Relaxation vector: S = (1, ω_mag, ω_mag, 1, 1)
+    T rtvec[LatSet::q];
+    rtvec[0] = T{1};
+    rtvec[1] = omega_mag;
+    rtvec[2] = omega_mag;
+    for (unsigned int i = 3; i < LatSet::q; ++i) rtvec[i] = T{1};
+
+    // InvM_S = InvM · diag(rtvec)
+    T InvM_S[LatSet::q][LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        InvM_S[i][j] = mrt::InvM<LatSet>(i, j) * rtvec[j];
+      }
+    }
+
+    // Forward transform: m = M · f
+    T momenta[LatSet::q] {};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
+      }
+    }
+
+    // Collision: f'[i] = f[i] - Σ_{j>0} InvM[i,j]·s_j·m[j]
+    // m_eq[j] = 0 ∀ j>0 (uniform equilibrium → vanishing higher moments)
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{};
+      for (unsigned int j = 1; j < LatSet::q; ++j) {
+        coll += InvM_S[i][j] * momenta[j];
+      }
+      cell[i] -= coll;
+    }
+  }
+};
+
+}  // namespace collision
