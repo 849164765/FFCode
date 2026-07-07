@@ -1,9 +1,8 @@
-// ferrofluiddroplet2d.cpp
-// 2D ferrofluid droplet deformation under uniform magnetic field
-// Hu & Li (2018) Phys. Rev. E 98, 033301 — Case B
+// ferroBubbleRising2d.cpp
+// 2D bubble rising in ferrofluid — NS + PF + Magnetic Field coupling
+// Guo et al. (2025) Phys. Fluids 37, 022148 — Case C
 // Three coupled lattices: NS(D2Q9) + PF(D2Q9) + MF(D2Q5)
-// φ=1: ferrofluid droplet (heavy),  φ=0: organic liquid (light)
-// gravity=0 — static deformation, magnetic force vs surface tension
+// periodic X, no-slip Y, uniform vertical H₀
 
 #include "freelb.h"
 #include "freelb.hh"
@@ -22,9 +21,10 @@ T Cell_Len;
 int BlockCellLen;
 int Thread_Num;
 
-// droplet
-T Droplet_Radius;
-Vector<T, LatSet::d> Droplet_Center;
+// bubble
+T Bubble_Radius;
+T Bubble_Diam;
+Vector<T, LatSet::d> Bubble_Center;
 
 // phase field
 T Interface_Width;
@@ -34,23 +34,27 @@ T Omega_phi;
 T Kappa;
 T Beta;
 
-// two-phase — Hu & Li (2018) Case B lattice units
+// two-phase
 T rho_l;
 T rho_h;
 T eta_l;
 T eta_h;
 T sigma;
 T gravity;
+T Eo;
+T Re;
+T U_g;
 T Tau_ns;
 
-// magnetic field — Hu & Li (2018)
-T Mu_l;
-T Mu_h;
-T Chi_l;
-T Chi_h;
-T H0;
-T Epsilon;
-T Tau_mag_ref;
+// magnetic field — Guo et al. (2025), Hu & Li (2018)
+T Mu_l;         // μ_l  — light fluid permeability
+T Mu_h;         // μ_h  — heavy fluid permeability
+T Chi_l;        // χ_l  — light fluid susceptibility
+T Chi_h;        // χ_h  — heavy fluid susceptibility
+T H0;           // H₀   — applied field strength (vertical)
+T Epsilon;       // ε   — free parameter for magnetic pseudo-time
+T Tau_mag_ref;   // τ_mag reference (Eq.42-43: default 4.0)
+T Bom;          // magnetic Bond number: μ₀χ₀H₀²D/(2σ)
 
 // simulation
 int MaxStep;
@@ -59,7 +63,7 @@ int OutputStep;
 std::string work_dir;
 
 void readParam() {
-  iniReader param_reader("ferrofluiddroplet2d.ini");
+  iniReader param_reader("ferroBubbleRising2d.ini");
   work_dir = param_reader.getValue<std::string>("workdir", "workdir_");
   Thread_Num = param_reader.getValue<int>("parallel", "thread_num");
 
@@ -68,15 +72,18 @@ void readParam() {
   Cell_Len = param_reader.getValue<T>("Mesh", "Cell_Len");
   BlockCellLen = param_reader.getValue<int>("Mesh", "BlockCellLen");
 
-  Droplet_Radius = param_reader.getValue<T>("Droplet", "Radius");
-  Droplet_Center[0] = param_reader.getValue<T>("Droplet", "CenterX");
-  Droplet_Center[1] = param_reader.getValue<T>("Droplet", "CenterY");
+  Bubble_Diam = param_reader.getValue<T>("Bubble", "Diameter");
+  Bubble_Radius = Bubble_Diam / T{2};
+  Bubble_Center[0] = param_reader.getValue<T>("Bubble", "CenterX");
+  Bubble_Center[1] = param_reader.getValue<T>("Bubble", "CenterY");
 
   Interface_Width = param_reader.getValue<T>("Phase_Field", "Interface_Width");
   Mobility = param_reader.getValue<T>("Phase_Field", "Mobility");
 
   rho_l = param_reader.getValue<T>("Two_Phase", "rho_l");
   rho_h = param_reader.getValue<T>("Two_Phase", "rho_h");
+  Eo = param_reader.getValue<T>("Two_Phase", "Eo");
+  Re = param_reader.getValue<T>("Two_Phase", "Re");
 
   // Magnetic parameters
   Mu_l = param_reader.getValue<T>("Magnetic", "Mu_l");
@@ -88,121 +95,75 @@ void readParam() {
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
 
-  // ---- Hu & Li (2018) Case B hardcoded lattice parameters ----
-  // ρ_l=1.0, ρ_h=1.975, η_l=0.0025, η_h=0.05, σ=0.00191875
-  // Reference: ρ_ref=800 kg/m³, L_ref=0.8 mm, U_ref=5 m/s
-  eta_l = T(0.0025);
-  eta_h = T(0.05);
-  sigma = T(0.00191875);
-  gravity = T(0);  // NO gravity — static deformation
+  // ---- Guo et al. (2025) Case C hardcoded lattice parameters ----
+  // ρ_l=1, ρ_h=1000, η_h/η_l=100, Re=40, Eo=20
+  // τ_ns = 0.6 → ν_h = (τ-0.5)/3 = 0.03333, η_h = ν_h·ρ_h = 33.33
+  // Re = sqrt(g·ρ_h²·D³)/η_h  →  g = (Re·η_h)²/(ρ_h²·D³)
+  // Eo = g·ρ_h·D²/σ           →  σ = g·ρ_h·D²/Eo
+  T D = Bubble_Diam;
+  T tau_ns_target = T{0.6};
+  T nu_h = (tau_ns_target - T{0.5}) * LatSet::cs2;
+  eta_h = nu_h * rho_h;
+  eta_l = eta_h / T{100};
 
-  Beta = T(12.0) * sigma / Interface_Width;
-  Kappa = T(3.0) * Interface_Width * sigma * T(0.5);
-  Tau_phi = T(3.0) * Mobility + T(0.5);
-  Omega_phi = T(1.0) / Tau_phi;
-  Tau_ns = T(0.5) + eta_h / rho_h / LatSet::cs2;
+  T g = (Re * eta_h) * (Re * eta_h) / (rho_h * rho_h * D * D * D);
+  gravity = g;
 
-  // Magnetic diffusion: τ(x) = 0.5 + ε·μ(x)/c_s²  (Eq.43)
+  sigma = gravity * rho_h * D * D / Eo;
+  U_g = std::sqrt(gravity * D);
+
+  Beta = T{12} * sigma / Interface_Width;
+  Kappa = T{3} * Interface_Width * sigma * T{0.5};
+  Tau_phi = T{3} * Mobility + T{0.5};
+  Omega_phi = T{1} / Tau_phi;
+  Tau_ns = tau_ns_target;
+
+  // Magnetic diffusion: τ(x) = 0.5 + ε·μ(x)/c_s²  (Eq.42-43)
   Tau_mag_ref = T{4.0};
   T mu_avg = (Mu_l + Mu_h) / T{2};
   Epsilon = (Tau_mag_ref - T{0.5}) * MFLatSet::cs2 / mu_avg;
 
+  // Magnetic Bond number: Bom = μ₀H₀²D/(2σ), μ₀=1  (Eq.65)
+  Bom = H0 * H0 * D / (T{2} * sigma);
+
+  T cs = std::sqrt(LatSet::cs2);
+  T Ma = U_g / cs;
+
   MPI_RANK(0) {
-    std::cout << "-----Ferrofluid Droplet Deformation (Hu2018 Case B)-----\n";
-    std::cout << "[Mesh]: " << Ni << "x" << Nj << "  BlockCellLen=" << BlockCellLen << "\n";
-    std::cout << "[Droplet]: R=" << Droplet_Radius
-              << "  Center=(" << Droplet_Center[0] << "," << Droplet_Center[1] << ")\n";
+    std::cout << "-----Ferrofluid Bubble Rising (Guo2025 Case C)-----\\n";
+    std::cout << "[Mesh]: " << Ni << "x" << Nj
+              << "  BlockCellLen=" << BlockCellLen << "\\n";
+    std::cout << "[Bubble]: D=" << Bubble_Diam
+              << "  Center=(" << Bubble_Center[0] << ","
+              << Bubble_Center[1] << ")\\n";
     std::cout << "[Fluid]: rho_l=" << rho_l << " rho_h=" << rho_h
               << " eta_l=" << eta_l << " eta_h=" << eta_h
-              << " sigma=" << sigma << " gravity=" << gravity << "\n";
+              << "  Re=" << Re << " Eo=" << Eo << "\\n";
+    std::cout << "[Derived]: g=" << gravity << " sigma=" << sigma
+              << " U_g=" << U_g << " Ma=" << Ma << "\\n";
     std::cout << "[Phase]: W=" << Interface_Width << " M=" << Mobility
-              << " tau_phi=" << Tau_phi << " beta=" << Beta << " kappa=" << Kappa << "\n";
+              << " tau_phi=" << Tau_phi
+              << " beta=" << Beta << " kappa=" << Kappa << "\\n";
     std::cout << "[Magnetic]: mu_l=" << Mu_l << " mu_h=" << Mu_h
               << " chi_l=" << Chi_l << " chi_h=" << Chi_h
-              << " H0=" << H0 << " eps=" << Epsilon << " tau_ref=" << Tau_mag_ref << "\n";
+              << " H0=" << H0 << " Bom=" << Bom
+              << " eps=" << Epsilon << " tau_ref=" << Tau_mag_ref << "\\n";
     std::cout << "[Simulation]: MaxStep=" << MaxStep
-              << "  OutputStep=" << OutputStep << "\n";
-    T Bom_est = Chi_h * H0 * H0 * Droplet_Radius / sigma;
-    std::cout << "[Estimate]: Bom ≈ " << Bom_est << "\n";
+              << "  OutputStep=" << OutputStep << "\\n";
 #ifdef _OPENMP
-    std::cout << "[Parallel]: " << Thread_Num << " threads\n";
+    std::cout << "[Parallel]: " << Thread_Num << " threads\\n";
 #endif
 #ifdef MPI_ENABLED
-    std::cout << "[Parallel]: " << mpi().getSize() << " MPI processes\n";
+    std::cout << "[Parallel]: " << mpi().getSize() << " MPI processes\\n";
 #endif
-    std::cout << "---------------------------------------------------------\n";
+    std::cout << "-----------------------------------------------------\\n";
   }
-}
 
-// Compute droplet aspect ratio b/a from φ=0.5 contour
-// Returns {b, a, b/a} — b=semi-major (vertical), a=semi-minor (horizontal)
-template <typename PFLAT>
-std::array<T, 3> computeAspectRatio(PFLAT& PFLattice, const BlockGeometry2D<T>& Geo) {
-  T x_min = T(1e10), x_max = T(-1e10);
-  T y_min = T(1e10), y_max = T(-1e10);
-  bool found = false;
-
-  auto& phiField = PFLattice.template getField<PHI<T>>();
-  for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-    const auto& block = Geo.getBlock(blockid);
-    const auto& proj = block.getProjection();
-    auto& blockPhi = phiField.getBlockField(blockid);
-    T voxelSize = block.getVoxelSize();
-    int overlap = block.getOverlap();
-    for (int j = overlap; j < block.getNy() - overlap; ++j) {
-      for (int i = overlap; i < block.getNx() - overlap; ++i) {
-        // Check neighbors for φ=0.5 crossing
-        if (i > overlap && i < block.getNx() - overlap - 1 &&
-            j > overlap && j < block.getNy() - overlap - 1) {
-          T phi_l = blockPhi.get(j * proj[1] + (i-1));
-          T phi_r = blockPhi.get(j * proj[1] + (i+1));
-          T phi_b = blockPhi.get((j-1) * proj[1] + i);
-          T phi_t = blockPhi.get((j+1) * proj[1] + i);
-          bool crosses_x = (phi_l - T{0.5}) * (phi_r - T{0.5}) < T{0};
-          bool crosses_y = (phi_b - T{0.5}) * (phi_t - T{0.5}) < T{0};
-          if (crosses_x || crosses_y) {
-            T x = block.getMin()[0] + static_cast<T>(i) * voxelSize;
-            T y = block.getMin()[1] + static_cast<T>(j) * voxelSize;
-            if (crosses_y) {
-              if (x < x_min) x_min = x;
-              if (x > x_max) x_max = x;
-            }
-            if (crosses_x) {
-              if (y < y_min) y_min = y;
-              if (y > y_max) y_max = y;
-            }
-            found = true;
-          }
-        }
-      }
+  if (Ma > T(0.2)) {
+    MPI_RANK(0) {
+      std::cerr << "[Warning] Ma=" << Ma << " > 0.2\\n";
     }
   }
-
-  // MPI reduction: each rank only searches its own blocks,
-  // so aggregate min/max across all ranks to get global contour.
-#ifdef MPI_ENABLED
-  {
-    int found_int = found ? 1 : 0;
-    int found_global = 0;
-    MPI_Allreduce(&found_int, &found_global, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-    found = (found_global != 0);
-
-    T buf[4] = {-x_min, x_max, -y_min, y_max};  // negate min → MPI_MAX = global min
-    T rbuf[4];
-    MPI_Allreduce(buf, rbuf, 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    x_min = -rbuf[0];
-    x_max =  rbuf[1];
-    y_min = -rbuf[2];
-    y_max =  rbuf[3];
-  }
-#endif
-
-  if (!found) return {T{0}, T{0}, T{0}};
-
-  T a = (x_max - x_min) / T{2};  // semi-minor (horizontal)
-  T b = (y_max - y_min) / T{2};  // semi-major (vertical)
-  T ba = (a > T{0}) ? b / a : T{0};
-  return {b, a, ba};
 }
 
 int main(int argc, char* argv[]) {
@@ -214,7 +175,7 @@ int main(int argc, char* argv[]) {
   mpi().init(&argc, &argv);
   MPI_DEBUG_WAIT
 
-  Printer::Print_BigBanner(std::string("Initializing Ferrofluid Droplet Deformation..."));
+  Printer::Print_BigBanner(std::string("Initializing Bubble Rising (Guo2025 Case C)..."));
 
   readParam();
 
@@ -240,7 +201,7 @@ int main(int argc, char* argv[]) {
                    Vector<T, 2>(T((Ni + 1) * Cell_Len), T(Nj * Cell_Len)));
 
   BlockGeometryHelper2D<T> GeoHelper(Ni, Nj, domain, Cell_Len, BlockCellLen);
-  GeoHelper.CreateBlocks(2, 2);
+  GeoHelper.CreateBlocks(4, 4);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
 
@@ -255,7 +216,7 @@ int main(int argc, char* argv[]) {
   FlagFM.template SetupBoundary<LatSet>(domain, BouncebackFlag);
 
   vtmo::ScalarWriter FlagWriter("flag", FlagFM);
-  vtmo::vtmWriter<T, 2> GeoWriter("GeoFlag_Droplet", Geo, 1);
+  vtmo::vtmWriter<T, 2> GeoWriter("GeoFlag_BubbleRising", Geo, 1);
   GeoWriter.addWriterSet(FlagWriter);
   GeoWriter.WriteBinary();
 
@@ -316,10 +277,10 @@ int main(int argc, char* argv[]) {
 
   ff::BroadcastMagParams<T>(MFLattice, Mu_l, Mu_h, Chi_l, Chi_h);
 
-  // ---- Init PHI: φ=1 inside droplet (ferrofluid), φ=0 outside (organic) ----
-  T R_phys = Droplet_Radius * Cell_Len;
-  T xc_phys = Droplet_Center[0] * Cell_Len;
-  T yc_phys = Droplet_Center[1] * Cell_Len;
+  // ---- Init PHI: φ=1 outside (ferrofluid), φ=0 inside (bubble) ----
+  T R_phys = Bubble_Radius * Cell_Len;
+  T xc_phys = Bubble_Center[0] * Cell_Len;
+  T yc_phys = Bubble_Center[1] * Cell_Len;
   T W_phys = Interface_Width * Cell_Len;
 
   auto& phiField = PFLattice.getField<PHI<T>>();
@@ -337,9 +298,7 @@ int main(int argc, char* argv[]) {
         T dx = x - xc_phys;
         T dy = y - yc_phys;
         T dist = std::sqrt(dx * dx + dy * dy);
-        // NOTE: φ=1 INSIDE droplet (ferrofluid), opposite of bubble case
-        // tanh profile: φ → 1 when dist < R, φ → 0 when dist > R
-        T phi = T(0.5) - T(0.5) * std::tanh(T(2.0) * (dist - R_phys) / W_phys);
+        T phi = T(0.5) + T(0.5) * std::tanh(T(2.0) * (dist - R_phys) / W_phys);
         blockPhi.get(id) = phi;
       }
     }
@@ -424,7 +383,7 @@ int main(int argc, char* argv[]) {
     chiField.Communicate();
   }
 
-  // Init OMEGA on MF lattice
+  // Init OMEGA on MF lattice from chi (Eq.42-43)
   {
     auto& omegaField = MFLattice.getField<ff::MAGOMEGA<T>>();
     auto& chiField = MFLattice.getField<ff::CHI<T>>();
@@ -597,7 +556,7 @@ int main(int argc, char* argv[]) {
   vtmo::ScalarWriter HSqWriter("HSq", MFLattice.getField<ff::H_SQ<T>>());
   vtmo::ScalarWriter ChiWriter("Chi", MFLattice.getField<ff::CHI<T>>());
 
-  vtmo::vtmWriter<T, 2> MainWriter("ferrofluiddroplet2d", Geo);
+  vtmo::vtmWriter<T, 2> MainWriter("ferroBubbleRising2d", Geo);
   MainWriter.addWriterSet(PHIWriter, VecWriter, ForceWriter,
                           DensityWriter, PressureWriter,
                           PsiWriter, HWriter, HSqWriter, ChiWriter);
@@ -612,27 +571,20 @@ int main(int argc, char* argv[]) {
   MFLattice.NormalFullCommunicate();
   NS_Periodic.Apply();
   PF_Periodic.Apply();
-  MF_Periodic.Apply();
 
-  // Initialize MF POPs to equilibrium psi = -H0*y
+  // Initialize ψ field = -H₀·y (nice initial guess for the SOR solver)
   {
-    T invQ = T{1} / T{MFLatSet::q};
+    auto& psiField = MFLattice.getField<ff::PSI<T>>();
     for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
       const auto& block = Geo.getBlock(blockid);
       const auto& proj = block.getProjection();
-      auto& blockLat = MFLattice.getBlockLat(blockid);
+      auto& bp = psiField.getBlockField(blockid);
       T minY = block.getMin()[1];
       T dy = block.getVoxelSize();
-      int nx = block.getNx();
-      int ny = block.getNy();
-      for (int j = 0; j < ny; ++j) {
-        T y = minY + j * dy;
-        T psi_bg = -H0 * y;
-        for (int i = 0; i < nx; ++i) {
-          std::size_t id = j * proj[1] + i;
-          MFCELL cell(id, blockLat);
-          for (unsigned int k = 0; k < MFLatSet::q; ++k) cell[k] = psi_bg * invQ;
-        }
+      for (int j = 0; j < block.getNy(); ++j) {
+        T psi_bg = -H0 * (minY + j * dy);
+        for (int i = 0; i < block.getNx(); ++i)
+          bp.get(j * proj[1] + i) = psi_bg;
       }
     }
     MFLattice.NormalFullCommunicate();
@@ -654,14 +606,6 @@ int main(int argc, char* argv[]) {
   MFLattice.template ApplyInnerCellDynamics<MFHsqSelector>(FlagFM);
   ff::CommunicateMagFields<T>(MFLattice);
 
-  // Initial aspect ratio + output
-  {
-    auto ar = computeAspectRatio(PFLattice, Geo);
-    if (mpi().getRank() == 0) {
-      std::cout << "[Step " << MainLoopTimer() << "] b=" << ar[0]
-                << " a=" << ar[1] << " b/a=" << ar[2] << "\n";
-    }
-  }
   MainWriter.WriteBinary(MainLoopTimer());
 
   Printer::Print_BigBanner(std::string("Start Calculation..."));
@@ -673,16 +617,12 @@ int main(int argc, char* argv[]) {
     RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
-    // A1: F_s = λ·∇φ
     STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // A2: F_b = -ρ·g  (g=0 for Case B — static deformation, no gravity)
     GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
-
-    // A3: F_p = -(p/3)·Δρ·∇φ
     PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
     // ---- Phase A_mag: Magnetic force ----
+    // CHI update
     {
       auto& chiField = MFLattice.getField<ff::CHI<T>>();
       auto& phiField = PFLattice.getField<PHI<T>>();
@@ -703,138 +643,150 @@ int main(int argc, char* argv[]) {
       chiField.Communicate();
     }
 
+    // MAGOMEGA update (required for MFLattice NormalFullCommunicate consistency)
     {
       auto& omegaField = MFLattice.getField<ff::MAGOMEGA<T>>();
       auto& chiField = MFLattice.getField<ff::CHI<T>>();
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
         const auto& block = Geo.getBlock(blockid);
         const auto& proj = block.getProjection();
-        auto& blockOmega = omegaField.getBlockField(blockid);
-        auto& blockChi = chiField.getBlockField(blockid);
-        int overlap = 0;
-        for (int j = overlap; j < block.getNy() - overlap; ++j) {
-          for (int i = overlap; i < block.getNx() - overlap; ++i) {
+        auto& bo = omegaField.getBlockField(blockid);
+        auto& bc = chiField.getBlockField(blockid);
+        for (int j = 0; j < block.getNy(); ++j)
+          for (int i = 0; i < block.getNx(); ++i) {
             std::size_t id = j * proj[1] + i;
-            T chi = blockChi.get(id);
-            T mu = T{1} + chi;
+            T mu = T{1} + bc.get(id);
             T tau = T{0.5} + Epsilon * mu * MFLatSet::InvCs2;
             T omega = T{1} / tau;
             if (omega > T{1.9}) omega = T{1.9};
             if (omega < T{0.05}) omega = T{0.05};
-            blockOmega.get(id) = omega;
+            bo.get(id) = omega;
           }
-        }
       }
       omegaField.Communicate();
     }
 
-    // MF collision
-    MFLattice.template ApplyInnerCellDynamics<MFCollisionSelector>(FlagFM);
-    MF_Periodic.Apply();
-
-    // MF bounceback + stream
-    MF_BB.Apply(MainLoopTimer());
-    MFLattice.Stream();
-    MFLattice.NormalFullCommunicate();
-
-    // MF Y ghost POPs = wall POPs
+    // ---- MF LBM: Fortran-style collision + ghost POP BC ----
+    // Collision: MRTMag on per-cell omega from mu
+    // Ghost BC: bounceback-like with flux 2*wt*H₀*μ/cs²
+    // After streaming: ψ=Σpop, ghost ψ extrapolation
+    // One step per NS step (no sub-iterations) — steady state reached
+    // within ~O(R²/D) ≈ 100-200 NS steps
     {
-      T H_global = T(Nj) * Cell_Len;
-      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-        const auto& block = Geo.getBlock(blockid);
-        const auto& proj = block.getProjection();
-        auto& blockLat = MFLattice.getBlockLat(blockid);
-        int nx = block.getNx();
-        int ny = block.getNy();
-        int overlap = block.getOverlap();
-        T minY = block.getMin()[1];
-        T maxY = block.getMax()[1];
-        if (minY < Cell_Len * T(1.5)) {
-          for (int i = 0; i < nx; ++i) {
-            std::size_t id_ghost = 0 * proj[1] + i;
-            std::size_t id_wall = overlap * proj[1] + i;
-            MFCELL ghost_cell(id_ghost, blockLat);
-            MFCELL wall_cell(id_wall, blockLat);
-            for (unsigned int k = 0; k < MFLatSet::q; ++k) {
-              ghost_cell[k] = wall_cell[k];
-            }
-          }
-        }
-        if (maxY > H_global - Cell_Len * T(1.5)) {
-          for (int i = 0; i < nx; ++i) {
-            std::size_t id_ghost = (ny - 1) * proj[1] + i;
-            std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
-            MFCELL ghost_cell(id_ghost, blockLat);
-            MFCELL wall_cell(id_wall, blockLat);
-            for (unsigned int k = 0; k < MFLatSet::q; ++k) {
-              ghost_cell[k] = wall_cell[k];
-            }
-          }
-        }
-      }
-    }
+      // MF collision
+      MFLattice.template ApplyInnerCellDynamics<MFCollisionSelector>(FlagFM);
+      MF_Periodic.Apply();
 
-    // MF: ψ = Σ h_α
-    {
-      auto& psiField = MFLattice.getField<ff::PSI<T>>();
-      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-        const auto& block = Geo.getBlock(blockid);
-        const auto& proj = block.getProjection();
-        auto& blockPsi = psiField.getBlockField(blockid);
-        auto& blockLat = MFLattice.getBlockLat(blockid);
-        int overlap = block.getOverlap();
-        for (int j = overlap; j < block.getNy() - overlap; ++j) {
-          for (int i = overlap; i < block.getNx() - overlap; ++i) {
-            std::size_t id = j * proj[1] + i;
-            MFCELL cell(id, blockLat);
-            T psi = T{0};
-            for (unsigned int k = 0; k < MFLatSet::q; ++k) {
-              psi += cell[k];
-            }
-            blockPsi.get(id) = psi;
-          }
-        }
-      }
-    }
-    MFLattice.getField<ff::PSI<T>>().Communicate();
-
-    // MF: ψ ghost for H₀ BC at top/bottom
-    {
-      auto& psiField = MFLattice.getField<ff::PSI<T>>();
-      T H_global = T(Nj) * Cell_Len;
-      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
-        const auto& block = Geo.getBlock(blockid);
-        const auto& proj = block.getProjection();
-        auto& blockPsi = psiField.getBlockField(blockid);
-        int nx = block.getNx();
-        int ny = block.getNy();
-        int overlap = block.getOverlap();
-        T minY = block.getMin()[1];
-        T maxY = block.getMax()[1];
-        T dy = block.getVoxelSize();
-        if (minY < Cell_Len * T(1.5)) {
-          for (int j = 0; j < overlap; ++j) {
+      // Ghost POP BC: Fortran-style (collisionPsiDF2D lines 472-488)
+      // ghost[incoming] = wall[opposite] ∓ 2*wt*H₀*μ/cs²
+      {
+        auto& chiField  = MFLattice.getField<ff::CHI<T>>();
+        T invCs2 = MFLatSet::InvCs2;
+        T H_global = T(Nj) * Cell_Len;
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& blockLat = MFLattice.getBlockLat(blockid);
+          auto& bc = chiField.getBlockField(blockid);
+          int nx = block.getNx(), ny = block.getNy();
+          int ov = block.getOverlap();
+          T minY = block.getMin()[1], maxY = block.getMax()[1];
+          T dy = block.getVoxelSize();
+          if (minY < Cell_Len * T{1.5}) {
             for (int i = 0; i < nx; ++i) {
-              std::size_t id_ghost = j * proj[1] + i;
-              std::size_t id_inner = overlap * proj[1] + i;
-              int ghost_depth = overlap - j;
-              blockPsi.get(id_ghost) = blockPsi.get(id_inner) + H0 * dy * T(ghost_depth);
+              std::size_t id_g = 0 * proj[1] + i;
+              std::size_t id_w = ov * proj[1] + i;
+              MFCELL gc(id_g, blockLat);
+              MFCELL wc(id_w, blockLat);
+              T mu = T{1} + bc.get(id_w);
+              for (unsigned int k = 1; k < MFLatSet::q; ++k) {
+                int cky = latset::c<MFLatSet>(k)[1];
+                if (cky > 0) {  // direction pointing INTO domain from bottom
+                  int opp = latset::opp<MFLatSet>(k);
+                  T flux = T{2} * latset::w<MFLatSet>(k) * H0 * mu * invCs2;
+                  gc[k] = wc[opp] - flux * dy;
+                }
+              }
             }
           }
-        }
-        if (maxY > H_global - Cell_Len * T(1.5)) {
-          for (int j = ny - overlap; j < ny; ++j) {
+          if (maxY > H_global - Cell_Len * T{1.5}) {
             for (int i = 0; i < nx; ++i) {
-              std::size_t id_ghost = j * proj[1] + i;
-              std::size_t id_inner = (ny - 1 - overlap) * proj[1] + i;
-              int ghost_depth = j - (ny - 1 - overlap);
-              blockPsi.get(id_ghost) = blockPsi.get(id_inner) - H0 * dy * T(ghost_depth);
+              std::size_t id_g = (ny - 1) * proj[1] + i;
+              std::size_t id_w = (ny - 1 - ov) * proj[1] + i;
+              MFCELL gc(id_g, blockLat);
+              MFCELL wc(id_w, blockLat);
+              T mu = T{1} + bc.get(id_w);
+              for (unsigned int k = 1; k < MFLatSet::q; ++k) {
+                int cky = latset::c<MFLatSet>(k)[1];
+                if (cky < 0) {  // direction pointing INTO domain from top
+                  int opp = latset::opp<MFLatSet>(k);
+                  T flux = T{2} * latset::w<MFLatSet>(k) * H0 * mu * invCs2;
+                  gc[k] = wc[opp] + flux * dy;
+                }
+              }
             }
           }
         }
       }
+
+      // Bounceback + streaming
+      MF_BB.Apply(MainLoopTimer());
+      MFLattice.Stream();
+      MFLattice.NormalFullCommunicate();
+
+      // Psi = Σ pop
+      {
+        auto& psiField = MFLattice.getField<ff::PSI<T>>();
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& bp = psiField.getBlockField(blockid);
+          auto& blockLat = MFLattice.getBlockLat(blockid);
+          int ov = block.getOverlap();
+          for (int j = ov; j < block.getNy() - ov; ++j)
+            for (int i = ov; i < block.getNx() - ov; ++i) {
+              MFCELL cell(j * proj[1] + i, blockLat);
+              T psi = T{};
+              for (unsigned int k = 0; k < MFLatSet::q; ++k) psi += cell[k];
+              bp.get(j * proj[1] + i) = psi;
+            }
+        }
+        psiField.Communicate();
+      }
+
+      // Psi ghost extrapolation (2nd order, like Fortran computeOrderMacro2D)
+      {
+        auto& psiField = MFLattice.getField<ff::PSI<T>>();
+        T H_global = T(Nj) * Cell_Len;
+        T dy = Cell_Len;  // voxel size
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& bp = psiField.getBlockField(blockid);
+          int nx = block.getNx(), ny = block.getNy();
+          int ov = block.getOverlap();
+          T minY = block.getMin()[1], maxY = block.getMax()[1];
+          if (minY < Cell_Len * T{1.5}) {
+            // Only 1 ghost layer supported; use 2nd-order Neumann extrapolation
+            for (int i = 0; i < nx; ++i) {
+              std::size_t ig = 0 * proj[1] + i;
+              std::size_t i1 = ov * proj[1] + i;
+              std::size_t i2 = (ov + 1) * proj[1] + i;
+              bp.get(ig) = (T{4} * bp.get(i1) - bp.get(i2) - T{2} * H0 * dy) / T{3};
+            }
+          }
+          if (maxY > H_global - Cell_Len * T{1.5}) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t ig = (ny - 1) * proj[1] + i;
+              std::size_t i1 = (ny - 1 - ov) * proj[1] + i;
+              std::size_t i2 = (ny - 2 - ov) * proj[1] + i;
+              bp.get(ig) = (T{4} * bp.get(i1) - bp.get(i2) + T{2} * H0 * dy) / T{3};
+            }
+          }
+        }
+        psiField.Communicate();
+      }
     }
-    MFLattice.getField<ff::PSI<T>>().Communicate();
 
     // MF: H = -∇ψ, |H|²
     MFLattice.template ApplyInnerCellDynamics<MFGradientSelector>(FlagFM);
@@ -859,8 +811,8 @@ int main(int argc, char* argv[]) {
     NSLattice.NormalFullCommunicate();
 
     // ---- Phase D: Streaming ----
+    // PF stream
     PF_BB.Apply(MainLoopTimer());
-    // PF Y ghost POP fix
     {
       T H_global = T(Nj) * Cell_Len;
       for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
@@ -966,7 +918,7 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // φ=0 at walls (organic liquid wets walls)
+    // φ=1 at walls + ghost cell fix
     {
       auto& phiField = PFLattice.getField<PHI<T>>();
       T H_global = T(Nj) * Cell_Len;
@@ -979,25 +931,23 @@ int main(int argc, char* argv[]) {
         int overlap = block.getOverlap();
         T minY = block.getMin()[1];
         T maxY = block.getMax()[1];
-        // Bottom wall: φ = 0
         if (minY < Cell_Len * T(1.5)) {
           for (int i = overlap; i < nx - overlap; ++i) {
-            blockPhi.get(overlap * proj[1] + i) = T{0};
+            blockPhi.get(overlap * proj[1] + i) = T{1};
           }
           for (int j = 0; j < overlap; ++j) {
             for (int i = 0; i < nx; ++i) {
-              blockPhi.get(j * proj[1] + i) = T{0};
+              blockPhi.get(j * proj[1] + i) = T{1};
             }
           }
         }
-        // Top wall: φ = 0
         if (maxY > H_global - Cell_Len * T(1.5)) {
           for (int i = overlap; i < nx - overlap; ++i) {
-            blockPhi.get((ny - 1 - overlap) * proj[1] + i) = T{0};
+            blockPhi.get((ny - 1 - overlap) * proj[1] + i) = T{1};
           }
           for (int j = ny - overlap; j < ny; ++j) {
             for (int i = 0; i < nx; ++i) {
-              blockPhi.get(j * proj[1] + i) = T{0};
+              blockPhi.get(j * proj[1] + i) = T{1};
             }
           }
         }
@@ -1123,40 +1073,102 @@ int main(int argc, char* argv[]) {
         const auto& block = Geo.getBlock(blockid);
         const auto& proj = block.getProjection();
         auto& blockLat = NSLattice.getBlockLat(blockid);
+        auto& rhoField = NSLattice.getField<DENSITY<T>>();
         auto& presField = NSLattice.getField<PRESSURE<T>>();
-        auto& velField = NSLattice.getField<VELOCITY<T, 2>>();
+        auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
+        auto& forceField = NSLattice.getField<FORCE<T, LatSet::d>>();
+        auto& blockRho = rhoField.getBlockField(blockid);
+        auto& blockPres = presField.getBlockField(blockid);
+        auto& blockVel = velField.getBlockField(blockid);
+        auto& blockForce = forceField.getBlockField(blockid);
         int overlap = block.getOverlap();
         for (int j = overlap; j < block.getNy() - overlap; ++j) {
           for (int i = overlap; i < block.getNx() - overlap; ++i) {
             std::size_t id = j * proj[1] + i;
             NSCELL cell(id, blockLat);
-            T p_new = T{0};
-            Vector<T, 2> u_new{T{0}, T{0}};
+            T pres = T{0}, ux_raw = T{0}, uy_raw = T{0};
             for (unsigned int k = 0; k < LatSet::q; ++k) {
-              p_new += cell[k];
-              u_new[0] += latset::c<LatSet>(k)[0] * cell[k];
-              u_new[1] += latset::c<LatSet>(k)[1] * cell[k];
+              pres += cell[k];
+              ux_raw += latset::c<LatSet>(k)[0] * cell[k];
+              uy_raw += latset::c<LatSet>(k)[1] * cell[k];
             }
-            presField.getBlockField(blockid).get(id) = p_new;
-            velField.getBlockField(blockid).get(id) = u_new;
+            T rho = blockRho.get(id);
+            const auto& F = blockForce.get(id);
+            blockPres.get(id) = pres;
+            blockVel.get(id) = Vector<T, 2>{ux_raw + T{0.5} * F[0] / rho,
+                                            uy_raw + T{0.5} * F[1] / rho};
+          }
+        }
+      }
+    }
+    NSLattice.getField<VELOCITY<T, LatSet::d>>().Communicate();
+    NSLattice.getField<PRESSURE<T>>().Communicate();
+    NSLattice.getField<DENSITY<T>>().Communicate();
+    NSLattice.getField<OMEGA<T>>().Communicate();
+
+    // NS ghost extrapolation
+    {
+      T H_global = T(Nj) * Cell_Len;
+      auto& velField = NSLattice.getField<VELOCITY<T, LatSet::d>>();
+      auto& presField = NSLattice.getField<PRESSURE<T>>();
+      auto& rhoField = NSLattice.getField<DENSITY<T>>();
+      auto& omegaField = NSLattice.getField<OMEGA<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockVel = velField.getBlockField(blockid);
+        auto& blockPres = presField.getBlockField(blockid);
+        auto& blockRho = rhoField.getBlockField(blockid);
+        auto& blockOmega = omegaField.getBlockField(blockid);
+        int nx = block.getNx();
+        int ny = block.getNy();
+        int overlap = block.getOverlap();
+        T minY = block.getMin()[1];
+        T maxY = block.getMax()[1];
+        if (minY < Cell_Len * T(1.5)) {
+          for (int j = 0; j < overlap; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = overlap * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockVel.get(id_ghost) = blockVel.get(id_wall);
+              blockPres.get(id_ghost) = blockPres.get(id_wall);
+              blockRho.get(id_ghost) = blockRho.get(id_wall);
+              blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+            }
+          }
+        }
+        if (maxY > H_global - Cell_Len * T(1.5)) {
+          for (int j = ny - overlap; j < ny; ++j) {
+            for (int i = 0; i < nx; ++i) {
+              std::size_t id_wall = (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id_ghost = j * proj[1] + i;
+              blockVel.get(id_ghost) = blockVel.get(id_wall);
+              blockPres.get(id_ghost) = blockPres.get(id_wall);
+              blockRho.get(id_ghost) = blockRho.get(id_wall);
+              blockOmega.get(id_ghost) = blockOmega.get(id_wall);
+            }
           }
         }
       }
     }
 
-    // ---- Output ----
     ++MainLoopTimer;
+    ++OutputTimer;
 
     if (MainLoopTimer() % OutputStep == 0) {
-      auto ar = computeAspectRatio(PFLattice, Geo);
-      if (mpi().getRank() == 0) {
-        std::cout << "[Step " << MainLoopTimer() << "] b=" << ar[0]
-                  << " a=" << ar[1] << " b/a=" << ar[2] << "\n";
-      }
+      PFLattice.getField<GRAD<T, 2>>().Communicate();
+      PFLattice.getField<PHI<T>>().Communicate();
+      MFLattice.getField<ff::PSI<T>>().Communicate();
+      MFLattice.getField<ff::H_FIELD<T, 2>>().Communicate();
+      OutputTimer.Print_InnerLoopPerformance(Geo.getTotalCellNum(), OutputStep);
+      Printer::Endl();
       MainWriter.WriteBinary(MainLoopTimer());
     }
   }
 
-  Printer::Print_BigBanner(std::string("Simulation Complete."));
+  Printer::Print_BigBanner(std::string("Calculation Complete!"));
+  MainLoopTimer.Print_MainLoopPerformance(Geo.getTotalCellNum());
+  Printer::Print("Total PhysTime", BaseConv.getPhysTime(MainLoopTimer()));
+  Printer::Endl();
   return 0;
 }
