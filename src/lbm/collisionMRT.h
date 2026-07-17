@@ -82,6 +82,30 @@ __constexpr__ int shearIndexes<2,9> = 2;
 template <>
 __constexpr__ int shearViscIndexes<2,9>[shearIndexes<2,9>] = { 7, 8};
 
+// D2Q5 MRT matrix (for magnetic field diffusion equation)
+template <>
+__constexpr__ Fraction<> M<2,5>[5][5] = {
+  { 1,  1,  1,  1,  1},
+  { 0,  1, -1,  0,  0},
+  { 0,  0,  0,  1, -1},
+  {-4,  1,  1,  1,  1},
+  { 0,  1,  1, -1, -1}
+};
+
+template <>
+__constexpr__ Fraction<> InvM<2,5>[5][5] = {
+  {{1, 5},       0,       0, {-1, 5},       0},
+  {{1, 5},  {1, 2},       0, {1, 20},  {1, 4}},
+  {{1, 5}, {-1, 2},       0, {1, 20},  {1, 4}},
+  {{1, 5},       0,  {1, 2}, {1, 20}, {-1, 4}},
+  {{1, 5},       0, {-1, 2}, {1, 20}, {-1, 4}}
+};
+
+template <>
+__constexpr__ Fraction<> s<2,5>[5] = {
+  0, 1, 1, 1, 1
+};
+
 template <>
 __constexpr__ Fraction<> M<3,19>[19][19] = {
 { 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1},

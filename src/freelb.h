@@ -17,3 +17,5 @@
 #include "lbm/lattice_set.h"
 // lbm dynamics
 #include "lbm/lbm.h"
+// magnetic field
+#include "mf/mf2d.h"

@@ -8,6 +8,7 @@
 
 using T = FLOAT;
 using LatSet = D2Q9<T>;
+using MFLatSet = D2Q5<T>;
 
 /*----------------------------------------------
             Simulation Parameters
@@ -42,6 +43,13 @@ T Re;
 T U_g;       // characteristic lattice velocity
 T Tau_ns;
 
+// magnetic field parameters
+T Chi_Ferro;   // magnetic susceptibility of ferrofluid (at φ=1)
+T Mu0;         // vacuum permeability
+T H0;          // applied external magnetic field strength
+int N_Sub;     // number of MF pseudo-time sub-iterations per physical step
+T Omega_M;     // MF relaxation frequency
+
 // simulation
 int MaxStep;
 int OutputStep;
@@ -70,6 +78,12 @@ void readParam() {
   Eo = param_reader.getValue<T>("Two_Phase", "Eo");
   Re = param_reader.getValue<T>("Two_Phase", "Re");
   U_g = param_reader.getValue<T>("Two_Phase", "U_g");
+
+  Chi_Ferro = param_reader.getValue<T>("Magnetic_Field", "Chi_Ferro");
+  Mu0 = param_reader.getValue<T>("Magnetic_Field", "Mu0");
+  H0 = param_reader.getValue<T>("Magnetic_Field", "H0");
+  N_Sub = param_reader.getValue<int>("Magnetic_Field", "N_Sub");
+  Omega_M = param_reader.getValue<T>("Magnetic_Field", "Omega_M");
 
   MaxStep = param_reader.getValue<int>("Simulation_Settings", "TotalStep");
   OutputStep = param_reader.getValue<int>("Simulation_Settings", "OutputStep");
@@ -114,6 +128,8 @@ void readParam() {
               << " beta=" << Beta << " kappa=" << Kappa
               << " tau_phi=" << Tau_phi << "\n";
     std::cout << "[Simulation]: MaxStep=" << MaxStep << "  OutputStep=" << OutputStep << "\n";
+    std::cout << "[Magnetic]: ChiFerro=" << Chi_Ferro << " Mu0=" << Mu0
+              << " H0=" << H0 << " N_Sub=" << N_Sub << " Omega_M=" << Omega_M << "\n";
 #ifdef _OPENMP
     std::cout << "[Parallel]: " << Thread_Num << " threads\n";
 #endif
@@ -150,6 +166,9 @@ int main(int argc, char* argv[]) {
 
   BaseConverter<T> PFBaseConv(LatSet::cs2);
   PFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), Tau_phi);
+
+  BaseConverter<T> MFBaseConv(MFLatSet::cs2);
+  MFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), T{1.0} / Omega_M);
 
   UnitConvManager<T> ConvManager(&BaseConv);
   ConvManager.Check_and_Print();
@@ -219,6 +238,23 @@ int main(int argc, char* argv[]) {
 
   // Init DELTARHO (block-level constant for variable density)
   PFLattice.template getField<ff::DELTARHO<T>>().InitValue(rho_h - rho_l);
+
+  // ------------------ define MF lattice (D2Q5) ------------------
+  // PSI = ψ (magnetic scalar potential), GRAD = H (vector), OMEGA = per-cell ω_m(x)
+  // H2 = |H|², GRAD_H2 = ∇(|H|²), CHI_CELL = per-cell χ, CHI_FERRO = χ at φ=1
+  using MFFIELDS = TypePack<PHI<T>, POP<T, MFLatSet::q>, GRAD<T, MFLatSet::d>,
+                             OMEGA<T>,
+                             mf::H2<T>, mf::GRAD_H2<T>, mf::CHI_CELL<T>,
+                             mf::CHI_FERRO<T>, mf::MU0<T>, mf::H0_FIELD<T>>;
+  T omega_m_init = Omega_M;
+  ValuePack MFInitValues(T{}, T{}, Vector<T, 2>{T{0}, T{0}},
+                         omega_m_init,
+                         T{}, Vector<T, 2>{T{0}, T{0}}, T{},
+                         Chi_Ferro, Mu0, H0);
+  using MFCELL = Cell<T, MFLatSet, MFFIELDS>;
+  BlockLatticeManager<T, MFLatSet, MFFIELDS> MFLattice(Geo, MFInitValues, MFBaseConv);
+
+  mf::BroadcastAllMFParams<T>(MFLattice, Chi_Ferro, Mu0, H0);
 
   // ---- Initialize PHI and POP fields ----
   // φ = 0 for light fluid (bubble interior), φ = 1 for heavy fluid (outside)
@@ -301,6 +337,40 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Initialize MF D2Q5 populations: ψ = -H₀·y, h_eq,α = w_α·ψ
+  // and per-cell ω_m = 1/(0.5 + μ(x)/cs²) with μ(x) = μ₀·(1 + χ_ferro·φ)
+  {
+    auto& phiField = PFLattice.getField<PHI<T>>();
+    auto& omegaMF = MFLattice.getField<OMEGA<T>>();
+    for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+      const auto& block = Geo.getBlock(blockid);
+      const auto& proj = block.getProjection();
+      auto& blockLat = MFLattice.getBlockLat(blockid);
+      auto& blockPhi = phiField.getBlockField(blockid);
+      auto& blockOmega = omegaMF.getBlockField(blockid);
+      int overlap = 0;
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          std::size_t id = j * proj[1] + i;
+          T y = block.getMin()[1] + static_cast<T>(j) * block.getVoxelSize();
+          T psi = -H0 * y;
+          MFCELL cell(id, blockLat);
+          for (unsigned int k = 0; k < MFLatSet::q; ++k) {
+            cell[k] = latset::w<MFLatSet>(k) * psi;
+          }
+          // Per-cell omega: μ = μ₀·(1 + χ_ferro·φ) → ω_m = 1/(0.5 + μ/cs²)
+          T phi = blockPhi.get(id);
+          T mu_local = Mu0 * (T{1} + Chi_Ferro * phi);
+          T tau_local = T{0.5} + mu_local / MFLatSet::cs2;
+          T omega_local = T{1} / tau_local;
+          if (omega_local > T{1.95}) omega_local = T{1.95};
+          if (omega_local < T{0.01}) omega_local = T{0.01};
+          blockOmega.get(id) = omega_local;
+        }
+      }
+    }
+  }
+
   // ------------------ define BCs ------------------
   // NS: bounceback on all walls
   BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>,
@@ -329,9 +399,17 @@ int main(int argc, char* argv[]) {
   PF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
   PF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
 
+  // MF periodic BC (D2Q5, same periodic setup as PF/NS)
+  using LM_MF = BlockLatticeManager<T, MFLatSet, MFFIELDS>;
+  FixedPeriodicBoundaryManager<LM_MF, FM>
+      MF_Periodic("MF_Periodic", MFLattice, FlagFM, PeriodicFlag, VoidFlag);
+  MF_Periodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  MF_Periodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+
 #ifdef MPI_ENABLED
   NS_Periodic.SetupMPI(GeoHelper);
   PF_Periodic.SetupMPI(GeoHelper);
+  MF_Periodic.SetupMPI(GeoHelper);
 #endif
 
   // ------------------ define tasks ------------------
@@ -395,6 +473,36 @@ int main(int argc, char* argv[]) {
     CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, ViscoForceTask>;
   BlockLatManagerCoupling ViscoForceCoupling(PFLattice, NSLattice);
 
+  // ---- MF tasks ----
+  // MF collision: D2Q5 MRT (no source) for magnetostatic pseudo-time iteration
+  using MFCollisionTask = tmp::Key_TypePair<BulkFlag, mf::MFCollision<MFCELL>>;
+  using MFPeriodicTask = tmp::Key_TypePair<PeriodicFlag, collision::PeriodicBoundary<MFCELL>>;
+  using MFAllTasks = tmp::TupleWrapper<MFCollisionTask, MFPeriodicTask>;
+  using MFCollisionTaskSelector = tmp::TaskSelector<MFAllTasks, std::uint8_t, MFCELL>;
+
+  // MF macro: ψ = Σh_α
+  using MFMacroTask = tmp::Key_TypePair<BulkFlag, mf::MFMacro<MFCELL>>;
+  using MFMacroSelector = TaskSelector<std::uint8_t, MFCELL, MFMacroTask>;
+
+  // MF field computation tasks (applied once per physical step after pseudo-time)
+  using MFHFieldTask = tmp::Key_TypePair<BulkFlag, mf::MFHField<MFCELL>>;
+  using MFHFieldSelector = TaskSelector<std::uint8_t, MFCELL, MFHFieldTask>;
+
+  using MFGradH2Task = tmp::Key_TypePair<BulkFlag, mf::MFGradH2<MFCELL>>;
+  using MFGradH2Selector = TaskSelector<std::uint8_t, MFCELL, MFGradH2Task>;
+
+  // MF → NS coupling: F_m = (μ₀·χ/2)·∇(|H|²) → added to NS FORCE
+  using KelvinForceTask = tmp::Key_TypePair<BulkFlag, mf::MFKelvinForce<MFCELL, NSCELL>>;
+  using KelvinForceTaskSelector =
+    CoupledTaskSelector<std::uint8_t, MFCELL, NSCELL, KelvinForceTask>;
+  BlockLatManagerCoupling KelvinForceCoupling(MFLattice, NSLattice);
+
+  // PF → MF coupling: χ_cell = χ_ferro · φ
+  using MFChiUpdateTask = tmp::Key_TypePair<BulkFlag, mf::MFChiUpdate<PFCELL, MFCELL>>;
+  using MFChiUpdateTaskSelector =
+    CoupledTaskSelector<std::uint8_t, PFCELL, MFCELL, MFChiUpdateTask>;
+  BlockLatManagerCoupling MFChiCoupling(PFLattice, MFLattice);
+
   // ------------------ writers ------------------
   vtmo::ScalarWriter PHIWriter("PHI", PFLattice.getField<PHI<T>>());
   vtmo::VectorWriter GRADWriter("GRAD", PFLattice.getField<GRAD<T, 2>>());
@@ -403,10 +511,15 @@ int main(int argc, char* argv[]) {
   vtmo::ScalarWriter DensityWriter("Density", NSLattice.getField<DENSITY<T>>());
   vtmo::ScalarWriter PressureWriter("Pressure", NSLattice.getField<PRESSURE<T>>());
   vtmo::VectorWriter ForceWriter("Force", NSLattice.getField<FORCE<T, 2>>());
+  vtmo::ScalarWriter PSIWriter("Psi", MFLattice.getField<PHI<T>>());
+  vtmo::VectorWriter HWriter("H_Field", MFLattice.getField<GRAD<T, 2>>());
+  vtmo::ScalarWriter H2Writer("H2", MFLattice.getField<mf::H2<T>>());
+  vtmo::VectorWriter GradH2Writer("GradH2", MFLattice.getField<mf::GRAD_H2<T>>());
 
   vtmo::vtmWriter<T, 2> MainWriter("bubble2d", Geo);
   MainWriter.addWriterSet(PHIWriter, GRADWriter, NormalWriter,
-                          VecWriter, PressureWriter, DensityWriter, ForceWriter);
+                          VecWriter, PressureWriter, DensityWriter, ForceWriter,
+                          PSIWriter, HWriter, H2Writer, GradH2Writer);
 
   // ------------------ timer ------------------
   Timer MainLoopTimer;
@@ -415,8 +528,10 @@ int main(int argc, char* argv[]) {
   
   PFLattice.NormalFullCommunicate();
   NSLattice.NormalFullCommunicate();
+  MFLattice.NormalFullCommunicate();
   NS_Periodic.Apply();
   PF_Periodic.Apply();
+  MF_Periodic.Apply();
 
   // Compute initial phi gradients, normal, laplacian, chempot (Fortran initHydroMacroVars)
   PFLattice.template ApplyInnerCellDynamics<FFNormalSelector>(FlagFM);
@@ -435,25 +550,121 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Start Calculation..."));
 
   while (MainLoopTimer() < MaxStep) {
-    // ===== Fortran-aligned: force → PF collision → NS collision → stream → macro =====
+    // ===== Three-field coupling: MF (pseudo-time) → Force → PF collision → NS collision → stream → macro =====
 
-    // ---- Phase A: Force setup (Fortran computeForce) ----
+    // ---- Phase A: Property update + force setup ----
     // A1: Update per-cell rho and omega from phi
     RhoOmegaCoupling.ApplyInnerCellDynamics<RhoOmegaTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // A1b: Update per-cell χ from φ (χ_cell = χ_ferro · φ)
+    MFChiCoupling.ApplyInnerCellDynamics<MFChiUpdateTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // A1b-cont: Update per-cell ω_m = 1/(0.5 + μ(x)/cs²) where μ(x) = μ₀·(1 + χ_cell)
+    {
+      auto& omegaField = MFLattice.getField<OMEGA<T>>();
+      auto& chiField = MFLattice.getField<mf::CHI_CELL<T>>();
+      for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+        const auto& block = Geo.getBlock(blockid);
+        const auto& proj = block.getProjection();
+        auto& blockOmega = omegaField.getBlockField(blockid);
+        auto& blockChi = chiField.getBlockField(blockid);
+        int overlap = block.getOverlap();
+        for (int j = overlap; j < block.getNy() - overlap; ++j) {
+          for (int i = overlap; i < block.getNx() - overlap; ++i) {
+            std::size_t id = j * proj[1] + i;
+            T mu_local = Mu0 * (T{1} + blockChi.get(id));
+            T tau_local = T{0.5} + mu_local / MFLatSet::cs2;
+            T omega_local = T{1} / tau_local;
+            if (omega_local > T{1.95}) omega_local = T{1.95};
+            if (omega_local < T{0.01}) omega_local = T{0.01};
+            blockOmega.get(id) = omega_local;
+          }
+        }
+      }
+    }
 
     // A2: Clear NS FORCE to zero
     NSLattice.getField<FORCE<T, LatSet::d>>().InitValue(Vector<T, 2>{T{0}, T{0}});
 
-    // A3: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
+    // A3: MF pseudo-time iteration (N_Sub steps) — D2Q5 MRT + Neumann BCs
+    for (int sub = 0; sub < N_Sub; ++sub) {
+      // MF collision (D2Q5 MRT, no source)
+      MFLattice.template ApplyInnerCellDynamics<MFCollisionTaskSelector>(FlagFM);
+      // MF periodic BC (left/right)
+      MF_Periodic.Apply();
+      // MF streaming + communicate
+      MFLattice.Stream();
+      MFLattice.NormalFullCommunicate();
+      // ψ = Σh_α
+      MFLattice.template ApplyInnerCellDynamics<MFMacroSelector>(FlagFM);
+      // Neumann BC: ∂ψ/∂y = -H₀ at top and bottom walls
+      {
+        auto& psiField = MFLattice.getField<PHI<T>>();
+        T H_global = T(Nj) * Cell_Len;
+        for (int blockid = 0; blockid < Geo.getBlockNum(); ++blockid) {
+          const auto& block = Geo.getBlock(blockid);
+          const auto& proj = block.getProjection();
+          auto& blockPsi = psiField.getBlockField(blockid);
+          auto& blockLat = MFLattice.getBlockLat(blockid);
+          int nx = block.getNx();
+          int ny = block.getNy();
+          int overlap = block.getOverlap();
+          T minY = block.getMin()[1];
+          T maxY = block.getMax()[1];
+          // Top wall: ψ(top) = ψ(top-1) + H₀ (∂ψ/∂y = -H₀ → ψ = ψ_neighbor + H₀)
+          if (maxY > H_global - Cell_Len * T(1.5)) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id_top = (ny - 1 - overlap) * proj[1] + i;
+              std::size_t id_int = (ny - 2 - overlap) * proj[1] + i;
+              T psi_val = blockPsi.get(id_int) + H0;
+              blockPsi.get(id_top) = psi_val;
+              MFCELL cell(id_top, blockLat);
+              for (unsigned int k = 0; k < MFLatSet::q; ++k) {
+                cell[k] = latset::w<MFLatSet>(k) * psi_val;
+              }
+            }
+          }
+          // Bottom wall: ψ(bot) = ψ(bot+1) + H₀
+          if (minY < Cell_Len * T(1.5)) {
+            for (int i = overlap; i < nx - overlap; ++i) {
+              std::size_t id_bot = overlap * proj[1] + i;
+              std::size_t id_int = (overlap + 1) * proj[1] + i;
+              T psi_val = blockPsi.get(id_int) + H0;
+              blockPsi.get(id_bot) = psi_val;
+              MFCELL cell(id_bot, blockLat);
+              for (unsigned int k = 0; k < MFLatSet::q; ++k) {
+                cell[k] = latset::w<MFLatSet>(k) * psi_val;
+              }
+            }
+          }
+        }
+      }
+      // Re-communicate ψ after Neumann BC
+      MFLattice.getField<PHI<T>>().Communicate();
+    }
+
+    // A4: H = -∇ψ, |H|² = Hx²+Hy² (computed in a single pass)
+    MFLattice.template ApplyInnerCellDynamics<MFHFieldSelector>(FlagFM);
+    MFLattice.getField<GRAD<T, 2>>().Communicate();
+    mf::CommunicateAllMFSelfFields<T>(MFLattice);
+
+    // A5-A6: ∇(|H|²) via central differencing
+    MFLattice.template ApplyInnerCellDynamics<MFGradH2Selector>(FlagFM);
+    mf::CommunicateAllMFSelfFields<T>(MFLattice);
+
+    // A7: F_m = (μ₀·χ/2)·∇(|H|²) → added to NS FORCE
+    KelvinForceCoupling.ApplyInnerCellDynamics<KelvinForceTaskSelector>(MainLoopTimer(), FlagFM);
+
+    // A8: F_s = λ*∇φ (Fortran: surtenforce = chpoten*nablaphi)
     STCoupling.ApplyInnerCellDynamics<STForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // A4: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
+    // A9: F_b = -ρ*g (Fortran: bodyforcey = -rho * 1e-4/60)
     GravCoupling.ApplyInnerCellDynamics<GravForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // A5: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
+    // A10: F_p = -(p/3)*Δρ*∇φ (Fortran: preforce from prev computeMacro2D)
     PreForceCoupling.ApplyInnerCellDynamics<PreForceTaskSelector>(MainLoopTimer(), FlagFM);
 
-    // A6: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
+    // A11: Communicate FORCE to ghost cells (aligned with bubble2d/shearflow2dMRT)
     NSLattice.getField<FORCE<T, LatSet::d>>().Communicate();
 
     // ---- Phase B: PF collision (Fortran collisionOrderDF2D) ----
