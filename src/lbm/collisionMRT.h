@@ -82,6 +82,39 @@ __constexpr__ int shearIndexes<2,9> = 2;
 template <>
 __constexpr__ int shearViscIndexes<2,9>[shearIndexes<2,9>] = { 7, 8};
 
+
+// ---------------------------------------------------------------------------
+// D2Q5 MRT: diffusion equation (magnetic potential operator)
+// c = {(0,0) (1,0) (-1,0) (0,1) (0,-1)}  w = {1/3 1/6 1/6 1/6 1/6}
+// Orthogonal moments: m0=psi m1=jx m2=jy m3=e m4=pxx
+// row norms: |m0|^2=5 |m1|^2=2 |m2|^2=2 |m3|^2=20 |m4|^2=4
+// ---------------------------------------------------------------------------
+template <>
+__constexpr__ Fraction<> M<2,5>[5][5] = {
+  { 1,  1,  1,  1,  1},
+  { 0,  1, -1,  0,  0},
+  { 0,  0,  0,  1, -1},
+  {-4,  1,  1,  1,  1},
+  { 0,  1,  1, -1, -1}
+};
+
+template <>
+__constexpr__ Fraction<> InvM<2,5>[5][5] = {
+  {{1, 5},     {0},      {0}, {-1, 5},     {0}},
+  {{1, 5},  {1, 2},      {0}, {1, 20},  {1, 4}},
+  {{1, 5}, {-1, 2},      {0}, {1, 20},  {1, 4}},
+  {{1, 5},     {0},   {1, 2}, {1, 20}, {-1, 4}},
+  {{1, 5},     {0},  {-1, 2}, {1, 20}, {-1, 4}}
+};
+
+template <>
+__constexpr__ Fraction<> s<2,5>[5] = {
+  {0}, {1}, {1}, {1}, {1}
+};
+
+template <>
+__constexpr__ int shearIndexes<2,5> = 0;
+
 template <>
 __constexpr__ Fraction<> M<3,19>[19][19] = {
 { 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1},
@@ -394,6 +427,56 @@ struct MRTSource {
     }
   }
 
+};
+
+// MRT collision for scalar diffusion (D2Q5 / D3Q7)
+// Used for magnetic potential operator: psi=sum(g_i), feq=w_i*psi
+// Reads per-cell omega_psi from OmegaField template parameter
+template <typename CELL, typename OmegaField>
+struct MRTDiffusion {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+  using GenericRho = typename CELL::GenericRho;
+
+  __any__ static void apply(CELL& cell) {
+    T omega_psi{};
+    if constexpr (cell.template hasField<OmegaField>()) {
+      omega_psi = cell.template get<OmegaField>();
+    } else {
+      omega_psi = cell.getOmega();
+    }
+
+    T rtvec[LatSet::q]{};
+    rtvec[0] = T{0};
+    for (unsigned int i = 1; i < LatSet::q; ++i) rtvec[i] = omega_psi;
+
+    T InvM_S[LatSet::q][LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i)
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        InvM_S[i][j] = mrt::InvM<LatSet>(i, j) * rtvec[j];
+
+    T psi = T{0};
+    for (unsigned int k = 0; k < LatSet::q; ++k) psi += cell[k];
+
+    T feq[LatSet::q];
+    for (unsigned int k = 0; k < LatSet::q; ++k)
+      feq[k] = latset::w<LatSet>(k) * psi;
+
+    T momenta[LatSet::q]{}, momentaEq[LatSet::q]{};
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      for (unsigned int j = 0; j < LatSet::q; ++j) {
+        momenta[i] += mrt::M<LatSet>(i, j) * cell[j];
+        momentaEq[i] += mrt::M<LatSet>(i, j) * feq[j];
+      }
+    }
+
+    for (unsigned int i = 0; i < LatSet::q; ++i) {
+      T coll{};
+      for (unsigned int j = 0; j < LatSet::q; ++j)
+        coll += InvM_S[i][j] * (momenta[j] - momentaEq[j]);
+      cell[i] -= coll;
+    }
+  }
 };
 
 // MRT collision with Guo force scheme for Navier-Stokes

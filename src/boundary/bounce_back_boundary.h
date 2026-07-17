@@ -171,6 +171,19 @@ struct anti_simple {
               cell.getPrevious(latset::opp<LatSet>(k));
   }
 };
+
+// Anti-bounceback for D2Q5 magnetic potential (reads PSI field directly)
+// psi_bc is set in the PSI field before this is called
+template <typename CELL, typename PSIField>
+struct anti_psi {
+  using T = typename CELL::FloatType;
+  using LatSet = typename CELL::LatticeSet;
+
+  static inline void apply(CELL &cell, unsigned int k) {
+    cell[k] = 2 * cell.template get<PSIField>() * latset::w<LatSet>(k) -
+              cell.getPrevious(latset::opp<LatSet>(k));
+  }
+};
 template <typename CELL>
 struct anti_O1 {
   using T = typename CELL::FloatType;
