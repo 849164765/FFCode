@@ -67,19 +67,12 @@ __any__ void MFComputeH2D<CELL>::apply(CELL& cell) {
 }
 
 // ---- MFMagneticForce2D ----
-// Complete Korteweg-Helmholtz magnetic body force:
-//   F_mag = χ(φ)·|H|·∇|H| - ½|H|²·∇χ  (with μ₀ ≡ 1)
-//   ≡ divergence of Maxwell stress tensor: ∇·(μ H⊗H - ½ μ |H|² I)
+// Magnetic body force (Guo et al., Phys. Fluids 37, 022148 (2025), Eq. (8)):
+//   F_m = (μ₀χ/2) ∇(|H|²) = μ₀χ|H|∇|H|   (with μ₀ ≡ 1)
 //
-// Reference: Guo et al., Phys. Fluids 37, 022148 (2025), Eqs. (64-66)
-//
-// The ∇χ term (magnetostrictive pressure gradient) is essential for correct
-// bubble elongation along the field direction when μ_h > μ_l:
-//   - At the poles: ∇χ points from bubble → fluid, and -½ H² ∇χ points
-//     fluid → bubble (pushing the interface OUTWARD → stretching)
-//   - At the equator: ∇|H| points toward the bubble, and χ|H|∇|H|
-//     points fluid → bubble (pushing the interface INWARD → compression)
-//   - Net effect: elongation along field + compression perpendicular
+// This form assumes linear magnetization (χ constant within each phase,
+// interpolated by φ across the interface). The ∇χ (magnetostrictive) term
+// is NOT included, following the reference.
 template <typename PFCELL, typename MFCELL, typename NSCELL>
 __any__ void MFMagneticForce2D<PFCELL, MFCELL, NSCELL>::apply(
     PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell) {
@@ -104,22 +97,9 @@ __any__ void MFMagneticForce2D<PFCELL, MFCELL, NSCELL>::apply(
   grad_Hmag[0] /= LatSet::cs2;
   grad_Hmag[1] /= LatSet::cs2;
 
-  // ∇χ via D2Q5 4-direction isotropic gradient (from per-cell CHI field)
-  Vector<T, 2> grad_chi{0, 0};
-  for (unsigned int k = 1; k < LatSet::q; ++k) {
-    T chi_k = mf_cell.getNeighbor(k).template get<CHI_PERCELL<T>>();
-    T wk = latset::w<LatSet>(k);
-    const auto& ck = latset::c<LatSet>(k);
-    grad_chi[0] += wk * ck[0] * chi_k;
-    grad_chi[1] += wk * ck[1] * chi_k;
-  }
-  grad_chi[0] /= LatSet::cs2;
-  grad_chi[1] /= LatSet::cs2;
-
-  // F_mag = χ·|H|·∇|H| - ½·|H|²·∇χ  (complete KH force divergence)
-  T Hsq = Hmag * Hmag;
-  T Fmag_x = chi * Hmag * grad_Hmag[0] - T{0.5} * Hsq * grad_chi[0];
-  T Fmag_y = chi * Hmag * grad_Hmag[1] - T{0.5} * Hsq * grad_chi[1];
+  // F_mag = χ·|H|·∇|H|  (Guo 2025, Eq. (8), μ₀ ≡ 1)
+  T Fmag_x = chi * Hmag * grad_Hmag[0];
+  T Fmag_y = chi * Hmag * grad_Hmag[1];
 
   auto& ns_force = ns_cell.template get<FORCE<T, 2>>();
   ns_force[0] += Fmag_x;

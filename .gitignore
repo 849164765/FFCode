@@ -23,3 +23,16 @@ split_*
 # Debug notes
 Recall.md
 Rising.md
+
+# Large files
+*.pdf
+*.png
+
+# Simulation output
+vtkoutput/
+output*/
+data*/
+
+# Scripts and tests temporary
+scripts/__pycache__/
+tests/__pycache__/

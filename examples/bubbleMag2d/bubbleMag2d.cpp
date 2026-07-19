@@ -64,7 +64,7 @@ void readParam() {
   gravity = gy_sqrt * gy_sqrt;
   sigma = gravity * rho_h * D_bubble * D_bubble / Eo;
   // H0 from Bo_m: Bo_m = μ₀ * H₀² * D / (2*σ),  μ₀=1 in LBM units
-  H0 = std::sqrt(T(2.0) * Bom * sigma / D_bubble);
+  H0 =std::sqrt(25) * std::sqrt(T(2.0) * Bom * sigma / D_bubble);
   Beta=T(12.0)*sigma/Interface_Width;
   Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
   Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
   AABB<T,2> left({T(-Cell_Len),0},{0,T(Nj*Cell_Len)});
   AABB<T,2> right({T(Ni*Cell_Len),0},{T((Ni+1)*Cell_Len),T(Nj*Cell_Len)});
   BlockGeometryHelper2D<T> GeoHelper(Ni,Nj,domain,Cell_Len,BlockCellLen);
-  GeoHelper.CreateBlocks(3,3);
+  GeoHelper.CreateBlocks(8,16);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
   BlockGeometry2D<T> Geo(GeoHelper);
