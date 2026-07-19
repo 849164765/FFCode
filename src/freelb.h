@@ -19,3 +19,4 @@
 #include "lbm/lbm.h"
 // magnetic field coupling
 #include "mfield/mfield2d.h"
+#include "mfield/mfield3d.h"
