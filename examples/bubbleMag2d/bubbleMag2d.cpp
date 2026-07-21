@@ -88,7 +88,7 @@ void readParam() {
 int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
   mpi().init(&argc,&argv); MPI_DEBUG_WAIT
-  printf("Initializing Bubble Rising in Ferrofluid...\n");
+  Printer::Print_BigBanner(std::string("Initializing Bubble Rising in Ferrofluid..."));
   readParam();
 
   // -- converters --
@@ -303,7 +303,7 @@ int main(int argc, char* argv[]) {
   RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(0,FlagFM);
   MW.WriteBinary(0);
 
-  printf("Start Calculation...\n");
+  Printer::Print_BigBanner(std::string("Start Calculation..."));
   Timer t; Timer ot;
   T H_global=T(Nj)*Cell_Len;
 
@@ -557,12 +557,12 @@ int main(int argc, char* argv[]) {
     ++t; ++ot;
     if(t()%OutputStep==0){
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
-      printf("\n");
+      Printer::Endl();
       MW.WriteBinary(t());
     }
   }
 
-  printf("Calculation Complete!\n");
+  Printer::Print_BigBanner(std::string("Calculation Complete!"));
   t.Print_MainLoopPerformance(Geo.getTotalCellNum());
   return 0;
 }
