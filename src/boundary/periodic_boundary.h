@@ -168,6 +168,7 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
       else if (dist10[d] > T(1e-6)) dist10[d] -= LatMan.getGeo().getVoxelSize();
     }
 
+#ifndef MPI_ENABLED
     for (std::size_t i = 0; i < LatMan.getGeo().getBlockNum(); ++i) {
       auto& blockLat = LatMan.getBlockLat(i);
       auto& block = blockLat.getBlock();
@@ -211,8 +212,6 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
       processBox(box1, dist10);
     }
 
-    BoundaryBoxPairs.push_back({box0, box1, dist01, dist10});
-
     MPI_RANK(0) {
       std::size_t sameBlockCount = 0;
       std::size_t crossBlockCount = 0;
@@ -223,6 +222,9 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
       std::cout << "[FixedPeriodicBoundaryManager] Total pairs: " << CrossBlockPairs.size()
                 << " (same-block: " << sameBlockCount << ", cross-block: " << crossBlockCount << ")" << std::endl;
     }
+#endif
+
+    BoundaryBoxPairs.push_back({box0, box1, dist01, dist10});
   }
 
 #ifdef MPI_ENABLED
@@ -246,33 +248,47 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
 
           Vector<int, D> idx_min, idx_max;
           hblock.getLocIdxRange(ghostBox, idx_min, idx_max);
+
+          auto pairGhostCell = [&](const Vector<T, D>& pos,
+                                   const Vector<T, D>& sourcePos) {
+            std::size_t foundSbi = globalGeo.getBlockNum();
+            int foundRank = -1;
+            for (std::size_t sbi = 0; sbi < globalGeo.getBlockNum(); ++sbi) {
+              const auto& sblock = globalGeo.getBlock(sbi);
+              if (sblock.getSelfBlock().isInside(sourcePos)) {
+                foundSbi = sbi;
+                foundRank = geoHelper.whichRank(sblock.getBlockId());
+                break;
+              }
+            }
+            if (foundSbi >= globalGeo.getBlockNum()) return;
+            const auto& sblock = globalGeo.getBlock(foundSbi);
+
+            if (hblockRank == myRank && foundRank == myRank) {
+              std::size_t ghostBlockIdx = LatMan.getGeo().findBlockIndex(hblock.getBlockId());
+              std::size_t ghostId = LatMan.getBlockLat(ghostBlockIdx).getBlock().getIndex_t(pos);
+              std::size_t sourceBlockIdx = LatMan.getGeo().findBlockIndex(sblock.getBlockId());
+              std::size_t sourceId = LatMan.getBlockLat(sourceBlockIdx).getBlock().getIndex_t(sourcePos);
+              CrossBlockPairs.push_back({ghostBlockIdx, ghostId, sourceBlockIdx, sourceId});
+            } else if (hblockRank == myRank && foundRank != myRank) {
+              std::size_t ghostBlockIdx = LatMan.getGeo().findBlockIndex(hblock.getBlockId());
+              std::size_t ghostId = LatMan.getBlockLat(ghostBlockIdx).getBlock().getIndex_t(pos);
+              int sourceBlockGlobalId = sblock.getBlockId();
+              recvMap[foundRank].push_back({ghostBlockIdx, ghostId, sourceBlockGlobalId, pos});
+            } else if (hblockRank != myRank && foundRank == myRank) {
+              std::size_t sourceBlockIdx = LatMan.getGeo().findBlockIndex(sblock.getBlockId());
+              std::size_t sourceId = LatMan.getBlockLat(sourceBlockIdx).getBlock().getIndex_t(sourcePos);
+              sendMap[hblockRank].push_back({sourceBlockIdx, sourceId, pos});
+            }
+          };
+
           if constexpr (D == 2) {
             for (int j = idx_min[1]; j <= idx_max[1]; ++j) {
               for (int i = idx_min[0]; i <= idx_max[0]; ++i) {
                 const Vector<T, 2> pt = hblock.getMinCenter() + (hblock.getVoxelSize() * Vector<T, 2>{T(i), T(j)});
                 if (!ghostBox.isInside(pt)) continue;
                 if (hbaseblock.isInside(pt)) continue;
-                Vector<T, D> pos = pt;
-                Vector<T, D> sourcePos = pos + dist;
-
-                for (std::size_t sbi = 0; sbi < globalGeo.getBlockNum(); ++sbi) {
-                  const auto& sblock = globalGeo.getBlock(sbi);
-                  if (sblock.getSelfBlock().isInside(sourcePos)) {
-                    int sourceRank = geoHelper.whichRank(sblock.getBlockId());
-
-                    if (hblockRank == myRank && sourceRank != myRank) {
-                      std::size_t ghostBlockIdx = LatMan.getGeo().findBlockIndex(hblock.getBlockId());
-                      std::size_t ghostId = LatMan.getBlockLat(ghostBlockIdx).getBlock().getIndex_t(pos);
-                      int sourceBlockGlobalId = sblock.getBlockId();
-                      recvMap[sourceRank].push_back({ghostBlockIdx, ghostId, sourceBlockGlobalId, pos});
-                    } else if (hblockRank != myRank && sourceRank == myRank) {
-                      std::size_t sourceBlockIdx = LatMan.getGeo().findBlockIndex(sblock.getBlockId());
-                      std::size_t sourceId = LatMan.getBlockLat(sourceBlockIdx).getBlock().getIndex_t(sourcePos);
-                      sendMap[hblockRank].push_back({sourceBlockIdx, sourceId, pos});
-                    }
-                    break;
-                  }
-                }
+                pairGhostCell(Vector<T, D>(pt), Vector<T, D>(pt) + dist);
               }
             }
           } else if constexpr (D == 3) {
@@ -282,27 +298,7 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
                   const Vector<T, 3> pt = hblock.getMinCenter() + (hblock.getVoxelSize() * Vector<T, 3>{T(i), T(j), T(k)});
                   if (!ghostBox.isInside(pt)) continue;
                   if (hbaseblock.isInside(pt)) continue;
-                  Vector<T, D> pos = pt;
-                  Vector<T, D> sourcePos = pos + dist;
-
-                  for (std::size_t sbi = 0; sbi < globalGeo.getBlockNum(); ++sbi) {
-                    const auto& sblock = globalGeo.getBlock(sbi);
-                    if (sblock.getSelfBlock().isInside(sourcePos)) {
-                      int sourceRank = geoHelper.whichRank(sblock.getBlockId());
-
-                      if (hblockRank == myRank && sourceRank != myRank) {
-                        std::size_t ghostBlockIdx = LatMan.getGeo().findBlockIndex(hblock.getBlockId());
-                        std::size_t ghostId = LatMan.getBlockLat(ghostBlockIdx).getBlock().getIndex_t(pos);
-                        int sourceBlockGlobalId = sblock.getBlockId();
-                        recvMap[sourceRank].push_back({ghostBlockIdx, ghostId, sourceBlockGlobalId, pos});
-                      } else if (hblockRank != myRank && sourceRank == myRank) {
-                        std::size_t sourceBlockIdx = LatMan.getGeo().findBlockIndex(sblock.getBlockId());
-                        std::size_t sourceId = LatMan.getBlockLat(sourceBlockIdx).getBlock().getIndex_t(sourcePos);
-                        sendMap[hblockRank].push_back({sourceBlockIdx, sourceId, pos});
-                      }
-                      break;
-                    }
-                  }
+                  pairGhostCell(Vector<T, D>(pt), Vector<T, D>(pt) + dist);
                 }
               }
             }
@@ -314,26 +310,16 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
       processDirection(bp.box1, bp.dist10);
     }
 
-    auto posLess = [](const Vector<T, D>& a, const Vector<T, D>& b) {
-      for (unsigned int d = 0; d < D; ++d) {
-        if (a[d] < b[d]) return true;
-        if (a[d] > b[d]) return false;
-      }
-      return false;
-    };
-    auto posEqual = [](const Vector<T, D>& a, const Vector<T, D>& b) {
-      for (unsigned int d = 0; d < D; ++d) {
-        if (a[d] != b[d]) return false;
-      }
-      return true;
-    };
+    // IMPORTANT: Do NOT deduplicate send/recv entries by ghost position.
+    // Different blocks can have ghost cells at the same physical position
+    // (because SelfBlocks overlap at block boundaries).  Deduplication by
+    // `pos` would drop one block's ghost cell, leaving it stuck (unpaired).
+    // Deduplication by (blockIdx, cellId) would break MPI symmetry (send
+    // count ≠ recv count).  The only correct option is no deduplication at
+    // all — the double Setup() call produces identical duplicates on both
+    // sides, so MPI send/recv sizes always match.
 
     for (auto& [rank, cells] : sendMap) {
-      std::sort(cells.begin(), cells.end(),
-        [&](const auto& a, const auto& b) { return posLess(std::get<2>(a), std::get<2>(b)); });
-      auto last = std::unique(cells.begin(), cells.end(),
-        [&](const auto& a, const auto& b) { return posEqual(std::get<2>(a), std::get<2>(b)); });
-      cells.erase(last, cells.end());
       std::map<std::size_t, std::vector<std::size_t>> blockGroups;
       for (auto& [blockIdx, cellId, pos] : cells) {
         blockGroups[blockIdx].push_back(cellId);
@@ -345,11 +331,6 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
     }
 
     for (auto& [rank, cells] : recvMap) {
-      std::sort(cells.begin(), cells.end(),
-        [&](const auto& a, const auto& b) { return posLess(std::get<3>(a), std::get<3>(b)); });
-      auto last = std::unique(cells.begin(), cells.end(),
-        [&](const auto& a, const auto& b) { return posEqual(std::get<3>(a), std::get<3>(b)); });
-      cells.erase(last, cells.end());
       std::map<int, std::vector<std::tuple<std::size_t, std::size_t>>> blockGroups;
       for (auto& [blockIdx, cellId, srcBlockId, pos] : cells) {
         blockGroups[srcBlockId].push_back({blockIdx, cellId});
@@ -363,11 +344,6 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
         }
         MPIRecvs.push_back({rank, srcBlockId, std::move(blockIdxs), std::move(ghostCellIds)});
       }
-    }
-
-    MPI_RANK(0) {
-      std::cout << "[FixedPeriodicBoundaryManager] MPI Sends: " << MPISends.size()
-                << " groups, MPI Recvs: " << MPIRecvs.size() << " groups" << std::endl;
     }
   }
 #endif
@@ -441,6 +417,65 @@ class FixedPeriodicBoundaryManager : public AbstractBlockBoundary {
           ghostCell[k] = buffer[bufidx++];
         }
         ghostCell.template get<GenericRho>() = buffer[bufidx++];
+      }
+    }
+#endif
+  }
+
+  template <typename OtherBFM>
+  void ApplyField(OtherBFM& fieldFM) {
+    for (std::size_t j = 0; j < CrossBlockPairs.size(); ++j) {
+      auto& pair = CrossBlockPairs[j];
+      auto& ghostBF = fieldFM.getBlockField(static_cast<int>(pair.ghostBlockIdx));
+      auto& sourceBF = fieldFM.getBlockField(static_cast<int>(pair.sourceBlockIdx));
+      ghostBF.get(pair.ghostId) = sourceBF.get(pair.sourceId);
+    }
+#ifdef MPI_ENABLED
+    if (MPISends.empty() && MPIRecvs.empty()) return;
+
+    constexpr int PERIODIC_FIELD_TAG_BASE = 9100;
+
+    std::vector<std::vector<T>> SendBuffers(MPISends.size());
+    std::vector<MPI_Request> SendRequests;
+
+    for (std::size_t i = 0; i < MPISends.size(); ++i) {
+      auto& send = MPISends[i];
+      auto& buffer = SendBuffers[i];
+      buffer.resize(send.sourceIds.size());
+      auto& sourceBF = fieldFM.getBlockField(static_cast<int>(send.sourceBlockIdx));
+      std::size_t bufidx = 0;
+      for (std::size_t id : send.sourceIds) {
+        buffer[bufidx++] = sourceBF.get(id);
+      }
+      MPI_Request request;
+      mpi().iSend(buffer.data(), static_cast<int>(buffer.size()), send.targetRank, &request,
+                  PERIODIC_FIELD_TAG_BASE + send.sourceBlockId);
+      SendRequests.push_back(request);
+    }
+
+    std::vector<std::vector<T>> RecvBuffers(MPIRecvs.size());
+    std::vector<MPI_Request> RecvRequests;
+
+    for (std::size_t i = 0; i < MPIRecvs.size(); ++i) {
+      auto& recv = MPIRecvs[i];
+      auto& buffer = RecvBuffers[i];
+      buffer.resize(recv.ghostIds.size());
+      MPI_Request request;
+      mpi().iRecv(buffer.data(), static_cast<int>(buffer.size()), recv.sourceRank, &request,
+                  PERIODIC_FIELD_TAG_BASE + recv.sourceBlockId);
+      RecvRequests.push_back(request);
+    }
+
+    MPI_Waitall(static_cast<int>(SendRequests.size()), SendRequests.data(), MPI_STATUSES_IGNORE);
+
+    for (std::size_t i = 0; i < MPIRecvs.size(); ++i) {
+      MPI_Wait(&RecvRequests[i], MPI_STATUS_IGNORE);
+      auto& recv = MPIRecvs[i];
+      const auto& buffer = RecvBuffers[i];
+      std::size_t bufidx = 0;
+      for (std::size_t j = 0; j < recv.ghostIds.size(); ++j) {
+        auto& ghostBF = fieldFM.getBlockField(static_cast<int>(recv.ghostBlockIdxs[j]));
+        ghostBF.get(recv.ghostIds[j]) = buffer[bufidx++];
       }
     }
 #endif
