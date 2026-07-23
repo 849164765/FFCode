@@ -8,7 +8,13 @@ namespace mfield {
 // Update per-cell mu, chi, omega_psi from phi
 // mu  = mu_l  + phi * (mu_h  - mu_l)
 // chi = chi_l + phi * (chi_h - chi_l)
-// tau_psi = 0.5 + mu / cs²,  omega_psi = 1 / tau_psi (clamped)
+// tau_psi = 0.5 + epsilon * mu / cs²,  omega_psi = 1 / tau_psi (clamped)
+//
+// 论文式(37): (1/ε) ∂ψ/∂t = ∇·(μ∇ψ)
+// ε 为伪时间加速参数: 大值 → 有效扩散系数 D_eff = ε*μ 增大 → 加速收敛到稳态
+// 论文式(42): tau = 0.5 + 2.5*ε*μ/cs² (D2Q5 w=0.2, cs²=4/5)
+// 本代码 D2Q5 w={1/3,1/6,...}, cs²=1/3, 对应 tau = 0.5 + ε*μ/cs²
+// ε=1 时 D=μ (收敛慢, RT算例需~100万步); ε=10 时 D=10μ (~1万步收敛)
 template <typename PFCELL, typename MFCELL>
 __any__ void MFUpdateCoeffs2D<PFCELL, MFCELL>::apply(PFCELL& pf_cell,
                                                      MFCELL& mf_cell) {
@@ -20,12 +26,13 @@ __any__ void MFUpdateCoeffs2D<PFCELL, MFCELL>::apply(PFCELL& pf_cell,
   T mu_h  = mf_cell.template get<MU_H<T>>();
   T chi_l = mf_cell.template get<CHI_L<T>>();
   T chi_h = mf_cell.template get<CHI_H<T>>();
+  T epsilon = mf_cell.template get<MF_EPSILON<T>>();
 
   T mu  = mu_l  + phi * (mu_h  - mu_l);
   T chi = chi_l + phi * (chi_h - chi_l);
 
-  // tau = 0.5 + mu / cs²  (diffusion: D = mu,  tau = 0.5 + D/cs²)
-  T tau_psi = T{0.5} + mu / LatSet::cs2;
+  // tau = 0.5 + ε*μ / cs²  (有效扩散系数 D_eff = ε*μ)
+  T tau_psi = T{0.5} + epsilon * mu / LatSet::cs2;
   T omega_psi = T{1} / tau_psi;
   if (omega_psi > T{1.95}) omega_psi = T{1.95};
   if (omega_psi < T{0.01}) omega_psi = T{0.01};

@@ -71,7 +71,7 @@ int main() {
   BaseConverter<T> MFBaseConv(D2Q5<T>::cs2);
   MFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), T(1.0));
   ValuePack MFInit(T{}, T{}, T{}, T{}, T{}, T{}, T{},
-                   mu_l, mu_h, chi_l, chi_h, H0);
+                   mu_l, mu_h, chi_l, chi_h, H0, T{1.0});
   BlockLatticeManager<T, D2Q5<T>, MFPACK> MFLattice(
     Geo, MFInit, MFBaseConv, &PFLattice.getField<PHI<T>>());
 

@@ -30,7 +30,7 @@ T Interface_Width, Mobility, Tau_phi, Omega_phi, Kappa, Beta;
 T rho_l, rho_h, eta_l, eta_h, sigma, gravity, U0, Tau_ns, DeltaRho;
 
 // magnetic field
-T chi_l, chi_h, mu_l, mu_h, H0, Bom;
+T chi_l, chi_h, mu_l, mu_h, H0, Bom, MF_Epsilon;
 
 int MaxStep, OutputStep;
 std::string work_dir;
@@ -61,6 +61,9 @@ void readParam() {
   mu_l = r.getValue<T>("Magnetic_Field","mu_l");
   mu_h = r.getValue<T>("Magnetic_Field","mu_h");
   Bom = r.getValue<T>("Magnetic_Field","Bom");
+  // MF_Epsilon: 伪时间加速参数(论文式37), 大值加速磁场求解器收敛
+  // ε=1: D=μ, RT域高1024需~100万步收敛; ε=10: D=10μ, ~1万步收敛
+  MF_Epsilon = r.getValue<T>("Magnetic_Field","MF_Epsilon");
   // 模拟设置
   MaxStep = r.getValue<int>("Simulation_Settings","TotalStep");
   OutputStep = r.getValue<int>("Simulation_Settings","OutputStep");
@@ -168,15 +171,15 @@ int main(int argc, char* argv[]) {
   // -- MF lattice (D2Q5) --
   using MFFIELDS=TypePack<PSI<T>,OMEGA_PSI<T>,MU_PERCELL<T>,CHI_PERCELL<T>,
     HX<T>,HY<T>,HMAG<T>,POP<T,MFLatSet::q>,
-    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>>;
+    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>,MF_EPSILON<T>>;
   using MFREF=TypePack<PHI<T>>;
   using MFPACK=TypePack<MFFIELDS,MFREF>;
   ValuePack MFI(T{},T{1.0},T{mu_l},T{chi_l},T{},T{},T{},T{},
-    mu_l,mu_h,chi_l,chi_h,H0);
+    mu_l,mu_h,chi_l,chi_h,H0,MF_Epsilon);
   using MFCELL=Cell<T,MFLatSet,ExtractFieldPack<MFPACK>::mergedpack>;
   BlockLatticeManager<T,MFLatSet,MFPACK> MFLattice(Geo,MFI,MFBaseConv,
     &PFLattice.getField<PHI<T>>());
-  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0);
+  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,MF_Epsilon);
   MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
 
   // -- init phi (RT: 重相在上 phi=1, 轻相在下 phi=0, 界面 y=2L+0.1L*cos(2pi*x/L)) --
@@ -229,16 +232,29 @@ int main(int argc, char* argv[]) {
       }
   }
 
-  // init MF: psi = -H0*y (uniform field), g_k = w_k*psi
+  // init MF: psi = 分段线性 (正确的变μ稳态解, 使H场在界面处产生跳变)
+  // 论文式(5): ∇·(μ∇ψ)=0 的1D稳态解 (水平界面 y_int):
+  //   轻相 (y<y_int, μ=μ_l): ψ = -H0*y,  → H = H0
+  //   重相 (y≥y_int, μ=μ_h): ψ = -H0*y_int - (H0/μ_h)*(y-y_int), → H = H0/μ_h
+  //   界面处 B_n=μH 连续: μ_l*H0 = μ_h*(H0/μ_h) = H0 ✓
+  // 初始界面位置 y_int(x) = 2L + 0.1L*cos(2πx/L) (论文式72)
   {
     auto& psiF=MFLattice.getField<PSI<T>>();
     for(int b=0;b<Geo.getBlockNum();++b){
       auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
       auto& bPsi=psiF.getBlockField(b);
-      T vs=bk.getVoxelSize(),my=bk.getMin()[1];
+      T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1];
       for(int j=0;j<bk.getNy();++j){
-        T y=my+T(j)*vs, psi=-H0*y;
+        T y=my+T(j)*vs;
         for(int i=0;i<bk.getNx();++i){
+          T x=mx+T(i)*vs;
+          T y_int = T(2.0)*L + T(0.1)*L * std::cos(T(2.0)*T(3.14159265358979323846)*x/L);
+          T psi;
+          if(y < y_int){
+            psi = -H0 * y;  // 轻相: H = H0
+          } else {
+            psi = -H0 * y_int - (H0 / mu_h) * (y - y_int);  // 重相: H = H0/μ_h
+          }
           std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
           for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi;
           bPsi.get(id)=psi;
@@ -315,8 +331,9 @@ int main(int argc, char* argv[]) {
   vtmo::VectorWriter Fw("Force",NSLattice.getField<FORCE<T,2>>());
   vtmo::ScalarWriter Hxw("HX",MFLattice.getField<HX<T>>());
   vtmo::ScalarWriter Hyw("HY",MFLattice.getField<HY<T>>());
+  vtmo::ScalarWriter Hmw("HMAG",MFLattice.getField<HMAG<T>>());
   vtmo::vtmWriter<T,2> MW("rt2d",Geo);
-  MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw);
+  MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw,Hmw);
 
   // ===== initial setup =====
   PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
@@ -341,7 +358,10 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: Set wall psi = -H0*y  and wall pops = feq(psi_bc)
+    // 0b: Set wall psi BC
+    // 底壁(轻相, y≈0): ψ = -H0*y, H = H0
+    // 顶壁(重相, y≈4L): ψ = -H0*y_int_avg - (H0/μ_h)*(y - y_int_avg), H = H0/μ_h
+    //   y_int_avg=2L (平均界面位置, 壁面远离界面, 近似合理)
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
       for(int b=0;b<Geo.getBlockNum();++b){
@@ -349,6 +369,7 @@ int main(int argc, char* argv[]) {
         auto& bPsi=psiF.getBlockField(b);
         int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
         T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
+        // 底壁: 轻相, ψ = -H0*y
         if(minY<Cell_Len*T{1.5}){
           for(int jj=0;jj<=ov;++jj){
             T y=minY+T(jj)*vs, psi_w=-H0*y;
@@ -359,9 +380,12 @@ int main(int argc, char* argv[]) {
             }
           }
         }
+        // 顶壁: 重相, ψ = -H0*2L - (H0/μ_h)*(y - 2L)
         if(maxY>H_global-Cell_Len*T{1.5}){
+          T y_int_avg = T(2.0)*L;  // 平均界面位置
           for(int jj=ny-ov-1;jj<ny;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
+            T y=minY+T(jj)*vs;
+            T psi_w = -H0*y_int_avg - (H0/mu_h)*(y - y_int_avg);
             for(int ii=0;ii<nx;++ii){
               std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;

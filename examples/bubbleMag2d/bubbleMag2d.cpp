@@ -143,15 +143,15 @@ int main(int argc, char* argv[]) {
   // -- MF lattice (D2Q5) --
   using MFFIELDS=TypePack<PSI<T>,OMEGA_PSI<T>,MU_PERCELL<T>,CHI_PERCELL<T>,
     HX<T>,HY<T>,HMAG<T>,POP<T,MFLatSet::q>,
-    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>>;
+    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>,MF_EPSILON<T>>;
   using MFREF=TypePack<PHI<T>>;
   using MFPACK=TypePack<MFFIELDS,MFREF>;
   ValuePack MFI(T{},T{1.0},T{mu_l},T{chi_l},T{},T{},T{},T{},
-    mu_l,mu_h,chi_l,chi_h,H0);
+    mu_l,mu_h,chi_l,chi_h,H0,T{1.0});
   using MFCELL=Cell<T,MFLatSet,ExtractFieldPack<MFPACK>::mergedpack>;
   BlockLatticeManager<T,MFLatSet,MFPACK> MFLattice(Geo,MFI,MFBaseConv,
     &PFLattice.getField<PHI<T>>());
-  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0);
+  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,T{1.0});
   MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
 
   // -- init phi (tanh bubble) --
