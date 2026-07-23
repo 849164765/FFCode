@@ -55,7 +55,10 @@ void readParam() {
   mu_h=r.getValue<T>("Magnetic_Field","mu_h");
   Bom=r.getValue<T>("Magnetic_Field","Bom");
 
-  T L = T(Ni) * Cell_Len;  // 计算参考长度 L=256 (文献 Sec.F 第1040行)
+  // 文献 Sec.F 第1039行: 计算域[0,2L]x[0,2L], L为半域长度
+  // 文献 L=256 对应 512x512 网格; 此处 L=半域=Ni*Cell_Len/2
+  // 若 Ni=512 则 L=256 (完全匹配文献); 若 Ni=256 则 L=128 (半尺度, 参数正确)
+  T L = T(Ni) * Cell_Len * T(0.5);  // 参考长度 L = 半域 (文献 Sec.F: 域=2Lx2L)
 
   // 派生参数 (文献公式推导, LBM单位 mu0=1)
   // sigma = rho_h*L*U^2/We  (文献 Eq.82)
@@ -166,9 +169,9 @@ int main(int argc, char* argv[]) {
 
   // -- init phi (KH interface, flipped tanh) --
   // 初始相场 phi (文献 Eq.78-79, 翻转tanh使底层phi=1铁磁流体)
-  // y(x) = L/2 + 0.1*L*cos(2*pi*x/L)  (文献 Eq.78, 适配用户域[0,L]x[0,L])
+  // y(x) = L + 0.1*L*cos(2*pi*x/L)  (文献 Eq.78, 适配用户域[0,L]x[0,L])
   // phi = 0.5 + 0.5*tanh(2*(y(x)-y)/W)  (文献 Eq.79翻转版, 底层phi=1)
-  T L_phys = T(Ni) * Cell_Len;
+  T L_phys = T(Ni) * Cell_Len * T(0.5);
   T W_phys = Interface_Width * Cell_Len;
   auto& phiField = PFLattice.getField<PHI<T>>();
   for(int b=0;b<Geo.getBlockNum();++b){
@@ -180,8 +183,8 @@ int main(int argc, char* argv[]) {
       T y=my+T(j)*vs;
       for(int i=ov;i<bk.getNx()-ov;++i){
         T x=mx+T(i)*vs;
-        // 界面位置 y(x) = L/2 + 0.1*L*cos(2*pi*x/L) (文献 Eq.78)
-        T y_interface = L_phys*T(0.5) + T(0.1)*L_phys*std::cos(T(2.0)*M_PI*x/L_phys);
+        // 界面位置 y(x) = L + 0.1*L*cos(2*pi*x/L) (文献 Eq.78)
+        T y_interface = L_phys*T(1.0) + T(0.1)*L_phys*std::cos(T(2.0)*M_PI*x/L_phys);
         // phi = 0.5 + 0.5*tanh(2*(y_interface-y)/W) (文献 Eq.79翻转, 底层phi=1)
         T phi = T(0.5) + T(0.5)*std::tanh(T(2.0)*(y_interface - y)/W_phys);
         bPhi.get(j*pr[1]+i)=phi;
