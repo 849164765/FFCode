@@ -512,20 +512,30 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // 0f-clip: Clip HMAG to the theoretical maximum (1.2×H0 for a 3D sphere
-    // with μ_in=1, μ_out=2).  H_max = 3μ_out/(μ_in+2μ_out)·H0 = 6/5·H0.
-    // Any HMAG exceeding 1.2×H0 is a numerical artifact from the D3Q7 LBM
-    // solve at triple corners (X+Y periodic + Z wall) where ghost-cell
-    // HMAG cannot be synced by Communicate().  Left unchecked, the
-    // artifact drives unphysical Fmag growth (Fmag = χ·|H|·∇|H|) that
-    // eventually destabilizes the NS solver (Ma → 0.2+ → NaN).
+    // 0f-clip: Clip HMAG to cap numerical artifacts from the D3Q7 LBM solve
+    // at triple corners (X+Y periodic + Z wall) where ghost-cell HMAG cannot
+    // be synced by Communicate().  Left unchecked, the artifact drives
+    // unphysical Fmag growth (Fmag = χ·|H|·∇|H|) that eventually destabilizes
+    // the NS solver (Ma → 0.2+ → NaN).
     //
-    // Clipping is applied globally to every interior cell, so it does not
-    // introduce artificial gradients (unlike the failed extended-0f-fix
-    // experiment).  The H vector is rescaled isotropically to preserve
-    // direction while capping magnitude.
+    // The theoretical sharp-interface maximum for a 3D sphere with μ_in=1,
+    // μ_out=2 is H_max = 3μ_out/(μ_in+2μ_out)·H0 = 6/5·H0 = 1.2×H0, located
+    // at the bubble equator.  However, clipping at exactly 1.2×H0 destroys
+    // the physical equatorial field: clip makes |H| constant (=1.2×H0) in
+    // the clipped region, so ∇|H|=0 and the magnetic force F=χ·|H|·∇|H|≈0
+    // at the interface.  This eliminates Bom dependence — Bom=1.94 and
+    // Bom=0.13 produce identical bubble shapes because the force is zeroed
+    // out and deformation is driven only by gravity + surface tension.
+    //
+    // Fix: clip at 1.5×H0 (25% above the sharp-interface theoretical max).
+    // This preserves the physical equatorial field (≤1.2×H0 for sharp,
+    // ≤~1.3×H0 for the diffuse interface with W/R=0.0625) while still
+    // capping staircase artifacts (which reach 4-5×H0 at triple corners).
+    // The force at the equator is restored: F = χ·|H|·∇|H| ∝ H0² ∝ Bom.
+    // Ma safety: with clip=1.2×H0, Ma≈0.085; at 1.5×H0, Ma≈0.132 (< 0.2 ✓).
+    // The H vector is rescaled isotropically to preserve direction.
     {
-      T Hmax_clip = T{1.2} * H0;
+      T Hmax_clip = T{1.5} * H0;
       auto& hxF=MFLattice.getField<HX<T>>();
       auto& hyF=MFLattice.getField<HY<T>>();
       auto& hzF=MFLattice.getField<HZ<T>>();
