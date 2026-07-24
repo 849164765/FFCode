@@ -31,6 +31,9 @@ T rho_l, rho_h, eta_l, eta_h, sigma, gravity, U0, Tau_ns, DeltaRho;
 
 // magnetic field
 T chi_l, chi_h, mu_l, mu_h, H0, Bom, MF_Epsilon;
+int MF_SubSteps;  // MF子迭代次数: 补偿标准LBM流动无法像论文Lax-Wendroff(式39)那样加速
+int MF_SOR_Iter;   // SOR求解器迭代次数
+T MF_SOR_Omega;    // SOR松弛因子(1-2, 1.8-1.9最优)
 
 int MaxStep, OutputStep;
 std::string work_dir;
@@ -61,9 +64,17 @@ void readParam() {
   mu_l = r.getValue<T>("Magnetic_Field","mu_l");
   mu_h = r.getValue<T>("Magnetic_Field","mu_h");
   Bom = r.getValue<T>("Magnetic_Field","Bom");
-  // MF_Epsilon: 伪时间加速参数(论文式37), 大值加速磁场求解器收敛
-  // ε=1: D=μ, RT域高1024需~100万步收敛; ε=10: D=10μ, ~1万步收敛
+  // MF_Epsilon: 伪时间加速参数(论文式37: ε=1/μ₀=1, 论文行273)
+  // 论文使用Lax-Wendroff流动(式39, γ>1)加速收敛, 本代码用标准LBM+子迭代替代
+  // ε=1 → τ=0.5+3μ (轻相3.5, 重相6.5), 碰撞有效, 数值稳定
   MF_Epsilon = r.getValue<T>("Magnetic_Field","MF_Epsilon");
+  // MF_SubSteps: 每个时间步的MF子迭代次数, 补偿标准LBM流动的慢收敛
+  // 有效伪时间 = ε × SubSteps, 扩散长度 = √(2D×SubSteps) 需 > 界面宽度W
+  MF_SubSteps = r.getValue<int>("Magnetic_Field","MF_SubSteps");
+  // SOR求解器参数: 直接有限差分求解∇·(μ∇ψ)=0, 替代LBM碰撞-流动
+  // 优点: 正确处理变磁导率μ(调和平均), 无条件稳定, 收敛快
+  MF_SOR_Iter = r.getValue<int>("Magnetic_Field","MF_SOR_Iter");
+  MF_SOR_Omega = r.getValue<T>("Magnetic_Field","MF_SOR_Omega");
   // 模拟设置
   MaxStep = r.getValue<int>("Simulation_Settings","TotalStep");
   OutputStep = r.getValue<int>("Simulation_Settings","OutputStep");
@@ -107,7 +118,8 @@ void readParam() {
            sigma, H0, Bom, Beta, Kappa);
     printf("         tau_phi=%.4f tau_ns=%.4f DeltaRho=%.4f Ma=%.4f\n",
            Tau_phi, Tau_ns, DeltaRho, Ma);
-    printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f)\n", chi_l, chi_h, mu_l, mu_h);
+    printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f) SOR: iter=%d omega=%.2f\n",
+           chi_l, chi_h, mu_l, mu_h, MF_SOR_Iter, MF_SOR_Omega);
     printf("====================================================\n");
   }
   if(Ma > T(0.2)) MPI_RANK(0){ fprintf(stderr,"[Warn] Ma=%.4f > 0.2\n",Ma); }
@@ -358,78 +370,64 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: Set wall psi BC
-    // 底壁(轻相, y≈0): ψ = -H0*y, H = H0
-    // 顶壁(重相, y≈4L): ψ = -H0*y_int_avg - (H0/μ_h)*(y - y_int_avg), H = H0/μ_h
-    //   y_int_avg=2L (平均界面位置, 壁面远离界面, 近似合理)
+    // 0b-0e: SOR直接求解器 for ∇·(μ∇ψ) = 0 (替代LBM碰撞-流动)
+    // 优点: ①正确处理变磁导率μ(调和平均) ②无条件稳定 ③不受τ限制
+    // 离散: ψ_new = (μ_E·ψ_E + μ_W·ψ_W + μ_N·ψ_N + μ_S·ψ_S) / (μ_E+μ_W+μ_N+μ_S)
+    // μ_face = 2·μ_c·μ_n/(μ_c+μ_n) (调和平均, 正确处理界面跳变)
+    // Red-Black SOR: 先更新红格(i+j偶), 再更新黑格(i+j奇), 可并行
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b);
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
-        // 底壁: 轻相, ψ = -H0*y
-        if(minY<Cell_Len*T{1.5}){
-          for(int jj=0;jj<=ov;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
+      auto& muF =MFLattice.getField<MU_PERCELL<T>>();
+      // 壁面BC函数 (Dirichlet: 底壁ψ=-H0*y, 顶壁ψ=-H0·2L-(H0/μ_h)·(y-2L))
+      auto setWallBC=[&](){
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bPsi=psiF.getBlockField(b);
+          const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+          T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
+          if(minY<Cell_Len*T{1.5})
+            for(int jj=0;jj<=ov;++jj){ T y=minY+T(jj)*vs;
+              for(int ii=0;ii<nx;++ii) bPsi.get(jj*pr[1]+ii)=-H0*y; }
+          if(maxY>H_global-Cell_Len*T{1.5}){ T yi=T(2.0)*L;
+            for(int jj=ny-ov-1;jj<ny;++jj){ T y=minY+T(jj)*vs;
+              for(int ii=0;ii<nx;++ii) bPsi.get(jj*pr[1]+ii)=-H0*yi-(H0/mu_h)*(y-yi); }}
+        }
+      };
+      setWallBC();
+      CommunicatePSI<T>(MFLattice);
+      // SOR迭代
+      for(int iter=0;iter<MF_SOR_Iter;++iter){
+        for(int color=0;color<2;++color){ // 0=红(i+j偶) 1=黑(i+j奇)
+          for(int b=0;b<Geo.getBlockNum();++b){
+            auto& bPsi=psiF.getBlockField(b); auto& bMu=muF.getBlockField(b);
+            const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+            int ov=bk.getOverlap(),nx=bk.getNx(),ny=bk.getNy();
+            T minY=bk.getMin()[1],maxY=bk.getMax()[1];
+            bool is_bottom=(minY<Cell_Len*T{1.5}), is_top=(maxY>H_global-Cell_Len*T{1.5});
+            for(int j=ov;j<ny-ov;++j){
+              if(is_bottom&&j==ov) continue;      // 跳过底壁(Dirichlet)
+              if(is_top&&j==ny-ov-1) continue;     // 跳过顶壁(Dirichlet)
+              for(int i=ov;i<nx-ov;++i){
+                if(((i+j)&1)!=color) continue;
+                std::size_t id=j*pr[1]+i;
+                T muc=bMu.get(id);
+                T muE=bMu.get(id+1),muW=bMu.get(id-1);
+                T muN=bMu.get((j+1)*pr[1]+i),muS=bMu.get((j-1)*pr[1]+i);
+                // 调和平均 (正确处理界面μ跳变)
+                T hE=2*muc*muE/(muc+muE),hW=2*muc*muW/(muc+muW);
+                T hN=2*muc*muN/(muc+muN),hS=2*muc*muS/(muc+muS);
+                T psi_new=(hE*bPsi.get(id+1)+hW*bPsi.get(id-1)
+                          +hN*bPsi.get((j+1)*pr[1]+i)+hS*bPsi.get((j-1)*pr[1]+i))
+                          /(hE+hW+hN+hS);
+                bPsi.get(id)=(T{1}-MF_SOR_Omega)*bPsi.get(id)+MF_SOR_Omega*psi_new;
+              }
             }
           }
-        }
-        // 顶壁: 重相, ψ = -H0*2L - (H0/μ_h)*(y - 2L)
-        if(maxY>H_global-Cell_Len*T{1.5}){
-          T y_int_avg = T(2.0)*L;  // 平均界面位置
-          for(int jj=ny-ov-1;jj<ny;++jj){
-            T y=minY+T(jj)*vs;
-            T psi_w = -H0*y_int_avg - (H0/mu_h)*(y - y_int_avg);
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
-            }
-          }
+          setWallBC(); // 每次颜色pass后重设壁面BC
         }
       }
+      CommunicatePSI<T>(MFLattice);
     }
-
-    // 0c: MF collision (direct iteration)
-    for(int b=0;b<Geo.getBlockNum();++b){
-      auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-      int ov=bk.getOverlap();
-      for(int j=ov;j<bk.getNy()-ov;++j){
-        for(int i=ov;i<bk.getNx()-ov;++i){
-          MFCELL c(j*pr[1]+i,bl);
-          collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
-        }
-      }
-    }
-    MF_Per.Apply();
-
-    // 0d: Stream
-    MFLattice.NormalFullCommunicate();
-    MFLattice.Stream();
-    MFLattice.NormalFullCommunicate();
-
-    // 0e: PSI = Σg_i (interior only, walls keep psi_bc)
-    {
-      auto& psiF=MFLattice.getField<PSI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b); int ov=bk.getOverlap();
-        for(int j=ov;j<bk.getNy()-ov;++j){
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
-            T psi=0; for(unsigned k=0;k<MFLatSet::q;++k)psi+=c[k];
-            bPsi.get(id)=psi;
-          }
-        }
-      }
-    }
-    CommunicatePSI<T>(MFLattice);
 
     // 0f: Compute H = -∇ψ
     for(int b=0;b<Geo.getBlockNum();++b){
@@ -612,6 +610,32 @@ int main(int argc, char* argv[]) {
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
       Printer::Endl();
       MW.WriteBinary(t());
+    }
+    // 诊断: 每500步打印H场统计, 监控MF求解器是否维持界面跳变
+    if(t()%500==0){
+      IF_MPI_RANK(0){
+        T hhmax=0,hhmin=1e10,hhsum=0; int hcnt=0;
+        T lhmax=0,lhmin=1e10,lhsum=0; int lcnt=0;
+        auto& hF=MFLattice.getField<HMAG<T>>();
+        auto& pF=PFLattice.getField<PHI<T>>();
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bH=hF.getBlockField(b); auto& bP=pF.getBlockField(b);
+          const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          int ov=bk.getOverlap();
+          for(int j=ov;j<bk.getNy()-ov;++j)
+            for(int i=ov;i<bk.getNx()-ov;++i){
+              std::size_t id=j*pr[1]+i;
+              T h=bH.get(id), phi=bP.get(id);
+              if(phi>T{0.9}){ hhsum+=h; hcnt++; if(h>hhmax)hhmax=h; if(h<hhmin)hhmin=h; }
+              else if(phi<T{0.1}){ lhsum+=h; lcnt++; if(h>lhmax)lhmax=h; if(h<lhmin)lhmin=h; }
+            }
+        }
+        T hh_mean=hhsum/hcnt, lh_mean=lhsum/lcnt;
+        T ratio=hh_mean/lh_mean;
+        printf("[Diag T=%d] H_heavy: mean=%.4e min=%.4e max=%.4e | H_light: mean=%.4e | ratio=%.4f (theory 0.500) max_ratio=%.1f\n",
+               t(), hh_mean, hhmin, hhmax, lh_mean, ratio, hhmax/H0);
+        fflush(stdout);
+      }
     }
   }
 
