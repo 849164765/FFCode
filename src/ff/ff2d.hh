@@ -244,6 +244,21 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
 //   The 5-peak pattern at 4.2mm is the PHYSICALLY CORRECT steady state at
 //   H0/Hc=1.745, not a numerical artifact. Full 7-peak match would require
 //   H0 closer to Hc (where λ_max → λ_c).
+//
+// PRESSURE SOURCE NOTE (p_ref experiment — reverted):
+//   A constant p_ref = (ρ_l+ρ_h)/2 was tested as a replacement for local p to
+//   provide "uniform damping" across the interface. Two variants were tried:
+//     1. p_ref/3 (erroneous, treating p_ref as physical pressure): 3× too weak
+//        → trough collapse at step ~2000 (Phi_trough→0.002)
+//     2. p_ref (corrected): 3× stronger than #1, but caused ALL modes (including
+//        unphysical short λ≈0.5mm) to grow simultaneously → 44 peaks at 0.48mm
+//        by step 1000, before linear mode selection could filter them.
+//   Both variants performed WORSE than the original local-pressure version,
+//   which correctly selects 5 peaks at 4.2mm by step ~15000. The local pressure
+//   variation across the interface is NOT a thick-interface artifact — it is the
+//   PHYSICAL mechanism that selects the correct wavelength (stronger damping at
+//   peaks where magnetic pressure is high, weaker at troughs where it is low).
+//   Conclusion: use local p = PRESSURE field, NOT a constant p_ref.
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   constexpr typename PFCELL::FloatType PrC_SCALE = 0.6;
