@@ -41,21 +41,30 @@ if [ -n "$PROJ_ROOT" ]; then
     echo "  当前分支:   $BRANCH"
     echo "  当前 HEAD:  $HEAD"
 
-    # 检查是否包含 Dirichlet BC 修复
-    if git -C "$PROJ_ROOT" log --oneline --all 2>/dev/null | grep -q "3d84ac1"; then
+    # 检查是否包含扭曲周期 BC 修复 (最新)
+    if git -C "$PROJ_ROOT" log --oneline --all 2>/dev/null | grep -q "a892a8d"; then
+        if git -C "$PROJ_ROOT" merge-base --is-ancestor a892a8d HEAD 2>/dev/null; then
+            echo "  [OK] 已包含扭曲周期 BC 修复 (a892a8d) - 最新"
+        else
+            echo "  [FAIL] HEAD 不包含扭曲周期 BC 修复 (a892a8d)"
+            echo "    >>> 这是问题根因 (磁场稳定化不足)"
+            echo "    >>> 修复: cd $PROJ_ROOT && git pull origin $BRANCH"
+            echo ""
+            echo "  预期 HEAD:"
+            echo "    a892a8d fix: 实现MF扭曲周期边界条件"
+        fi
+    elif git -C "$PROJ_ROOT" log --oneline --all 2>/dev/null | grep -q "3d84ac1"; then
         if git -C "$PROJ_ROOT" merge-base --is-ancestor 3d84ac1 HEAD 2>/dev/null; then
-            echo "  [OK] 已包含 Dirichlet BC 修复 (3d84ac1)"
+            echo "  [WARN] 仅包含 Dirichlet BC 修复 (3d84ac1), 缺少扭曲周期 BC (a892a8d)"
+            echo "    >>> Dirichlet BC 稳定化仅 9.3%, 扭曲周期 BC 可达 53.1%"
+            echo "    >>> 修复: cd $PROJ_ROOT && git pull origin $BRANCH"
         else
             echo "  [FAIL] HEAD 不包含 Dirichlet BC 修复 (3d84ac1)"
             echo "    >>> 这是问题根因"
             echo "    >>> 修复: cd $PROJ_ROOT && git pull origin $BRANCH"
-            echo ""
-            echo "  预期 HEAD:"
-            echo "    8f25a53 feat: 添加云端KH仿真诊断脚本"
-            echo "    3d84ac1 fix: 磁场壁面边界条件 Neumann->Dirichlet"
         fi
     else
-        echo "  [FAIL] 仓库中未找到 Dirichlet BC 修复 (3d84ac1)"
+        echo "  [FAIL] 仓库中未找到任何 BC 修复"
         echo "    >>> 请拉取最新代码: git pull origin $BRANCH"
     fi
 else
@@ -148,12 +157,12 @@ if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
             IS_ZERO=$(awk -v r="$RATIO" 'BEGIN{if(r<0.05) print 1; else print 0}')
 
             if [ "$IS_GOOD" = "1" ]; then
-                echo "  [OK][OK][OK] 诊断: Dirichlet BC (修复版, 正确)"
-                echo "       H 场维持良好 (>90% of H0)"
+                echo "  [OK][OK][OK] 诊断: H 场维持良好 (>90% of H0)"
                 echo "       磁场力应有效稳定 KH 不稳定性"
                 echo ""
-                echo "  此时 20000 步应对应 t*=1.56 (早期生长阶段)"
+                echo "  此时 20000 步应对应早期生长阶段 (振幅 ~13-23% L)"
                 echo "  不应出现 t*=6 的液桥形态"
+                echo "  若仍出现 t*=6, 请检查是否使用扭曲周期 BC (commit a892a8d)"
             elif [ "$IS_NEUMANN" = "1" ]; then
                 echo "  [FAIL][FAIL][FAIL] 诊断: Neumann BC (旧版, 有bug)"
                 echo "       H 场衰减至 $PERCENT% of H0 (应 >90%)"
@@ -162,7 +171,7 @@ if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
                 echo ""
                 echo "  >>> 修复方法:"
                 echo "      cd $PROJ_ROOT && git pull origin FerroKHinstability"
-                echo "      确认 git log -1 显示 commit 3d84ac1 或 8f25a53"
+                echo "      确认 git log -1 显示 commit a892a8d (扭曲周期 BC)"
                 echo "      重新编译: make clean && make"
                 echo "      重新运行: ./kh2d.exe"
             elif [ "$IS_ZERO" = "1" ]; then
