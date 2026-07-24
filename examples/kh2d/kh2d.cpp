@@ -246,6 +246,7 @@ int main(int argc, char* argv[]) {
   // -- BCs --
   using LM_NS=BlockLatticeManager<T,LatSet,NSFIELDS>;
   using LM_PF=BlockLatticeManager<T,LatSet,PFPACK>;
+  using LM_MF=BlockLatticeManager<T,MFLatSet,MFPACK>;
   using FM=BlockFieldManager<FLAG,T,2>;
 
   BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>,LM_NS,FM>
@@ -259,8 +260,13 @@ int main(int argc, char* argv[]) {
   FixedPeriodicBoundaryManager<LM_PF,FM> PF_Per("PF_Per",PFLattice,FlagFM,PeriodicFlag,VoidFlag);
   PF_Per.Setup(left,NbrDirection::XN,right,NbrDirection::XP);
   PF_Per.Setup(right,NbrDirection::XP,left,NbrDirection::XN);
+  // MF 周期边界 (左右壁): 用于扰动 δψ=ψ+H0*x 的周期传播
+  // 注意: 水平场 ψ=-H0*x 非周期, 需在 Apply 后施加扭曲校正 (见 step 0c)
+  FixedPeriodicBoundaryManager<LM_MF,FM> MF_Per("MF_Per",MFLattice,FlagFM,PeriodicFlag,VoidFlag);
+  MF_Per.Setup(left,NbrDirection::XN,right,NbrDirection::XP);
+  MF_Per.Setup(right,NbrDirection::XP,left,NbrDirection::XN);
 #ifdef MPI_ENABLED
-  NS_Per.SetupMPI(GeoHelper); PF_Per.SetupMPI(GeoHelper);
+  NS_Per.SetupMPI(GeoHelper); PF_Per.SetupMPI(GeoHelper); MF_Per.SetupMPI(GeoHelper);
 #endif
 
   // -- PF tasks --
@@ -334,49 +340,20 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: 设置磁场壁面Dirichlet边界 (ψ=-H0*x, 精确维持外加水平场)
-    // 根因修复: 原Neumann BC仅设平衡分布(g_k=w_k*ψ), 丢失梯度信息,
-    //          导致H场从~79%衰减到~54% (500→2500步), 磁场力不足.
-    //          改用Dirichlet BC: 在所有壁面设精确解析值ψ=-H0*x,
-    //          与bubbleMag2d验证方法一致 (bubbleMag2d用ψ=-H0*y维持垂直场).
-    // 物理依据: 壁面远离界面(y=0,2L处), 场扰动衰减, ψ≈-H0*x为良好近似.
+    // 0b: 设置磁场上下壁 Dirichlet 边界 (ψ=-H0*x, 维持外加水平场)
+    // 左右壁改用扭曲周期 BC (见 step 0c), 允许扰动 δψ 周期传播.
+    // 物理依据: 上下壁远离界面(y=0,2L), 场扰动衰减, ψ≈-H0*x 为良好近似;
+    //           左右壁存在周期扰动 cos(2πx/L), 必须允许 δψ 周期穿越.
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         auto& bPsi=psiF.getBlockField(b);
         int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minX=bk.getMin()[0],maxX=bk.getMax()[0],vs=bk.getVoxelSize();
+        T minX=bk.getMin()[0],vs=bk.getVoxelSize();
         T minY=bk.getMin()[1],maxY=bk.getMax()[1];
-        T W_global=T(Ni)*Cell_Len;
         T H_global=T(Nj)*Cell_Len;
-        // 左壁: ψ=-H0*x (精确解析值)
-        if(minX<Cell_Len*T(1.5)){
-          for(int jj=0;jj<ny;++jj){
-            for(int ii=0;ii<ov;++ii){
-              std::size_t id=jj*pr[1]+ii;
-              T x_ghost=minX+T(ii)*vs;
-              T psi_ghost=-H0*x_ghost;
-              MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
-              bPsi.get(id)=psi_ghost;
-            }
-          }
-        }
-        // 右壁: ψ=-H0*x (精确解析值)
-        if(maxX>W_global-Cell_Len*T(1.5)){
-          for(int jj=0;jj<ny;++jj){
-            for(int ii=nx-ov;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii;
-              T x_ghost=minX+T(ii)*vs;
-              T psi_ghost=-H0*x_ghost;
-              MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
-              bPsi.get(id)=psi_ghost;
-            }
-          }
-        }
-        // 下壁: ψ=-H0*x (精确解析值, 替代原零梯度copy)
+        // 下壁: ψ=-H0*x (精确解析值, 维持水平场)
         if(minY<Cell_Len*T(1.5)){
           for(int jj=0;jj<ov;++jj){
             for(int ii=0;ii<nx;++ii){
@@ -389,7 +366,7 @@ int main(int argc, char* argv[]) {
             }
           }
         }
-        // 上壁: ψ=-H0*x (精确解析值, 替代原零梯度copy)
+        // 上壁: ψ=-H0*x (精确解析值, 维持水平场)
         if(maxY>H_global-Cell_Len*T(1.5)){
           for(int jj=ny-ov;jj<ny;++jj){
             for(int ii=0;ii<nx;++ii){
@@ -413,6 +390,103 @@ int main(int argc, char* argv[]) {
         for(int i=ov;i<bk.getNx()-ov;++i){
           MFCELL c(j*pr[1]+i,bl);
           collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
+        }
+      }
+    }
+
+    // 0c2: MF 扭曲周期边界 (Twisted Periodic BC for horizontal field)
+    // 标准周期 BC 复制 g_k: ghost ← source (MF_Per.Apply())
+    // 但水平场 ψ=-H0*x 非周期: ψ(0)=0, ψ(L_domain)=-H0*L_domain
+    // 扭曲校正: 对扰动 δψ=ψ+H0*x 施加标准周期
+    //   左壁 ghost (x<0): g_k += w_k*H0*L_domain,  ψ 重算
+    //   右壁 ghost (x>=L_domain): g_k -= w_k*H0*L_domain,  ψ 重算
+    MF_Per.Apply();
+    {
+      T L_domain=T(Ni)*Cell_Len;   // 全域宽度 = 2L
+      T shift=H0*L_domain;          // 扭曲位移 = H0 * 2L
+      auto& psiF=MFLattice.getField<PSI<T>>();
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        auto& bPsi=psiF.getBlockField(b);
+        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+        T minX=bk.getMin()[0],maxX=bk.getMax()[0],vs=bk.getVoxelSize();
+        T W_global=T(Ni)*Cell_Len;
+        T H_global=T(Nj)*Cell_Len;
+        T minY=bk.getMin()[1],maxY=bk.getMax()[1];
+        // 左壁 ghost: x<0, 加 shift (源来自右壁, ψ 应增加 H0*L_domain)
+        // 仅处理非上下壁的 ghost (避免覆盖 Dirichlet BC)
+        if(minX<T(0)+Cell_Len*T(1.5)){
+          for(int jj=ov;jj<ny-ov;++jj){  // 排除上下壁 ghost
+            for(int ii=0;ii<ov;++ii){
+              std::size_t id=jj*pr[1]+ii;
+              T x_ghost=minX+T(ii)*vs;
+              if(x_ghost<T(0)){
+                MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k){
+                  c[k]+=latset::w<MFLatSet>(k)*shift;
+                }
+                // 从 g_k 重算 PSI (MF_Per 不更新 PSI 字段)
+                T psi_new=T(0);
+                for(unsigned k=0;k<MFLatSet::q;++k) psi_new+=c[k];
+                bPsi.get(id)=psi_new;
+              }
+            }
+          }
+        }
+        // 右壁 ghost: x>=L_domain, 减 shift (源来自左壁, ψ 应减少 H0*L_domain)
+        if(maxX>W_global-Cell_Len*T(1.5)){
+          for(int jj=ov;jj<ny-ov;++jj){  // 排除上下壁 ghost
+            for(int ii=nx-ov;ii<nx;++ii){
+              std::size_t id=jj*pr[1]+ii;
+              T x_ghost=minX+T(ii)*vs;
+              if(x_ghost>=W_global){
+                MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k){
+                  c[k]-=latset::w<MFLatSet>(k)*shift;
+                }
+                T psi_new=T(0);
+                for(unsigned k=0;k<MFLatSet::q;++k) psi_new+=c[k];
+                bPsi.get(id)=psi_new;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 0c3: 重新设置上下壁 Dirichlet BC (修复 MF_Per 覆盖的角落 ghost)
+    {
+      auto& psiF=MFLattice.getField<PSI<T>>();
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        auto& bPsi=psiF.getBlockField(b);
+        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+        T minX=bk.getMin()[0],vs=bk.getVoxelSize();
+        T minY=bk.getMin()[1],maxY=bk.getMax()[1];
+        T H_global=T(Nj)*Cell_Len;
+        if(minY<Cell_Len*T(1.5)){
+          for(int jj=0;jj<ov;++jj){
+            for(int ii=0;ii<nx;++ii){
+              std::size_t id=jj*pr[1]+ii;
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
+              MFCELL c(id,bl);
+              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
+              bPsi.get(id)=psi_ghost;
+            }
+          }
+        }
+        if(maxY>H_global-Cell_Len*T(1.5)){
+          for(int jj=ny-ov;jj<ny;++jj){
+            for(int ii=0;ii<nx;++ii){
+              std::size_t id=jj*pr[1]+ii;
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
+              MFCELL c(id,bl);
+              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
+              bPsi.get(id)=psi_ghost;
+            }
+          }
         }
       }
     }
