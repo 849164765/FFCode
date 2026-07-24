@@ -125,23 +125,40 @@ if interface.any() and all_fy.size == all_phi.size:
     print('  FY min=%.6e  FY max=%.6e' % (all_fy[interface].min(), all_fy[interface].max()))
 
 # 关键诊断: 磁力方向
-# 重相(铁磁)磁力应向下(FY<0, 同重力方向), 因为|H|从轻相H0到重相H0/2递减
-# 轻相磁力应为0(chi=0)
+# 重相(铁磁)磁力集中在界面区, 在bulk区|H|均匀故磁力≈0
+# 重力方向: -y (向下), FY_grav = -rho*g (负值)
+# 磁力方向: 界面重相侧向下(促进RT spike), 界面轻相侧向上(促进RT bubble)
 print('\n=== 磁力诊断 ===')
 if all_fy.size == all_phi.size and heavy.any():
     fy_heavy = all_fy[heavy].mean()
     fy_light = all_fy[light].mean() if light.any() else 0
-    grav_heavy = rho_h * g
-    grav_light = rho_l * g
-    # 重相: FY_total = FY_grav + FY_mag → FY_mag = FY_total - FY_grav
+    fy_interface = all_fy[interface].mean() if interface.any() else 0
+    # 重力 FY_grav = -rho*g (负值, 向下)
+    grav_heavy = -rho_h * g
+    grav_light = -rho_l * g
+    grav_interface = -2.0 * g  # 界面区平均密度≈2
+    # FY_mag = FY_total - FY_grav
     fy_mag_heavy = fy_heavy - grav_heavy
     fy_mag_light = fy_light - grav_light
-    print('重相: FY_total=%.6e  FY_grav=%.6e  FY_mag(估算)=%.6e' % (fy_heavy, grav_heavy, fy_mag_heavy))
-    print('轻相: FY_total=%.6e  FY_grav=%.6e  FY_mag(估算)=%.6e' % (fy_light, grav_light, fy_mag_light))
-    if abs(fy_mag_heavy) < 1e-15:
-        print('\n>>> 警告: 重相磁力接近0! 磁力未生效! <<<')
-    elif fy_mag_heavy > 0:
-        print('\n>>> 警告: 重相磁力为正(向上)! 方向错误, 应为负(向下)! <<<')
-    else:
-        print('\n>>> 磁力方向正确(向下, 促进RT), 大小=%.6e <<<' % abs(fy_mag_heavy))
-        print('>>> 磁力/重力 = %.4f <<<' % (abs(fy_mag_heavy)/grav_heavy))
+    fy_mag_interface = fy_interface - grav_interface
+    print('重相(phi>0.9):   FY_total=%.6e  FY_grav=%.6e  FY_mag=%.6e  (bulk磁力应≈0)' % (fy_heavy, grav_heavy, fy_mag_heavy))
+    print('轻相(phi<0.1):   FY_total=%.6e  FY_grav=%.6e  FY_mag=%.6e  (chi=0, 磁力应≈0)' % (fy_light, grav_light, fy_mag_light))
+    print('界面区(0.3-0.7): FY_total=%.6e  FY_grav=%.6e  FY_mag=%.6e  (磁力集中区)' % (fy_interface, grav_interface, fy_mag_interface))
+    print()
+    if interface.any():
+        ratio = fy_mag_interface / grav_interface if grav_interface != 0 else 0
+        print('>>> 界面区磁力/重力 = %.4f <<<' % ratio)
+        if fy_mag_interface < 0:
+            print('>>> 界面区磁力向下(促进RT不稳定性) <<<')
+        else:
+            print('>>> 界面区磁力向上(抑制RT不稳定性) <<<')
+    # 细分界面: 重相侧 vs 轻相侧
+    heavy_side = (all_phi > 0.5) & (all_phi < 0.7)
+    light_side = (all_phi > 0.3) & (all_phi < 0.5)
+    if heavy_side.any() and light_side.any():
+        fy_hs = all_fy[heavy_side].mean()
+        fy_ls = all_fy[light_side].mean()
+        grav_hs = -2.5 * g; grav_ls = -1.5 * g
+        mag_hs = fy_hs - grav_hs; mag_ls = fy_ls - grav_ls
+        print('\n界面重相侧(0.5-0.7): FY_mag=%.6e  (向下=促进spike)' % mag_hs)
+        print('界面轻相侧(0.3-0.5): FY_mag=%.6e  (向上=促进bubble)' % mag_ls)
