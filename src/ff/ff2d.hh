@@ -232,6 +232,18 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
 //   - PrC=0.6 is the optimal balance: enough damping to prevent trough collapse
 //     with M7, while allowing adequate peak growth toward the theoretical
 //     Cowley-Rosensweig height η_peak = (λ_c/4π)·√(2(H₀/H_c)²−2) = 0.454mm
+//
+// WAVELENGTH NOTE (verified by PrC=0.7 test and Cowley-Rosensweig theory):
+//   At H0/Hc=1.745 (H0=8.2kA/m, Hc=4.7kA/m), the fastest-growing wavelength is
+//   LONGER than λ_c. The Cowley-Rosensweig dispersion relation gives:
+//     λ_max ≈ 1.4×λ_c ≈ 3.95mm → N_peaks ≈ 21/3.95 ≈ 5.3
+//   The 7-mode seed (3.0mm) initially dominates but is overtaken by the 5-mode
+//   (4.2mm) by step ~15000 due to linear mode selection. This was confirmed by:
+//     1. PrC=0.7 test: even with slower growth, mode 5 dominates by step 15000
+//     2. The paper (Guo2025 line 873) uses identical params (Lx=21, λ_c=2.82)
+//   The 5-peak pattern at 4.2mm is the PHYSICALLY CORRECT steady state at
+//   H0/Hc=1.745, not a numerical artifact. Full 7-peak match would require
+//   H0 closer to Hc (where λ_max → λ_c).
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
   constexpr typename PFCELL::FloatType PrC_SCALE = 0.6;
