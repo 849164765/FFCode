@@ -334,8 +334,12 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: 设置磁场壁面Neumann边界 (水平场: 左右∂ψ/∂x=-H0, 上下∂ψ/∂y=0)
-    // 文献 Eq.45-48 虚拟节点法适配x方向; 此处用Dirichlet等价(ghost psi由Neumann推导)
+    // 0b: 设置磁场壁面Dirichlet边界 (ψ=-H0*x, 精确维持外加水平场)
+    // 根因修复: 原Neumann BC仅设平衡分布(g_k=w_k*ψ), 丢失梯度信息,
+    //          导致H场从~79%衰减到~54% (500→2500步), 磁场力不足.
+    //          改用Dirichlet BC: 在所有壁面设精确解析值ψ=-H0*x,
+    //          与bubbleMag2d验证方法一致 (bubbleMag2d用ψ=-H0*y维持垂直场).
+    // 物理依据: 壁面远离界面(y=0,2L处), 场扰动衰减, ψ≈-H0*x为良好近似.
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
       for(int b=0;b<Geo.getBlockNum();++b){
@@ -346,56 +350,52 @@ int main(int argc, char* argv[]) {
         T minY=bk.getMin()[1],maxY=bk.getMax()[1];
         T W_global=T(Ni)*Cell_Len;
         T H_global=T(Nj)*Cell_Len;
-        // 左壁 Neumann ∂ψ/∂x=-H0: ghost psi = interior psi + H0*vs
-        // 注意: ghost格点为 ii=0..ov-1, 不含ii=ov(内部格点)
+        // 左壁: ψ=-H0*x (精确解析值)
         if(minX<Cell_Len*T(1.5)){
           for(int jj=0;jj<ny;++jj){
             for(int ii=0;ii<ov;++ii){
               std::size_t id=jj*pr[1]+ii;
-              std::size_t id_int=jj*pr[1]+(ov);  // 内侧第一个格点
-              T psi_ghost=bPsi.get(id_int)+H0*vs;
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
               MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
               bPsi.get(id)=psi_ghost;
             }
           }
         }
-        // 右壁 Neumann ∂ψ/∂x=-H0: ghost psi = interior psi - H0*vs
-        // 注意: ghost格点为 ii=nx-ov..nx-1, 不含ii=nx-ov-1(内部格点)
+        // 右壁: ψ=-H0*x (精确解析值)
         if(maxX>W_global-Cell_Len*T(1.5)){
           for(int jj=0;jj<ny;++jj){
             for(int ii=nx-ov;ii<nx;++ii){
               std::size_t id=jj*pr[1]+ii;
-              std::size_t id_int=jj*pr[1]+(nx-ov-1);  // 内侧最后一个格点
-              T psi_ghost=bPsi.get(id_int)-H0*vs;
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
               MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
               bPsi.get(id)=psi_ghost;
             }
           }
         }
-        // 下壁 零梯度 ∂ψ/∂y=0: ghost psi = interior psi
-        // 注意: ghost格点为 jj=0..ov-1, 不含jj=ov(内部格点)
+        // 下壁: ψ=-H0*x (精确解析值, 替代原零梯度copy)
         if(minY<Cell_Len*T(1.5)){
           for(int jj=0;jj<ov;++jj){
             for(int ii=0;ii<nx;++ii){
               std::size_t id=jj*pr[1]+ii;
-              std::size_t id_int=(ov)*pr[1]+ii;  // 内侧第一个格点
-              T psi_ghost=bPsi.get(id_int);
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
               MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
               bPsi.get(id)=psi_ghost;
             }
           }
         }
-        // 上壁 零梯度 ∂ψ/∂y=0: ghost psi = interior psi
-        // 注意: ghost格点为 jj=ny-ov..ny-1, 不含jj=ny-ov-1(内部格点)
+        // 上壁: ψ=-H0*x (精确解析值, 替代原零梯度copy)
         if(maxY>H_global-Cell_Len*T(1.5)){
           for(int jj=ny-ov;jj<ny;++jj){
             for(int ii=0;ii<nx;++ii){
               std::size_t id=jj*pr[1]+ii;
-              std::size_t id_int=(ny-ov-1)*pr[1]+ii;  // 内侧最后一个格点
-              T psi_ghost=bPsi.get(id_int);
+              T x_ghost=minX+T(ii)*vs;
+              T psi_ghost=-H0*x_ghost;
               MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_ghost;
               bPsi.get(id)=psi_ghost;
@@ -460,6 +460,8 @@ int main(int argc, char* argv[]) {
 
     // A4: Magnetic force (if chi>0 and H0>0)
     if(Bom>T{0}){
+      T Hmag_min=1e30, Hmag_max=0, Hmag_sum=0; int Hmag_cnt=0;
+      T Fmag_max=0, Fmag_sum=0;
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
         auto& ns_bl=NSLattice.getBlockLat(b);
@@ -469,8 +471,29 @@ int main(int argc, char* argv[]) {
           for(int i=ov;i<bk.getNx()-ov;++i){
             std::size_t id=j*pr[1]+i;
             PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+            // Record force before magnetic force
+            T fx_before=ns.template get<FORCE<T,2>>()[0];
+            T fy_before=ns.template get<FORCE<T,2>>()[1];
             MFMagneticForce2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+            // Record Hmag and magnetic force delta
+            T Hmag=mf.template get<HMAG<T>>();
+            Hmag_min=std::min(Hmag_min,Hmag);
+            Hmag_max=std::max(Hmag_max,Hmag);
+            Hmag_sum+=Hmag; Hmag_cnt++;
+            T dfx=ns.template get<FORCE<T,2>>()[0]-fx_before;
+            T dfy=ns.template get<FORCE<T,2>>()[1]-fy_before;
+            T dfmag=std::sqrt(dfx*dfx+dfy*dfy);
+            Fmag_max=std::max(Fmag_max,dfmag);
+            Fmag_sum+=dfmag;
           }
+        }
+      }
+      IF_MPI_RANK(0){
+        if(t()%OutputStep==0 || t()<3){
+          printf("[DEBUG step=%d] Hmag: min=%.6e max=%.6e mean=%.6e  range=%.6e (H0=%.6e)\n",
+                 t(),Hmag_min,Hmag_max,Hmag_sum/Hmag_cnt,Hmag_max-Hmag_min,H0);
+          printf("[DEBUG step=%d] Fmag: max=%.6e mean=%.6e\n",
+                 t(),Fmag_max,Fmag_sum/Hmag_cnt);
         }
       }
     }
