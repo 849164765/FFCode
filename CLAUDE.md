@@ -28,3 +28,8 @@ Key routing rules:
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 - Author a backlog-ready spec/issue → invoke /spec
+
+
+# 项目要求
+## 远程仓库
+    每次修改完一次代码后，都需要提交到远程仓库，备注信息需要详细记录修改内容

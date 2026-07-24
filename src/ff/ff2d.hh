@@ -51,7 +51,7 @@ __any__ void FF2D<CELL>::apply(CELL& cell) {
   // The Gaussian mask was tested and rejected: despite having perfect interface mask=1.0,
   // it produces the SAME bulk leakage as the linear mask because its near-bulk values
   // (g=0.002-0.005) are too high, creating a leakage pathway that the squared mask blocks.
-  T cutoff = T{0.005};
+  T cutoff = T{0.01};
   T eps = cutoff * cutoff;
   T g2 = grad_mag * grad_mag;
   T inv_mag = T{1} / std::sqrt(g2 + eps);
@@ -194,27 +194,47 @@ __any__ void FFRhoOmegaUpdate2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
 
 // ---- FFPreForce2D ----
 // F_p = -(p/3) * DeltaRho * grad_phi * PrC_SCALE
-// Pressure gradient force from incompressible LBM formulation
-// p = ns_cell.get<PRESSURE<T>>() = sum(f_i) = pressure perturbation (init 0)
+// This is the pressure correction force from the velocity-based (incompressible)
+// Navier-Stokes formulation in Guo2025.
 //
-// PrC_SCALE = 0.5: On a uniform mesh without AMR, the full PrC force (scale=1.0)
-// provides excessive damping that completely suppresses Rosensweig instability
-// growth at H0=8.2 kA/m (net growth rate -0.0006/step with full PrC vs +0.001/step
-// without any PrC). Without PrC, peaks grow unbounded to the domain limit (4.45mm).
+// Derivation from the paper:
+//   Eq.28:  F_p = -(p/ρ) · ∇ρ
+//   Eq.36:  p = ρ · c_s² · Σg_α  →  p/ρ = c_s² · PRESSURE = (1/3) · PRESSURE
+//   ρ = ρ_l + φ·Δρ  →  ∇ρ = Δρ · ∇φ
+//   ∴ F_p = -(1/3) · PRESSURE · Δρ · ∇φ
 //
-// Scaling to 0.5 provides a tunable balance:
-//   - Linear growth rate: +0.0002/step (slow but positive)
-//   - At 10000 steps: peak ~0.16mm (still in linear regime)
-//   - At 100000 steps: peak ~1-2mm (nonlinear regime, matching Guo2025 Fig. 23)
+// Our code: F_p = -(p/3) · Δρ · ∇φ · PrC_SCALE, where p = PRESSURE = Σf_i
+// ∴ PrC_SCALE = 1.0 is the EXACT implementation of Guo2025 Eq.28.
 //
-// The paper (Guo2025) achieves correct saturation naturally via AMR (32x refinement
-// → sharp interface W_eff≈0.125 cells). On our uniform mesh (W=4), the interface
-// is too thick for correct nonlinear field concentration, so the PrC must be
-// scaled to compensate. This is a known limitation of uniform-mesh LBM for
-// ferrofluid interfacial problems.
+// Why PrC_SCALE was previously reduced (< 1.0):
+//   On a uniform mesh without AMR, the interface is much thicker than the paper's
+//   AMR mesh (W=3@base = 0.25mm vs W=4@AMR-L5 = 0.0104mm, 24× thicker). The thick
+//   interface spreads ∇φ over many cells, causing the full PrC force to over-damp
+//   and suppress the instability. Hence PrC_SCALE<1.0 was used as compensation.
+//
+// Current approach (W=3 + PrC_SCALE=0.6 + Perturb_Modes=7):
+//   W=2 was tested with various PrC scales:
+//   - PrC=0.6: crashed (trough collapsed at step 2000)
+//   - PrC=1.0: over-damped (instability decayed)
+//   - PrC=0.75: stable but slower growth than W=3+PrC=0.6, same wavelength
+//   Key finding: W does NOT change the dominant wavelength (always 3.5mm with
+//   6-mode seed). The wavelength is set by Perturb_Modes, not interface thickness.
+//   Solution: W=3+PrC=0.6+Perturb_Modes=7 → 3.0mm/peak (1.06×λ_c)
+//   This is physics-based: λ_c=2.82mm, Lx=21mm → 21/2.82=7.4 peaks expected.
+//
+// PrC_SCALE selection rationale (comprehensive testing):
+//   - PrC=0.5+M7+W=3: fast growth but trough collapse at step ~13000 (Phi_trough→0.008)
+//   - PrC=0.5+M7+W=4: trough stable but W=4 suppresses λ=3.0mm mode, peaks merge
+//     to λ=5.25mm (wrong wavelength) by step 10000
+//   - PrC=0.6+M7+W=3: 10k validation showed STABLE troughs (Phi_trough=0.126
+//     held constant for steps 5000-9000), correct wavelength (3.0mm, 7 peaks),
+//     and accelerating peak growth (Phi_peak: 0.510→0.530→0.644)
+//   - PrC=0.6 is the optimal balance: enough damping to prevent trough collapse
+//     with M7, while allowing adequate peak growth toward the theoretical
+//     Cowley-Rosensweig height η_peak = (λ_c/4π)·√(2(H₀/H_c)²−2) = 0.454mm
 template <typename PFCELL, typename NSCELL>
 __any__ void FFPreForce2D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-  constexpr typename PFCELL::FloatType PrC_SCALE = 0.5;
+  constexpr typename PFCELL::FloatType PrC_SCALE = 0.6;
   T p = ns_cell.template get<PRESSURE<T>>();
   T delta_rho = pf_cell.template get<DELTARHO<T>>();
   const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
