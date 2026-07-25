@@ -1,4 +1,10 @@
 // bubbleMag2d.cpp — 2D bubble rising in ferrofluid (Phase field + NS + Magnetic)
+// Force formula selector:
+//   0 = Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ
+//   1 = Interfacial only: -(1/2)|H|²∇χ
+//   2 = Paper Eq.(8): (χ/2)∇|H|²
+#define FORCE_FORMULA 2
+
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
@@ -64,7 +70,7 @@ void readParam() {
   gravity = gy_sqrt * gy_sqrt;
   sigma = gravity * rho_h * D_bubble * D_bubble / Eo;
   // H0 from Bo_m: Bo_m = μ₀ * H₀² * D / (2*σ),  μ₀=1 in LBM units
-  H0 =std::sqrt(25) * std::sqrt(T(2.0) * Bom * sigma / D_bubble);
+  H0 = std::sqrt(T(2.0) * Bom * sigma / D_bubble);
   Beta=T(12.0)*sigma/Interface_Width;
   Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
   Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
@@ -290,17 +296,241 @@ int main(int argc, char* argv[]) {
   vtmo::vtmWriter<T,2> MW("bubbleMag2d",Geo);
   MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw);
 
-  // ===== initial setup =====
-  PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
-  NS_Per.Apply(); PF_Per.Apply();
+  // ===== Pre-converge magnetic field to steady state for diagnostics =====
+  {
+    MPI_RANK(0) printf("Pre-converging magnetic field (200 iters)...\n"); fflush(stdout);
+    for(int iter=0;iter<200;++iter){
+      // 0a: Update coeffs
+      MCC.ApplyInnerCellDynamics<MCSel>(0,FlagFM);
+      CommunicateOMEGAPSI<T>(MFLattice);
+      // 0b: Set wall psi = -H0*y
+      {
+        auto& psiF=MFLattice.getField<PSI<T>>();
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          auto& bPsi=psiF.getBlockField(b);
+          int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+          T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
+          T H_global=T(Nj)*Cell_Len;
+          if(minY<Cell_Len*T{1.5}){
+            for(int jj=0;jj<=ov;++jj){
+              T y=minY+T(jj)*vs, psi_w=-H0*y;
+              for(int ii=0;ii<nx;++ii){
+                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+                bPsi.get(id)=psi_w;
+              }
+            }
+          }
+          if(maxY>H_global-Cell_Len*T{1.5}){
+            for(int jj=ny-ov-1;jj<ny;++jj){
+              T y=minY+T(jj)*vs, psi_w=-H0*y;
+              for(int ii=0;ii<nx;++ii){
+                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+                bPsi.get(id)=psi_w;
+              }
+            }
+          }
+        }
+      }
+      // 0c: Collision
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+          MFCELL c(j*pr[1]+i,bl);
+          collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
+        }
+      }
+      MF_Per.Apply();
+      MFLattice.NormalFullCommunicate();
+      MFLattice.Stream();
+      MFLattice.NormalFullCommunicate();
+      // 0e: PSI
+      {
+        auto& psiF=MFLattice.getField<PSI<T>>();
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          auto& bPsi=psiF.getBlockField(b); int ov=bk.getOverlap();
+          for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+            std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
+            T psi=0; for(unsigned k=0;k<MFLatSet::q;++k)psi+=c[k];
+            bPsi.get(id)=psi;
+          }
+        }
+      }
+      CommunicatePSI<T>(MFLattice);
+      // 0f: Compute H
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+          MFCELL c(j*pr[1]+i,bl);
+          MFComputeH2D<MFCELL>::apply(c);
+        }
+      }
+      CommunicateAllMFFields<T>(MFLattice);
+    }
+    MPI_RANK(0) printf("Pre-convergence done.\n");
+  }
 
-  PFLattice.template ApplyInnerCellDynamics<PFSelN>(FlagFM);
-  PFLattice.template ApplyInnerCellDynamics<PFSelL>(FlagFM);
-  PFLattice.template ApplyInnerCellDynamics<PFSelC>(FlagFM);
-  PFLattice.getField<NORMAL<T,2>>().Communicate();
-  PFLattice.getField<GRAD<T,2>>().Communicate();
-  ff::CommunicateAllSelfFields<T>(PFLattice);
-  RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(0,FlagFM);
+  // Force diagnostic after pre-convergence
+  {
+    T maxF_mag=0, maxF_inter=0, maxF_body=0;
+    T maxHx=0, maxHy=0, maxDchi=0, maxDHsq=0, maxChi=0;
+    T maxProd=0;
+    int nz_body=0, nz_inter=0, total_interface=0;
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
+      const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i;
+        PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl);
+        T chi_l=mf.template get<CHI_L<T>>(), chi_h=mf.template get<CHI_H<T>>();
+        T chi=mf.template get<CHI_PERCELL<T>>();
+        T Hx=mf.template get<HX<T>>(), Hy=mf.template get<HY<T>>(), Hmag=mf.template get<HMAG<T>>();
+        T dchi_x=0,dchi_y=0;
+        for(unsigned k=1;k<MFLatSet::q;++k){
+          T pk=mf.getNeighbor(k).template get<PHI<T>>();
+          T wk=latset::w<MFLatSet>(k); const auto& ck=latset::c<MFLatSet>(k);
+          dchi_x+=wk*ck[0]*pk; dchi_y+=wk*ck[1]*pk;
+        }
+        dchi_x=(chi_h-chi_l)*dchi_x/MFLatSet::cs2;
+        dchi_y=(chi_h-chi_l)*dchi_y/MFLatSet::cs2;
+        T dHsq_x=0,dHsq_y=0;
+        for(unsigned k=1;k<MFLatSet::q;++k){
+          T Hk=mf.getNeighbor(k).template get<HMAG<T>>();
+          T Hsqk=Hk*Hk; T wk=latset::w<MFLatSet>(k); const auto& ck=latset::c<MFLatSet>(k);
+          dHsq_x+=wk*ck[0]*Hsqk; dHsq_y+=wk*ck[1]*Hsqk;
+        }
+        dHsq_x/=MFLatSet::cs2; dHsq_y/=MFLatSet::cs2;
+        T HdotDchi=Hx*dchi_x+Hy*dchi_y;
+        T half_Hsq=T{0.5}*Hmag*Hmag;
+        T Fmx=Hx*HdotDchi-half_Hsq*dchi_x, Fmy=Hy*HdotDchi-half_Hsq*dchi_y;
+        T Fmag=std::sqrt(Fmx*Fmx+Fmy*Fmy);
+        T Fix=-half_Hsq*dchi_x, Fiy=-half_Hsq*dchi_y;
+        T Fi=std::sqrt(Fix*Fix+Fiy*Fiy);
+        T half_chi=T{0.5}*chi;
+        T Fbx=half_chi*dHsq_x, Fby=half_chi*dHsq_y;
+        T Fb=std::sqrt(Fbx*Fbx+Fby*Fby);
+        if(Fmag>maxF_mag)maxF_mag=Fmag;
+        if(Fi>maxF_inter)maxF_inter=Fi;
+        if(Fb>maxF_body)maxF_body=Fb;
+        T hx=std::abs(Hx); if(hx>maxHx)maxHx=hx;
+        T hy=std::abs(Hy); if(hy>maxHy)maxHy=hy;
+        T dc=std::sqrt(dchi_x*dchi_x+dchi_y*dchi_y); if(dc>maxDchi)maxDchi=dc;
+        T dh=std::sqrt(dHsq_x*dHsq_x+dHsq_y*dHsq_y); if(dh>maxDHsq)maxDHsq=dh;
+        if(chi>maxChi)maxChi=chi;
+        T prod=chi*dh; if(prod>maxProd)maxProd=prod;
+        if(dc>1e-4) total_interface++;
+        if(Fb>1e-15) nz_body++;
+        if(Fi>1e-15) nz_inter++;
+      }
+    }
+    MPI_RANK(0){
+      printf("[Post-converge] |H|_max=(%.2e,%.2e) |∇χ|_max=%.2e |∇|H|²|_max=%.2e χ_max=%.2e\n",
+             maxHy,maxHx,maxDchi,maxDHsq,maxChi);
+      printf("  F_mag(Maxwell)=%.2e  F_inter=%.2e  F_body(paper)=%.2e\n",
+             maxF_mag,maxF_inter,maxF_body);
+      printf("  max(χ*|∇|H|²|)=%.2e  interface_cells=%d  nz_body=%d  nz_inter=%d\n",
+             maxProd,total_interface,nz_body,nz_inter);
+      fflush(stdout);
+    }
+  }
+
+  // ===== Direct NS force comparison: apply each formula and measure total force =====
+  {
+    MPI_RANK(0) printf("Direct NS force comparison (Bom=%.3f)...\n", Bom); fflush(stdout);
+    // Test 1: Full Maxwell
+    NSLattice.getField<FORCE<T,2>>().InitValue(Vector<T,2>{0,0});
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
+      auto& ns_bl=NSLattice.getBlockLat(b);
+      const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i;
+        PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+        MFMagneticForce2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+      }
+    }
+    T sumF_maxwell=0, maxF_maxwell=0;
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& ns_bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i; NSCELL ns(id,ns_bl);
+        auto F=ns.template get<FORCE<T,2>>();
+        T f=std::sqrt(F[0]*F[0]+F[1]*F[1]);
+        sumF_maxwell+=f; if(f>maxF_maxwell)maxF_maxwell=f;
+      }
+    }
+
+    // Test 2: Paper formula
+    NSLattice.getField<FORCE<T,2>>().InitValue(Vector<T,2>{0,0});
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
+      auto& ns_bl=NSLattice.getBlockLat(b);
+      const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i;
+        PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+        MFMagneticForcePaper2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+      }
+    }
+    T sumF_paper=0, maxF_paper=0;
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& ns_bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i; NSCELL ns(id,ns_bl);
+        auto F=ns.template get<FORCE<T,2>>();
+        T f=std::sqrt(F[0]*F[0]+F[1]*F[1]);
+        sumF_paper+=f; if(f>maxF_paper)maxF_paper=f;
+      }
+    }
+
+    // Test 3: Interfacial only
+    NSLattice.getField<FORCE<T,2>>().InitValue(Vector<T,2>{0,0});
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
+      auto& ns_bl=NSLattice.getBlockLat(b);
+      const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i;
+        PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+        MFMagneticForceInterfacial2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+      }
+    }
+    T sumF_inter=0, maxF_inter=0;
+    for(int b=0;b<Geo.getBlockNum();++b){
+      auto& ns_bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      int ov=bk.getOverlap();
+      for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+        std::size_t id=j*pr[1]+i; NSCELL ns(id,ns_bl);
+        auto F=ns.template get<FORCE<T,2>>();
+        T f=std::sqrt(F[0]*F[0]+F[1]*F[1]);
+        sumF_inter+=f; if(f>maxF_inter)maxF_inter=f;
+      }
+    }
+    MPI_RANK(0){
+      printf("NS Force comparison:\n");
+      printf("  Maxwell:   sum|F|=%.2e  max|F|=%.2e\n", sumF_maxwell, maxF_maxwell);
+      printf("  Interfacial: sum|F|=%.2e  max|F|=%.2e\n", sumF_inter, maxF_inter);
+      printf("  Paper:     sum|F|=%.2e  max|F|=%.2e\n", sumF_paper, maxF_paper);
+      printf("  Ratio paper/Maxwell sum=%.2f  max=%.2f\n",
+             sumF_paper/maxF_paper, maxF_paper/maxF_maxwell);
+      fflush(stdout);
+    }
+    // Reset force to zero for clean start
+    NSLattice.getField<FORCE<T,2>>().InitValue(Vector<T,2>{0,0});
+  }
+
+  // Write initial state
   MW.WriteBinary(0);
 
   Printer::Print_BigBanner(std::string("Start Calculation..."));
@@ -344,7 +574,7 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // 0c: MF collision (direct iteration)
+    // 0c: MF collision
     for(int b=0;b<Geo.getBlockNum();++b){
       auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
       int ov=bk.getOverlap();
@@ -408,10 +638,125 @@ int main(int argc, char* argv[]) {
           for(int i=ov;i<bk.getNx()-ov;++i){
             std::size_t id=j*pr[1]+i;
             PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+#if FORCE_FORMULA == 0
+            // Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ
             MFMagneticForce2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#elif FORCE_FORMULA == 1
+            // Interfacial only: -(1/2)|H|²∇χ
+            MFMagneticForceInterfacial2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#else
+            // Paper Eq.(8): (χ/2)∇|H|²
+            MFMagneticForcePaper2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#endif
           }
         }
       }
+    }
+
+    // Force diagnostic at step 0 and every 10000 steps
+    if(t()==0||t()%10000==0){
+      T maxF_mag=0, maxF_inter=0, maxF_body=0;
+      T maxHx=0, maxHy=0, maxDchi=0, maxDHsq=0, maxChi=0;
+      // Also track where the max values occur and the product at interface
+      T maxProd=0; // max of chi * |∇|H|²|
+      int nz_body=0, nz_inter=0, total_interface=0;
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
+        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+          std::size_t id=j*pr[1]+i;
+          PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl);
+          T chi_l=mf.template get<CHI_L<T>>(), chi_h=mf.template get<CHI_H<T>>();
+          T chi=mf.template get<CHI_PERCELL<T>>();
+          T Hx=mf.template get<HX<T>>(), Hy=mf.template get<HY<T>>(), Hmag=mf.template get<HMAG<T>>();
+          // ∇χ from φ
+          T dchi_x=0,dchi_y=0;
+          for(unsigned k=1;k<MFLatSet::q;++k){
+            T pk=mf.getNeighbor(k).template get<PHI<T>>();
+            T wk=latset::w<MFLatSet>(k); const auto& ck=latset::c<MFLatSet>(k);
+            dchi_x+=wk*ck[0]*pk; dchi_y+=wk*ck[1]*pk;
+          }
+          dchi_x=(chi_h-chi_l)*dchi_x/MFLatSet::cs2;
+          dchi_y=(chi_h-chi_l)*dchi_y/MFLatSet::cs2;
+          // ∇|H|²
+          T dHsq_x=0,dHsq_y=0;
+          for(unsigned k=1;k<MFLatSet::q;++k){
+            T Hk=mf.getNeighbor(k).template get<HMAG<T>>();
+            T Hsqk=Hk*Hk; T wk=latset::w<MFLatSet>(k); const auto& ck=latset::c<MFLatSet>(k);
+            dHsq_x+=wk*ck[0]*Hsqk; dHsq_y+=wk*ck[1]*Hsqk;
+          }
+          dHsq_x/=MFLatSet::cs2; dHsq_y/=MFLatSet::cs2;
+          T HdotDchi=Hx*dchi_x+Hy*dchi_y;
+          T half_Hsq=T{0.5}*Hmag*Hmag;
+          // Maxwell: F_m = (H·∇χ)H - (1/2)|H|²∇χ
+          T Fmx=Hx*HdotDchi-half_Hsq*dchi_x, Fmy=Hy*HdotDchi-half_Hsq*dchi_y;
+          T Fmag=std::sqrt(Fmx*Fmx+Fmy*Fmy);
+          // Interfacial only: F_m = -(1/2)|H|²∇χ
+          T Fix=-half_Hsq*dchi_x, Fiy=-half_Hsq*dchi_y;
+          T Fi=std::sqrt(Fix*Fix+Fiy*Fiy);
+          // Body: F_m = (χ/2)∇|H|²
+          T half_chi=T{0.5}*chi;
+          T Fbx=half_chi*dHsq_x, Fby=half_chi*dHsq_y;
+          T Fb=std::sqrt(Fbx*Fbx+Fby*Fby);
+          if(Fmag>maxF_mag)maxF_mag=Fmag;
+          if(Fi>maxF_inter)maxF_inter=Fi;
+          if(Fb>maxF_body)maxF_body=Fb;
+          T hx=std::abs(Hx); if(hx>maxHx)maxHx=hx;
+          T hy=std::abs(Hy); if(hy>maxHy)maxHy=hy;
+          T dc=std::sqrt(dchi_x*dchi_x+dchi_y*dchi_y); if(dc>maxDchi)maxDchi=dc;
+          T dh=std::sqrt(dHsq_x*dHsq_x+dHsq_y*dHsq_y); if(dh>maxDHsq)maxDHsq=dh;
+          if(chi>maxChi)maxChi=chi;
+          T prod=chi*dh; if(prod>maxProd)maxProd=prod;
+          if(dc>1e-4) total_interface++;
+          if(Fb>1e-15) nz_body++;
+          if(Fi>1e-15) nz_inter++;
+        }
+      }
+      MPI_RANK(0){
+        printf("[Diag t=%d] |H|_max=(%.2e,%.2e) |∇χ|_max=%.2e |∇|H|²|_max=%.2e χ_max=%.2e\n",
+               t(),maxHy,maxHx,maxDchi,maxDHsq,maxChi);
+        printf("  F_mag(Maxwell)=%.2e  F_inter=%.2e  F_body(paper)=%.2e\n",
+               maxF_mag,maxF_inter,maxF_body);
+        printf("  max(χ*|∇|H|²|)=%.2e  interface_cells=%d  nz_body=%d  nz_inter=%d\n",
+               maxProd,total_interface,nz_body,nz_inter);
+        fflush(stdout);
+      }
+    }
+
+    // --- Direct NS force check at interface points ---
+    if(t()==0){
+      T nsF_at_top=0, nsF_at_side=0, nsF_at_bottom=0, nsF_at_center=0;
+      for(int b=0;b<Geo.getBlockNum();++b){
+        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        auto& ns_bl=NSLattice.getBlockLat(b);
+        T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1];
+        T cx=T(128)*Cell_Len, cy=T(128)*Cell_Len, R=T(50)*Cell_Len;
+        for(int j=0;j<bk.getNy();++j) for(int i=0;i<bk.getNx();++i){
+          T x=mx+T(i)*vs, y=my+T(j)*vs;
+          T dx=x-cx, dy=y-cy, dist=std::sqrt(dx*dx+dy*dy);
+          std::size_t id=j*pr[1]+i;
+          // Top pole: (128, 78) = center + (0, -R)
+          if(std::abs(x-cx)<vs && std::abs(y-(cy-R))<vs){
+            NSCELL ns(id,ns_bl); auto F=ns.template get<FORCE<T,2>>();
+            nsF_at_top=std::sqrt(F[0]*F[0]+F[1]*F[1]); }
+          // Side: (178, 128) = center + (R, 0)
+          if(std::abs(x-(cx+R))<vs && std::abs(y-cy)<vs){
+            NSCELL ns(id,ns_bl); auto F=ns.template get<FORCE<T,2>>();
+            nsF_at_side=std::sqrt(F[0]*F[0]+F[1]*F[1]); }
+          // Bottom: (128, 178) = center + (0, +R)
+          if(std::abs(x-cx)<vs && std::abs(y-(cy+R))<vs){
+            NSCELL ns(id,ns_bl); auto F=ns.template get<FORCE<T,2>>();
+            nsF_at_bottom=std::sqrt(F[0]*F[0]+F[1]*F[1]); }
+          // Center: (128, 128)
+          if(std::abs(x-cx)<vs && std::abs(y-cy)<vs){
+            NSCELL ns(id,ns_bl); auto F=ns.template get<FORCE<T,2>>();
+            nsF_at_center=std::sqrt(F[0]*F[0]+F[1]*F[1]); }
+        }
+      }
+      MPI_RANK(0) printf("[NS Force] top=%.2e  side=%.2e  bottom=%.2e  center=%.2e\n",
+             nsF_at_top, nsF_at_side, nsF_at_bottom, nsF_at_center);
+      fflush(stdout);
     }
 
     GrC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,GrT>>(t(),FlagFM);

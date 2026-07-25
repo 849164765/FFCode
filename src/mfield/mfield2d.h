@@ -96,11 +96,29 @@ struct MFComputeH2D {
   __any__ static void apply(CELL& cell);
 };
 
-// MF3: Magnetic body force F_mag = +χ·|H|·∇|H|  (Kelvin force, PF+MF → NS coupling)
+// MF3a: Magnetic body force from Maxwell stress tensor divergence
+//   F_m = (H·∇χ)H - (1/2)|H|²∇χ
 template <typename PFCELL, typename MFCELL, typename NSCELL>
 struct MFMagneticForce2D {
   using T = typename PFCELL::FloatType;
-  using LatSet = typename NSCELL::LatticeSet;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
+};
+
+// MF3b: Interfacial force only: F_m = -(1/2)|H|²∇χ
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+struct MFMagneticForceInterfacial2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
+};
+
+// MF3c: Paper Eq.(8) formula: F_m = (χ/2)∇|H|²  (Kelvin body force)
+// Valid when magnetic susceptibility is constant (sharp interface limit).
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+struct MFMagneticForcePaper2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
 };
 
