@@ -1,9 +1,24 @@
 // bubbleMag2d.cpp — 2D bubble rising in ferrofluid (Phase field + NS + Magnetic)
 // Force formula selector:
-//   0 = Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ
+//   0 = Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ   *** RECOMMENDED ***
+//         This is the ONLY formula that produces real magnetic deformation.
+//         The (H·∇χ)H term is NOT a gradient and cannot be absorbed by pressure.
 //   1 = Interfacial only: -(1/2)|H|²∇χ
+//         Equivalent to Paper (differs by a pressure-absorbed gradient).
+//         Does NOT produce magnetic deformation in incompressible flow.
 //   2 = Paper Eq.(8): (χ/2)∇|H|²
-#define FORCE_FORMULA 2
+//         Equivalent to Interfacial (Paper = Interfacial + (1/2)∇(χ|H|²)).
+//         Does NOT produce magnetic deformation in incompressible flow.
+//
+// IMPORTANT: Parallel testing at Bom=1.94 (t=6000) showed:
+//   Maxwell     -> elong=1.0521 (real magnetic deformation)
+//   Paper       -> elong=1.0204 (== Interfacial, == buoyancy-only baseline)
+//   Interfacial -> elong=1.0204 (== Paper, no magnetic deformation)
+// See CHANGELOG.md "修改 11" for the mathematical proof and full analysis.
+// Can be overridden at compile time: -DFORCE_FORMULA=0/1/2
+#ifndef FORCE_FORMULA
+#define FORCE_FORMULA 0
+#endif
 
 #include "freelb.h"
 #include "freelb.hh"
