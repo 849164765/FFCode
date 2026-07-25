@@ -68,7 +68,76 @@ if [ -n "$PROJ_ROOT" ]; then
         echo "    >>> 请拉取最新代码: git pull origin $BRANCH"
     fi
 else
-    echo "  [WARN] 未找到 git 仓库"
+    echo "  [WARN] 未找到 git 仓库 (可能是 kh0723/ 备份部署, 无 git 信息)"
+fi
+echo ""
+
+# ---- 1b. kh2d.cpp BC 实现直接检测 (最可靠) ----
+echo "[1b/3] kh2d.cpp BC 实现直接检测 (最可靠)"
+echo "------------------------------------------------------------"
+KH2D_CPP=""
+# 查找 kh2d.cpp 文件
+for candidate in "$SCRIPT_DIR/kh2d.cpp" "$PROJ_ROOT/examples/kh2d/kh2d.cpp" "$SCRIPT_DIR/../kh2d/kh2d.cpp"; do
+    if [ -f "$candidate" ]; then
+        KH2D_CPP="$candidate"
+        break
+    fi
+done
+# 也检查 kh0723 备份目录
+if [ -z "$KH2D_CPP" ] && [ -n "$PROJ_ROOT" ]; then
+    for kh0723_cpp in "$PROJ_ROOT/kh0723/examples/kh2d/kh2d.cpp" "$PROJ_ROOT/../kh0723/examples/kh2d/kh2d.cpp"; do
+        if [ -f "$kh0723_cpp" ]; then
+            KH2D_CPP="$kh0723_cpp"
+            echo "  [WARN] 找到 kh0723/ 备份目录的 kh2d.cpp: $kh0723_cpp"
+            echo "    >>> 这是问题根因! 云端可能运行旧备份代码"
+            break
+        fi
+    done
+fi
+
+if [ -n "$KH2D_CPP" ]; then
+    echo "  检测文件: $KH2D_CPP"
+
+    # 检测 Twisted Periodic BC (最新, 正确)
+    if grep -q "MF_Per" "$KH2D_CPP" 2>/dev/null && grep -q "Twisted\|扭曲" "$KH2D_CPP" 2>/dev/null; then
+        echo "  [OK] 检测到 Twisted Periodic BC (MF_Per + 扭曲校正) - 最新正确版本"
+        echo "       H 场应维持 ~100% of H0, 稳定化 73.3%"
+    # 检测 Dirichlet BC (次新, 部分修复)
+    elif grep -q "psi_ghost=-H0\*x_ghost" "$KH2D_CPP" 2>/dev/null; then
+        echo "  [WARN] 检测到 Dirichlet BC (上下壁), 但缺少 Twisted Periodic BC"
+        echo "         H 场维持 ~96% H0, 稳定化仅 9.3% (Twisted BC 可达 73.3%)"
+        echo "    >>> 修复: git pull origin FerroKHinstability"
+    # 检测 buggy Neumann BC (最旧, 有bug)
+    elif grep -q "psi_ghost=bPsi.get(id_int)+H0\*vs" "$KH2D_CPP" 2>/dev/null; then
+        echo "  [FAIL][FAIL][FAIL] 检测到 buggy Neumann BC (缺 ov 因子)"
+        echo "         H 场衰减到 54% H0, 磁场力仅 46% 重力"
+        echo "         KH 演化加速 3.84 倍, 20000步即达 t*=6 (应为 76800步)"
+        echo ""
+        echo "  >>> 这是云端问题的根因! <<<"
+        echo "  修复步骤:"
+        echo "    1. cd $PROJ_ROOT && git pull origin FerroKHinstability"
+        echo "    2. 确认使用 examples/kh2d/ (不是 kh0723/examples/kh2d/)"
+        echo "    3. cd examples/kh2d && cp kh2d_backup.ini kh2d.ini"
+        echo "    4. make clean && make"
+        echo "    5. sbatch dlf.sh (或 mpiexec -n 128 ./kh2d.exe)"
+    else
+        echo "  [WARN] 无法识别 BC 实现类型, 请手动检查 kh2d.cpp"
+        echo "    关键标记:"
+        echo "      Twisted BC: grep 'MF_Per' kh2d.cpp  (期望: 多个匹配)"
+        echo "      Buggy BC:   grep 'H0\*vs' kh2d.cpp   (期望: 0 匹配)"
+    fi
+
+    # 额外检查: kh0723 备份目录存在性
+    if [ -n "$PROJ_ROOT" ] && [ -d "$PROJ_ROOT/kh0723" ]; then
+        echo ""
+        echo "  [FAIL] 检测到 kh0723/ 备份目录存在!"
+        echo "    >>> 此目录含 buggy Neumann BC 代码 + dlf.sh 部署脚本"
+        echo "    >>> 云端可能误用此目录部署"
+        echo "    >>> 建议: rm -rf $PROJ_ROOT/kh0723/  (删除旧备份)"
+        echo "             或确保从 examples/kh2d/ 部署"
+    fi
+else
+    echo "  [WARN] 未找到 kh2d.cpp 文件"
 fi
 echo ""
 
