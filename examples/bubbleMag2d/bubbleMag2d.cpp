@@ -763,6 +763,30 @@ int main(int argc, char* argv[]) {
     PrC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,PrT>>(t(),FlagFM);
     NSLattice.getField<FORCE<T,2>>().Communicate();
 
+    // === NS force sum diagnostic after ALL forces applied (before NS collision) ===
+    if(t()%200==0){
+      T totalNSForce=0, maxNSForce=0;
+      T sumFx=0, sumFy=0;
+      int nonZero=0;
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& ns_bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j) for(int i=ov;i<bk.getNx()-ov;++i){
+          std::size_t id=j*pr[1]+i; NSCELL ns(id,ns_bl);
+          auto F=ns.template get<FORCE<T,2>>();
+          T f=std::sqrt(F[0]*F[0]+F[1]*F[1]);
+          totalNSForce+=f; if(f>maxNSForce)maxNSForce=f;
+          sumFx+=F[0]; sumFy+=F[1];
+          if(f>1e-15) nonZero++;
+        }
+      }
+      MPI_RANK(0){
+        printf("[NS Force t=%d] sum|F|=%.2e max|F|=%.2e sumF=(%.2e,%.2e) nz=%d\n",
+               t(), totalNSForce, maxNSForce, sumFx, sumFy, nonZero);
+        fflush(stdout);
+      }
+    }
+
     // ===== Phase B-C: PF + NS collision =====
     PFLattice.template ApplyInnerCellDynamics<PFSel>(FlagFM);
     PF_Per.Apply(); PFLattice.NormalFullCommunicate();
