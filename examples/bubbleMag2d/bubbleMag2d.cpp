@@ -925,6 +925,49 @@ int main(int argc, char* argv[]) {
 
     ++t; ++ot;
     if(t()%OutputStep==0){
+      // ===== Geometry & Field Enhancement Diagnostic (Phase 1) =====
+      // Measures: elongation ratio (Dy/Dx), centroid, area, field enhancement Henh
+      // Henh = avg|H| inside bubble / H0, should be ~1.33 if field correctly enhanced
+      {
+        T sumW=T{0}, sumX=T{0}, sumY=T{0};
+        T sumH_in=T{0}; int n_in=0;
+        T xmin=1e30, xmax=-1e30, ymin=1e30, ymax=-1e30;
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& pf_bl=PFLattice.getBlockLat(b);
+          auto& mf_bl=MFLattice.getBlockLat(b);
+          const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          int ov=bk.getOverlap();
+          T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1];
+          for(int j=ov;j<bk.getNy()-ov;++j){
+            for(int i=ov;i<bk.getNx()-ov;++i){
+              std::size_t id=j*pr[1]+i;
+              PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl);
+              T phi=pf.template get<PHI<T>>();
+              T x=mx+T(i)*vs, y=my+T(j)*vs;
+              if(phi < T{0.5}){ // inside bubble
+                T w=T{1}-phi;
+                sumW+=w; sumX+=x*w; sumY+=y*w;
+                if(x<xmin)xmin=x; if(x>xmax)xmax=x;
+                if(y<ymin)ymin=y; if(y>ymax)ymax=y;
+              }
+              if(phi < T{0.1}){ // deep inside (for field enhancement)
+                T Hmag=mf.template get<HMAG<T>>();
+                sumH_in+=Hmag; n_in++;
+              }
+            }
+          }
+        }
+        T xc = (sumW>T{0}) ? sumX/sumW : T{0};
+        T yc = (sumW>T{0}) ? sumY/sumW : T{0};
+        T Dx = xmax-xmin, Dy = ymax-ymin;
+        T elong = (Dx>T{0}) ? Dy/Dx : T{0};
+        T Henh = (n_in>0 && H0>T{0}) ? (sumH_in/T(n_in))/H0 : T{0};
+        MPI_RANK(0){
+          printf("[Geom t=%d] elong=%.4f center=(%.2f,%.2f) area=%.2f Dx=%.2f Dy=%.2f Henh=%.4f (expect~1.33)\n",
+                 t(), elong, xc, yc, sumW, Dx, Dy, Henh);
+          fflush(stdout);
+        }
+      }
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
       Printer::Endl();
       MW.WriteBinary(t());
