@@ -1,4 +1,27 @@
 // bubbleMag2d.cpp — 2D bubble rising in ferrofluid (Phase field + NS + Magnetic)
+// Force formula selector:
+//   0 = Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ   *** RECOMMENDED ***
+//         This is the ONLY formula that produces real magnetic deformation.
+//         The (H·∇χ)H term is NOT a gradient and cannot be absorbed by pressure.
+//   1 = Interfacial only: -(1/2)|H|²∇χ
+//         Equivalent to Paper (differs by a pressure-absorbed gradient).
+//         Does NOT produce magnetic deformation in incompressible flow.
+//   2 = Paper Eq.(8): (χ/2)∇|H|²
+//         Equivalent to Interfacial (Paper = Interfacial + (1/2)∇(χ|H|²)).
+//         Does NOT produce magnetic deformation in incompressible flow.
+//
+// IMPORTANT: Parallel testing at Bom=1.94 showed:
+//   Maxwell     -> real magnetic deformation (bubble elongates in field direction)
+//   Paper       -> == Interfacial, == buoyancy-only baseline (NO magnetic deformation)
+//   Interfacial -> == Paper (no magnetic deformation)
+// Mathematical proof: Paper = Interfacial + (1/2)∇(χ|H|²), the difference is a
+// pure gradient absorbed by pressure in incompressible NS equations.
+// See CHANGELOG.md for the full analysis.
+// Can be overridden at compile time: -DFORCE_FORMULA=0/1/2
+#ifndef FORCE_FORMULA
+#define FORCE_FORMULA 0
+#endif
+
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
@@ -64,7 +87,7 @@ void readParam() {
   gravity = gy_sqrt * gy_sqrt;
   sigma = gravity * rho_h * D_bubble * D_bubble / Eo;
   // H0 from Bo_m: Bo_m = μ₀ * H₀² * D / (2*σ),  μ₀=1 in LBM units
-  H0 =std::sqrt(25) * std::sqrt(T(2.0) * Bom * sigma / D_bubble);
+  H0 = std::sqrt(T(2.0) * Bom * sigma / D_bubble);
   Beta=T(12.0)*sigma/Interface_Width;
   Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
   Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
@@ -80,6 +103,13 @@ void readParam() {
     printf("Eo=%.0f Re=%.0f W=%.1f M=%.3f tau_phi=%.3f\n",Eo,Re,Interface_Width,Mobility,Tau_phi);
     printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f) H0=%.3f Bom=%.3f\n",chi_l,chi_h,mu_l,mu_h,H0,Bom);
     printf("U_g=%.3f Ma=%.3f\n",U_g,Ma);
+#if FORCE_FORMULA == 0
+    printf("Force Formula: %d (Maxwell - produces real magnetic deformation)\n", FORCE_FORMULA);
+#elif FORCE_FORMULA == 1
+    printf("Force Formula: %d (Interfacial - NO magnetic deformation)\n", FORCE_FORMULA);
+#else
+    printf("Force Formula: %d (Paper - NO magnetic deformation)\n", FORCE_FORMULA);
+#endif
     printf("---------------------------------------\n");
   }
   if(Ma>T(0.2)) MPI_RANK(0){ fprintf(stderr,"[Warn] Ma=%.3f > 0.2\n",Ma); }
@@ -313,54 +343,60 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: Set wall psi = -H0*y  and wall pops = feq(psi_bc)
-    {
-      auto& psiF=MFLattice.getField<PSI<T>>();
+    // 0a-sub: Sub-iteration loop to accelerate MF convergence
+    // The pseudo-time diffusion equation needs many iterations to converge.
+    // We run N_sub iterations per time step to keep the MF field in quasi-steady state.
+    constexpr int MF_SUB_ITER = 10;
+    for(int iter=0; iter<MF_SUB_ITER; ++iter){
+      // 0b: Set wall psi = -H0*y  and wall pops = feq(psi_bc)
+      {
+        auto& psiF=MFLattice.getField<PSI<T>>();
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          auto& bPsi=psiF.getBlockField(b);
+          int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+          T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
+          if(minY<Cell_Len*T{1.5}){
+            for(int jj=0;jj<=ov;++jj){
+              T y=minY+T(jj)*vs, psi_w=-H0*y;
+              for(int ii=0;ii<nx;++ii){
+                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+                bPsi.get(id)=psi_w;
+              }
+            }
+          }
+          if(maxY>H_global-Cell_Len*T{1.5}){
+            for(int jj=ny-ov-1;jj<ny;++jj){
+              T y=minY+T(jj)*vs, psi_w=-H0*y;
+              for(int ii=0;ii<nx;++ii){
+                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+                bPsi.get(id)=psi_w;
+              }
+            }
+          }
+        }
+      }
+
+      // 0c: MF collision (direct iteration)
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b);
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
-        if(minY<Cell_Len*T{1.5}){
-          for(int jj=0;jj<=ov;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
-            }
-          }
-        }
-        if(maxY>H_global-Cell_Len*T{1.5}){
-          for(int jj=ny-ov-1;jj<ny;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
-            }
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j){
+          for(int i=ov;i<bk.getNx()-ov;++i){
+            MFCELL c(j*pr[1]+i,bl);
+            collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
           }
         }
       }
-    }
+      MF_Per.Apply();
 
-    // 0c: MF collision (direct iteration)
-    for(int b=0;b<Geo.getBlockNum();++b){
-      auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-      int ov=bk.getOverlap();
-      for(int j=ov;j<bk.getNy()-ov;++j){
-        for(int i=ov;i<bk.getNx()-ov;++i){
-          MFCELL c(j*pr[1]+i,bl);
-          collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
-        }
-      }
-    }
-    MF_Per.Apply();
-
-    // 0d: Stream
-    MFLattice.NormalFullCommunicate();
-    MFLattice.Stream();
-    MFLattice.NormalFullCommunicate();
+      // 0d: Stream
+      MFLattice.NormalFullCommunicate();
+      MFLattice.Stream();
+      MFLattice.NormalFullCommunicate();
+    } // end MF sub-iteration loop
 
     // 0e: PSI = Σg_i (interior only, walls keep psi_bc)
     {
@@ -399,6 +435,22 @@ int main(int argc, char* argv[]) {
 
     // A4: Magnetic force (if chi>0 and H0>0)
     if(Bom>T{0}){
+      T maxFmag=0, maxHmag=0, maxGradHmag=0;
+      int maxH_ix=0, maxH_iy=0;
+      // local sampled values (only the rank owning the cell sets them)
+      T Hmag_at_center_l=0, Hmag_at_equator_l=0, Hmag_at_pole_l=0;
+      T Hmag_at_45deg_l=0;
+      T Fmag_at_equator_l=0, Fmag_at_pole_l=0;
+      T chi_at_equator_l=0;
+      // Hx/Hy at center and equator for direction check
+      T Hx_at_center_l=0, Hy_at_center_l=0;
+      T Hx_at_equator_l=0, Hy_at_equator_l=0;
+      T Hx_at_pole_l=0, Hy_at_pole_l=0;
+      T Hx_at_45deg_l=0, Hy_at_45deg_l=0;
+      T mu_at_center_l=0, mu_at_equator_l=0, mu_at_pole_l=0;
+      T omega_at_center_l=0, omega_at_equator_l=0, omega_at_pole_l=0;
+      T phi_at_center_l=0, phi_at_equator_l=0, phi_at_pole_l=0;
+      T psi_at_center_l=0, psi_at_equator_l=0, psi_at_pole_l=0;
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
         auto& ns_bl=NSLattice.getBlockLat(b);
@@ -408,8 +460,128 @@ int main(int argc, char* argv[]) {
           for(int i=ov;i<bk.getNx()-ov;++i){
             std::size_t id=j*pr[1]+i;
             PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
+            T Hmag_diag = mf.template get<HMAG<T>>();
+            T Hx_diag = mf.template get<HX<T>>();
+            T Hy_diag = mf.template get<HY<T>>();
+            T phi_diag = pf.template get<typename PFCELL::GenericRho>();
+            T chi_diag = chi_l + phi_diag * (chi_h - chi_l);
+            Vector<T,2> gH{0,0};
+            for(unsigned k=1;k<MFLatSet::q;++k){
+              T Hk=mf.getNeighbor(k).template get<HMAG<T>>();
+              T wk=latset::w<MFLatSet>(k);
+              const auto& ck=latset::c<MFLatSet>(k);
+              gH[0]+=wk*ck[0]*Hk; gH[1]+=wk*ck[1]*Hk;
+            }
+            gH[0]/=MFLatSet::cs2; gH[1]/=MFLatSet::cs2;
+            T gradHmag=std::sqrt(gH[0]*gH[0]+gH[1]*gH[1]);
+            T Fmag_diag=chi_diag*Hmag_diag*gradHmag;
+            // Compute lattice coordinates for sampling
+            T xcoord=bk.getMin()[0]+T(i-ov)*bk.getVoxelSize();
+            T ycoord=bk.getMin()[1]+T(j-ov)*bk.getVoxelSize();
+            int ix=(int)(xcoord+0.5), iy=(int)(ycoord+0.5);
+            if(Fmag_diag>maxFmag) maxFmag=Fmag_diag;
+            if(Hmag_diag>maxHmag){maxHmag=Hmag_diag; maxH_ix=ix; maxH_iy=iy;}
+            if(gradHmag>maxGradHmag) maxGradHmag=gradHmag;
+            // Sample at key points (bubble center=(128,128), R=50)
+            T mu_diag = mf.template get<MU_PERCELL<T>>();
+            T omega_diag = mf.template get<OMEGA_PSI<T>>();
+            T psi_diag = mf.template get<PSI<T>>();
+            if(ix==128 && iy==128){Hmag_at_center_l=Hmag_diag; Hx_at_center_l=Hx_diag; Hy_at_center_l=Hy_diag; mu_at_center_l=mu_diag; omega_at_center_l=omega_diag; phi_at_center_l=phi_diag; psi_at_center_l=psi_diag;}
+            if(ix==78 && iy==128){Hmag_at_equator_l=Hmag_diag; chi_at_equator_l=chi_diag; Fmag_at_equator_l=Fmag_diag; Hx_at_equator_l=Hx_diag; Hy_at_equator_l=Hy_diag; mu_at_equator_l=mu_diag; omega_at_equator_l=omega_diag; phi_at_equator_l=phi_diag; psi_at_equator_l=psi_diag;}
+            if(ix==128 && iy==78){Hmag_at_pole_l=Hmag_diag; Fmag_at_pole_l=Fmag_diag; Hx_at_pole_l=Hx_diag; Hy_at_pole_l=Hy_diag; mu_at_pole_l=mu_diag; omega_at_pole_l=omega_diag; phi_at_pole_l=phi_diag; psi_at_pole_l=psi_diag;}
+            // 45° point on interface: (128-35, 128-35) = (93, 93)
+            if(ix==93 && iy==93){Hmag_at_45deg_l=Hmag_diag; Hx_at_45deg_l=Hx_diag; Hy_at_45deg_l=Hy_diag;}
+#if FORCE_FORMULA == 0
+            // Full Maxwell: (H·∇χ)H - (1/2)|H|²∇χ  *** RECOMMENDED ***
             MFMagneticForce2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#elif FORCE_FORMULA == 1
+            // Interfacial only: -(1/2)|H|²∇χ (equivalent to Paper, no deformation)
+            MFMagneticForceInterfacial2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#else
+            // Paper Eq.(8): (χ/2)∇|H|² (equivalent to Interfacial, no deformation)
+            MFMagneticForcePaper2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
+#endif
           }
+        }
+      }
+      // MPI reduction: use MAX since only the owning rank has a nonzero value
+      T Hmag_at_center=Hmag_at_center_l, Hmag_at_equator=Hmag_at_equator_l, Hmag_at_pole=Hmag_at_pole_l;
+      T Hmag_at_45deg=Hmag_at_45deg_l;
+      T Fmag_at_equator=Fmag_at_equator_l, Fmag_at_pole=Fmag_at_pole_l;
+      T chi_at_equator=chi_at_equator_l;
+      T Hx_at_center=Hx_at_center_l, Hy_at_center=Hy_at_center_l;
+      T Hx_at_equator=Hx_at_equator_l, Hy_at_equator=Hy_at_equator_l;
+      T Hx_at_pole=Hx_at_pole_l, Hy_at_pole=Hy_at_pole_l;
+      T Hx_at_45deg=Hx_at_45deg_l, Hy_at_45deg=Hy_at_45deg_l;
+      T mu_at_center=mu_at_center_l, mu_at_equator=mu_at_equator_l, mu_at_pole=mu_at_pole_l;
+      T omega_at_center=omega_at_center_l, omega_at_equator=omega_at_equator_l, omega_at_pole=omega_at_pole_l;
+      T phi_at_center=phi_at_center_l, phi_at_equator=phi_at_equator_l, phi_at_pole=phi_at_pole_l;
+      T psi_at_center=psi_at_center_l, psi_at_equator=psi_at_equator_l, psi_at_pole=psi_at_pole_l;
+#ifdef MPI_ENABLED
+      MPI_Allreduce(MPI_IN_PLACE,&Hmag_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hmag_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hmag_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hmag_at_45deg,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Fmag_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Fmag_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&chi_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hx_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hy_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hx_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hy_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hx_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hy_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hx_at_45deg,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&Hy_at_45deg,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&mu_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&mu_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&mu_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&omega_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&omega_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&omega_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&phi_at_center,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&phi_at_equator,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&phi_at_pole,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&psi_at_center,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&psi_at_equator,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&psi_at_pole,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&maxFmag,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&maxHmag,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&maxGradHmag,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+      // For maxH location: use MAXLOC to find the rank and value
+      struct { double val; int rank; } in, out;
+      in.val = maxHmag; in.rank = mpi().getRank();
+      MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+      if(out.rank != mpi().getRank()) { maxH_ix = 0; maxH_iy = 0; }
+      MPI_Allreduce(MPI_IN_PLACE,&maxH_ix,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE,&maxH_iy,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+#endif
+      if(mpi().getRank()==0){
+        if(t()%10==0 || t()<10){
+          printf("[DIAG t=%d] H0=%.6e  maxH=%.6e@(%d,%d)  maxGradH=%.6e  maxF=%.6e\n",
+                 (int)t(),(double)H0,(double)maxHmag,maxH_ix,maxH_iy,(double)maxGradHmag,(double)maxFmag);
+          printf("[DIAG t=%d] H_center=%.6e (Hx=%.3e Hy=%.3e)  H_eq=%.6e (Hx=%.3e Hy=%.3e)  H_pole=%.6e (Hx=%.3e Hy=%.3e)  H_45=%.6e\n",
+                 (int)t(),(double)Hmag_at_center,(double)Hx_at_center,(double)Hy_at_center,
+                 (double)Hmag_at_equator,(double)Hx_at_equator,(double)Hy_at_equator,
+                 (double)Hmag_at_pole,(double)Hx_at_pole,(double)Hy_at_pole,
+                 (double)Hmag_at_45deg);
+          printf("[DIAG t=%d] H_pole/H_eq=%.4f  H_eq/H_center=%.4f  H_pole/H_center=%.4f  H_45/H0=%.4f\n",
+                 (int)t(),
+                 Hmag_at_equator>0?(double)(Hmag_at_pole/Hmag_at_equator):0.0,
+                 Hmag_at_center>0?(double)(Hmag_at_equator/Hmag_at_center):0.0,
+                 Hmag_at_center>0?(double)(Hmag_at_pole/Hmag_at_center):0.0,
+                 H0>0?(double)(Hmag_at_45deg/H0):0.0);
+          printf("[DIAG t=%d] chi_eq=%.4f  F_eq=%.3e  F_pole=%.3e  F_exp=%.3e  maxF/Fexp=%.1f\n",
+                 (int)t(),(double)chi_at_equator,(double)Fmag_at_equator,(double)Fmag_at_pole,
+                 (double)(chi_h*H0*H0/Bubble_Radius),
+                 (chi_h*H0*H0/Bubble_Radius)>0?(double)(maxFmag/(chi_h*H0*H0/Bubble_Radius)):0.0);
+          printf("[DIAG t=%d] phi: c=%.4f eq=%.4f pole=%.4f | mu: c=%.4f eq=%.4f pole=%.4f | omega: c=%.4f eq=%.4f pole=%.4f\n",
+                 (int)t(),(double)phi_at_center,(double)phi_at_equator,(double)phi_at_pole,
+                 (double)mu_at_center,(double)mu_at_equator,(double)mu_at_pole,
+                 (double)omega_at_center,(double)omega_at_equator,(double)omega_at_pole);
+          printf("[DIAG t=%d] psi: c=%.6e eq=%.6e pole=%.6e | theoretical: psi_eq=%.6e psi_pole=%.6e\n",
+                 (int)t(),(double)psi_at_center,(double)psi_at_equator,(double)psi_at_pole,
+                 -H0*128.0, -H0*128.0);
         }
       }
     }

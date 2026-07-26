@@ -96,9 +96,34 @@ struct MFComputeH2D {
   __any__ static void apply(CELL& cell);
 };
 
-// MF3: Magnetic body force F_mag = +χ·|H|·∇|H|  (Kelvin force, PF+MF → NS coupling)
+// MF3: Full Maxwell stress tensor divergence (RECOMMENDED - produces real deformation)
+//   F_m = (H·∇χ)H - (1/2)|H|²∇χ
+// This is the ONLY formula that produces real magnetic deformation.
+// The (H·∇χ)H term is NOT a gradient and cannot be absorbed by pressure.
 template <typename PFCELL, typename MFCELL, typename NSCELL>
 struct MFMagneticForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
+};
+
+// MF3b: Interfacial force only (does NOT produce magnetic deformation)
+//   F_m = -(1/2)|H|²∇χ
+// Mathematically equivalent to Paper formula in incompressible flow.
+// The difference is a pure gradient absorbed by pressure.
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+struct MFMagneticForceInterfacial2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
+};
+
+// MF3c: Paper Eq.(8) Kelvin body force (does NOT produce magnetic deformation)
+//   F_m = (χ/2)∇|H|²
+// Mathematically equivalent to Interfacial formula in incompressible flow.
+// Reference: Guo et al., Phys. Fluids 37, 022148 (2025), Eq.(8).
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+struct MFMagneticForcePaper2D {
   using T = typename PFCELL::FloatType;
   using LatSet = typename NSCELL::LatticeSet;
   __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);

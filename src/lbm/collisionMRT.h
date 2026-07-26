@@ -85,9 +85,11 @@ __constexpr__ int shearViscIndexes<2,9>[shearIndexes<2,9>] = { 7, 8};
 
 // ---------------------------------------------------------------------------
 // D2Q5 MRT: diffusion equation (magnetic potential operator)
-// c = {(0,0) (1,0) (-1,0) (0,1) (0,-1)}  w = {1/3 1/6 1/6 1/6 1/6}
+// c = {(0,0) (1,0) (-1,0) (0,1) (0,-1)}  w = {1/5 1/5 1/5 1/5 1/5} (uniform)
+// cs² = 2/5  (Guo 2025 Eq.40: uniform weights for M5 orthogonality)
 // Orthogonal moments: m0=psi m1=jx m2=jy m3=e m4=pxx
-// row norms: |m0|^2=5 |m1|^2=2 |m2|^2=2 |m3|^2=20 |m4|^2=4
+// row norms (unweighted): |m0|^2=5 |m1|^2=2 |m2|^2=2 |m3|^2=20 |m4|^2=4
+// weighted norms (w=1/5): |m0|^2=1 |m1|^2=2/5 |m2|^2=2/5 |m3|^2=4 |m4|^2=4/5
 // ---------------------------------------------------------------------------
 template <>
 __constexpr__ Fraction<> M<2,5>[5][5] = {
@@ -447,8 +449,17 @@ struct MRTDiffusion {
     }
 
     T rtvec[LatSet::q]{};
+    // Paper Eq.(42-43): s0=0 (conserved), s1=s2=omega (flux→diffusion D=μ),
+    // s3=s4=1 (energy/stress: full relaxation for stability & accuracy)
     rtvec[0] = T{0};
-    for (unsigned int i = 1; i < LatSet::q; ++i) rtvec[i] = omega_psi;
+    rtvec[1] = omega_psi;
+    rtvec[2] = omega_psi;
+    if constexpr (LatSet::q == 5) {
+      rtvec[3] = T{1};
+      rtvec[4] = T{1};
+    } else {
+      for (unsigned int i = 3; i < LatSet::q; ++i) rtvec[i] = omega_psi;
+    }
 
     T InvM_S[LatSet::q][LatSet::q]{};
     for (unsigned int i = 0; i < LatSet::q; ++i)

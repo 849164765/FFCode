@@ -119,16 +119,20 @@ __constexpr__ int opp<2, 4>[4] = {1, 0, 3, 2};
 }  // namespace latsetdata
 
 // D2Q5
+// Uniform weights w = {1/5, ...} per Guo 2025 Eq.(40) for M5 orthogonality.
+// cs² = Σ w_k cx_k² = 2*(1/5) = 2/5, matching paper Eq.(42): 1/s = 2.5μ + 0.5.
+// Standard weights {1/3,1/6,...} break M5 orthogonality (m0–m3 coupling),
+// causing incorrect magnetic potential diffusion and uniform H field.
 template <typename T>
 struct D2Q5 : public Basic_Lattice_Set<2, 5> {
   using FloatType = T;
   static constexpr Vector<int, 2> c[q] = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-  static constexpr T w[q] = {T(1) / T(3), T(1) / T(6), T(1) / T(6), T(1) / T(6),
-                             T(1) / T(6)};
+  static constexpr T w[q] = {T(1) / T(5), T(1) / T(5), T(1) / T(5), T(1) / T(5),
+                             T(1) / T(5)};
   static constexpr int opp[q] = {0, 2, 1, 4, 3};
-  static constexpr T cs2 = T(1) / T(3);
-  static constexpr T InvCs2 = T(3);
-  static constexpr T InvCs4 = T(9);
+  static constexpr T cs2 = T(2) / T(5);
+  static constexpr T InvCs2 = T(5) / T(2);
+  static constexpr T InvCs4 = T(25) / T(4);
 };
 
 namespace latsetdata {
@@ -136,7 +140,7 @@ template <>
 __constexpr__ Vector<int, 2> c<2, 5>[5] = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
 template <>
-__constexpr__ Fraction<> w<2, 5>[5] = {{1, 3}, {1, 6}, {1, 6}, {1, 6}, {1, 6}};
+__constexpr__ Fraction<> w<2, 5>[5] = {{1, 5}, {1, 5}, {1, 5}, {1, 5}, {1, 5}};
 
 template <>
 __constexpr__ int opp<2, 5>[5] = {0, 2, 1, 4, 3};
