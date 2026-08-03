@@ -55,7 +55,7 @@ void readParam() {
   mu_h=r.getValue<T>("Magnetic_Field","mu_h");
   Bom=r.getValue<T>("Magnetic_Field","Bom");
 
-  eta_l=T(0.6)/T(3500.0); eta_h=T(0.6)/T(35.0);
+  eta_l=T(0.0568)/T(100.0); eta_h=T(0.0568);
   // Compute sigma, gravity from Eo and Re (Guo 2025 definitions)
   // Re = sqrt(|Gy|)*rho_h*D^(3/2)/eta_h
   // Eo = |Gy|*rho_h*D^2/sigma
@@ -64,7 +64,7 @@ void readParam() {
   gravity = gy_sqrt * gy_sqrt;
   sigma = gravity * rho_h * D_bubble * D_bubble / Eo;
   // H0 from Bo_m: Bo_m = μ₀ * H₀² * D / (2*σ),  μ₀=1 in LBM units
-  H0 =std::sqrt(25) * std::sqrt(T(2.0) * Bom * sigma / D_bubble);
+  H0 =std::sqrt(T(2.0) * Bom * sigma / D_bubble);
   Beta=T(12.0)*sigma/Interface_Width;
   Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
   Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
@@ -314,26 +314,21 @@ int main(int argc, char* argv[]) {
     CommunicateOMEGAPSI<T>(MFLattice);
 
     // 0b: Set wall psi = -H0*y  and wall pops = feq(psi_bc)
+    // NOTE: lattice row jj holds physical y = minY + (jj-ov)*vs (ov halo
+    // rows below the block). Pinning by absolute y (halo + wall rows) gives
+    // the exact linear profile, so H == H0 everywhere in the far field.
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
+      const T nwall=Cell_Len*T{3.0};
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         auto& bPsi=psiF.getBlockField(b);
         int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],maxY=bk.getMax()[1],vs=bk.getVoxelSize();
-        if(minY<Cell_Len*T{1.5}){
-          for(int jj=0;jj<=ov;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
-            }
-          }
-        }
-        if(maxY>H_global-Cell_Len*T{1.5}){
-          for(int jj=ny-ov-1;jj<ny;++jj){
-            T y=minY+T(jj)*vs, psi_w=-H0*y;
+        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
+        for(int jj=0;jj<ny;++jj){
+          T y=minY+T(jj-ov)*vs;
+          if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
+            T psi_w=-H0*y;
             for(int ii=0;ii<nx;++ii){
               std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
@@ -379,6 +374,30 @@ int main(int argc, char* argv[]) {
     }
     CommunicatePSI<T>(MFLattice);
 
+    // 0e+: re-pin walls (0e overwrote them with the drifted Σg) so the
+    // stored field is exactly -H0*y at the walls/halo before H is computed.
+    {
+      auto& psiF=MFLattice.getField<PSI<T>>();
+      const T nwall=Cell_Len*T{3.0};
+      for(int b=0;b<Geo.getBlockNum();++b){
+        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        auto& bPsi=psiF.getBlockField(b);
+        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
+        for(int jj=0;jj<ny;++jj){
+          T y=minY+T(jj-ov)*vs;
+          if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
+            T psi_w=-H0*y;
+            for(int ii=0;ii<nx;++ii){
+              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+              bPsi.get(id)=psi_w;
+            }
+          }
+        }
+      }
+    }
+
     // 0f: Compute H = -∇ψ
     for(int b=0;b<Geo.getBlockNum();++b){
       auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
@@ -398,13 +417,27 @@ int main(int argc, char* argv[]) {
     STC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,STT>>(t(),FlagFM);
 
     // A4: Magnetic force (if chi>0 and H0>0)
+    // Paper Eq. (8): F_m = (μ₀χ/2)∇(|H|²) = μ₀χ|H|∇|H| (μ₀≡1, Kelvin form).
+    // The full interfacial stress (χ_h/2)∫φ·d|H|² is delivered ONLY when the
+    // μ-jump is co-located with the φ-midpoint — i.e. the interface is sharp
+    // (Interface_Width ≈ 1-2 cells, as in the paper's AMR finest level).
     if(Bom>T{0}){
+      // Force-free wall bands: the wall ψ-pins and the D2Q5 ψ-solver's ~1.4%
+      // far-field slope mismatch leave a spurious |H| spike (|H| ~ 4-6·H0,
+      // worst at the x-corners) within ~6 rows of each wall. The Kelvin force
+      // there (χ|H|∇|H|) is a numerical artifact, so it is zeroed in the
+      // bands |y|<=12 and |y-H_global|<=12. (Physically the far-field Kelvin
+      // force is ~0 anyway: |H| is uniform, ∇|H|≈0.)
+      const T band=T{12.0};
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
         auto& ns_bl=NSLattice.getBlockLat(b);
         const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         int ov=bk.getOverlap();
+        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
         for(int j=ov;j<bk.getNy()-ov;++j){
+          T y=minY+T(j-ov)*vs;
+          if(y<=band||y>=H_global-band) continue;
           for(int i=ov;i<bk.getNx()-ov;++i){
             std::size_t id=j*pr[1]+i;
             PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
