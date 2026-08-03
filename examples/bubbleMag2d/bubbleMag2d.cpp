@@ -26,6 +26,10 @@ T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Eo, Re, U_g, Tau_ns;
 // magnetic field
 T chi_l, chi_h, mu_l, mu_h, H0, Bom, DeltaRho;
 
+// psi-solver: boosted relaxation tau = 0.5 + PsiSolver_K*mu (K=0.5 -> smooth
+// fixed point, ~100 sub-iterations; K=3.0 = 1/cs^2 reproduces original solve)
+int PsiSolver_Iter; T PsiSolver_K;
+
 int MaxStep, OutputStep;
 std::string work_dir;
 
@@ -54,6 +58,8 @@ void readParam() {
   mu_l=r.getValue<T>("Magnetic_Field","mu_l");
   mu_h=r.getValue<T>("Magnetic_Field","mu_h");
   Bom=r.getValue<T>("Magnetic_Field","Bom");
+  PsiSolver_Iter=r.getValue<int>("Magnetic_Field","PsiSolver_Iter");
+  PsiSolver_K=r.getValue<T>("Magnetic_Field","PsiSolver_K");
 
   eta_l=T(0.0568)/T(100.0); eta_h=T(0.0568);
   // Compute sigma, gravity from Eo and Re (Guo 2025 definitions)
@@ -79,6 +85,7 @@ void readParam() {
     printf("rho: l=%.4f h=%.1f  eta: l=%.6f h=%.6f  sigma=%.2e g=%.2e\n",rho_l,rho_h,eta_l,eta_h,sigma,gravity);
     printf("Eo=%.0f Re=%.0f W=%.1f M=%.3f tau_phi=%.3f\n",Eo,Re,Interface_Width,Mobility,Tau_phi);
     printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f) H0=%.3f Bom=%.3f\n",chi_l,chi_h,mu_l,mu_h,H0,Bom);
+    printf("PsiSolver: K=%.3f iter=%d (omega_mu9=%.3f omega_mu1=%.3f)\n",PsiSolver_K,PsiSolver_Iter, T{1}/(T{0.5}+PsiSolver_K*mu_h),T{1}/(T{0.5}+PsiSolver_K*mu_l));
     printf("U_g=%.3f Ma=%.3f\n",U_g,Ma);
     printf("---------------------------------------\n");
   }
@@ -143,15 +150,15 @@ int main(int argc, char* argv[]) {
   // -- MF lattice (D2Q5) --
   using MFFIELDS=TypePack<PSI<T>,OMEGA_PSI<T>,MU_PERCELL<T>,CHI_PERCELL<T>,
     HX<T>,HY<T>,HMAG<T>,POP<T,MFLatSet::q>,
-    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>>;
+    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>,PSI_K<T>>;
   using MFREF=TypePack<PHI<T>>;
   using MFPACK=TypePack<MFFIELDS,MFREF>;
   ValuePack MFI(T{},T{1.0},T{mu_l},T{chi_l},T{},T{},T{},T{},
-    mu_l,mu_h,chi_l,chi_h,H0);
+    mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
   using MFCELL=Cell<T,MFLatSet,ExtractFieldPack<MFPACK>::mergedpack>;
   BlockLatticeManager<T,MFLatSet,MFPACK> MFLattice(Geo,MFI,MFBaseConv,
     &PFLattice.getField<PHI<T>>());
-  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0);
+  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
   MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
 
   // -- init phi (tanh bubble) --
@@ -339,64 +346,110 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // 0c: MF collision (direct iteration)
-    for(int b=0;b<Geo.getBlockNum();++b){
-      auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-      int ov=bk.getOverlap();
-      for(int j=ov;j<bk.getNy()-ov;++j){
-        for(int i=ov;i<bk.getNx()-ov;++i){
-          MFCELL c(j*pr[1]+i,bl);
-          collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
-        }
-      }
-    }
-    MF_Per.Apply();
-
-    // 0d: Stream
-    MFLattice.NormalFullCommunicate();
-    MFLattice.Stream();
-    MFLattice.NormalFullCommunicate();
-
-    // 0e: PSI = Σg_i (interior only, walls keep psi_bc)
-    {
-      auto& psiF=MFLattice.getField<PSI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b); int ov=bk.getOverlap();
-        for(int j=ov;j<bk.getNy()-ov;++j){
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
-            T psi=0; for(unsigned k=0;k<MFLatSet::q;++k)psi+=c[k];
-            bPsi.get(id)=psi;
+    // SyncMFPeriodicGhosts: mirror the physical edge columns of a per-cell MF
+    // field into the opposite x-wrapped ghost columns. MF_Per.Apply() copies
+    // only pops + GenericRho, and GenericRho for MFCELL resolves to PHI (see
+    // FindGenericRhoType in src/utils/tmp.h — PSI is not in its list), so the
+    // wrapped ghost columns of PSI/HX/HY/HMAG stay frozen at their T0 values
+    // and MFComputeH2D / MFMagneticForce2D would read stale neighbors at
+    // x=0/255. (Block-interior ghosts are fine: CommunicatePSI /
+    // CommunicateAllMFFields fill them from the neighbor block's physical
+    // data.)
+    auto SyncMFPeriodicGhosts = [&](auto& field) {
+      const T xLeft = T{0};
+      const T xRight = T(Ni) * Cell_Len;
+      for (int b = 0; b < Geo.getBlockNum(); ++b) {
+        const auto& bk = Geo.getBlock(b);
+        const bool atL = bk.getMin()[0] < xLeft + Cell_Len * T{0.5};
+        const bool atR = bk.getMax()[0] > xRight - Cell_Len * T{0.5};
+        if (!atL && !atR) continue;
+        for (int bp = 0; bp < Geo.getBlockNum(); ++bp) {
+          const auto& bk2 = Geo.getBlock(bp);
+          if (bk2.getMin()[1] != bk.getMin()[1]) continue;
+          const bool pL = bk2.getMin()[0] < xLeft + Cell_Len * T{0.5};
+          const bool pR = bk2.getMax()[0] > xRight - Cell_Len * T{0.5};
+          if (!((atL && pR) || (atR && pL) || (atL && atR && bp == b))) continue;
+          const auto& pr = bk.getProjection();
+          const int nx = bk.getNx(), ny = bk.getNy();
+          auto& f1 = field.getBlockField(b);
+          auto& f2 = field.getBlockField(bp);
+          for (int j = 0; j < ny; ++j) {
+            if (atL) f1.get(j * pr[1] + 0) = f2.get(j * pr[1] + nx - 2);
+            if (atR) f1.get(j * pr[1] + nx - 1) = f2.get(j * pr[1] + 1);
           }
         }
       }
-    }
-    CommunicatePSI<T>(MFLattice);
+    };
 
-    // 0e+: re-pin walls (0e overwrote them with the drifted Σg) so the
-    // stored field is exactly -H0*y at the walls/halo before H is computed.
-    {
-      auto& psiF=MFLattice.getField<PSI<T>>();
-      const T nwall=Cell_Len*T{3.0};
+    // 0c-0e+: psi-solver sub-iterations (PsiSolver_Iter repeats of
+    // collision+stream+macro). Each sub-iteration is one D2Q5 BGK diffusion
+    // step with the boosted relaxation omega_psi = 1/(0.5+K*mu); ~100
+    // iterations converge the solve to its (smooth) fixed point, removing the
+    // grid-scale |H| oscillation that caused the faceted bubble outline.
+    for(int sub=0;sub<PsiSolver_Iter;++sub){
+      // 0c: MF collision (direct iteration)
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b);
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
-        for(int jj=0;jj<ny;++jj){
-          T y=minY+T(jj-ov)*vs;
-          if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
-            T psi_w=-H0*y;
-            for(int ii=0;ii<nx;++ii){
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
+        int ov=bk.getOverlap();
+        for(int j=ov;j<bk.getNy()-ov;++j){
+          for(int i=ov;i<bk.getNx()-ov;++i){
+            MFCELL c(j*pr[1]+i,bl);
+            collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
+          }
+        }
+      }
+      MF_Per.Apply();
+
+      // 0d: Stream
+      MFLattice.NormalFullCommunicate();
+      MFLattice.Stream();
+      MFLattice.NormalFullCommunicate();
+
+      // 0e: PSI = Σg_i (interior only, walls keep psi_bc)
+      {
+        auto& psiF=MFLattice.getField<PSI<T>>();
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          auto& bPsi=psiF.getBlockField(b); int ov=bk.getOverlap();
+          for(int j=ov;j<bk.getNy()-ov;++j){
+            for(int i=ov;i<bk.getNx()-ov;++i){
+              std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
+              T psi=0; for(unsigned k=0;k<MFLatSet::q;++k)psi+=c[k];
+              bPsi.get(id)=psi;
+            }
+          }
+        }
+      }
+      CommunicatePSI<T>(MFLattice);
+
+      // 0e+: re-pin walls (0e overwrote them with the drifted Σg) so the
+      // stored field is exactly -H0*y at the walls/halo before H is computed.
+      {
+        auto& psiF=MFLattice.getField<PSI<T>>();
+        const T nwall=Cell_Len*T{3.0};
+        for(int b=0;b<Geo.getBlockNum();++b){
+          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+          auto& bPsi=psiF.getBlockField(b);
+          int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+          T minY=bk.getMin()[1],vs=bk.getVoxelSize();
+          for(int jj=0;jj<ny;++jj){
+            T y=minY+T(jj-ov)*vs;
+            if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
+              T psi_w=-H0*y;
+              for(int ii=0;ii<nx;++ii){
+                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
+                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
+                bPsi.get(id)=psi_w;
+              }
             }
           }
         }
       }
     }
+    // One sync per step is enough: the sub-iterations never read neighbor PSI
+    // (collision uses own pops, 0e uses own cells), and the H ghosts are only
+    // read by A4 below, after the sync that follows 0f.
+    SyncMFPeriodicGhosts(MFLattice.getField<PSI<T>>());
 
     // 0f: Compute H = -∇ψ
     for(int b=0;b<Geo.getBlockNum();++b){
@@ -410,6 +463,9 @@ int main(int argc, char* argv[]) {
       }
     }
     CommunicateAllMFFields<T>(MFLattice);
+    SyncMFPeriodicGhosts(MFLattice.getField<HX<T>>());
+    SyncMFPeriodicGhosts(MFLattice.getField<HY<T>>());
+    SyncMFPeriodicGhosts(MFLattice.getField<HMAG<T>>());
 
     // ===== Phase A: Force setup =====
     RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(t(),FlagFM);

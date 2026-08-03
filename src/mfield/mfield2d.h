@@ -29,6 +29,7 @@ struct MuHBase    : public FieldBase<1> {};  // 非磁相磁导率 μ_h
 struct ChiLBase   : public FieldBase<1> {};  // 铁磁相磁化率 χ_l
 struct ChiHBase   : public FieldBase<1> {};  // 非磁相磁化率 χ_h
 struct H0Base     : public FieldBase<1> {};  // 外加磁场强度 H₀ (沿 y 方向)
+struct PsiKBase    : public FieldBase<1> {};  // ψ 求解器松弛系数 K: τ_ψ = 0.5 + K·μ
 
 // ===================================================================
 //  Section 2: Self-Owned Field Type Aliases
@@ -59,6 +60,8 @@ template <typename T>
 using CHI_H = Data<T, ChiHBase>;
 template <typename T>
 using H_0   = Data<T, H0Base>;
+template <typename T>
+using PSI_K = Data<T, PsiKBase>;
 
 // ===================================================================
 //  Section 3: Field Packs
@@ -68,7 +71,7 @@ template <typename T>
 using MFFIELDS = TypePack<
     PSI<T>, OMEGA_PSI<T>, MU_PERCELL<T>, CHI_PERCELL<T>,
     HX<T>, HY<T>, HMAG<T>,
-    MU_L<T>, MU_H<T>, CHI_L<T>, CHI_H<T>, H_0<T>>;
+    MU_L<T>, MU_H<T>, CHI_L<T>, CHI_H<T>, H_0<T>, PSI_K<T>>;
 
 template <typename T, unsigned int D>
 using MFEXTERNALFIELDS = TypePack<PHI<T>>;
@@ -147,19 +150,22 @@ void CommunicateAllMFFields(LATTICE& lattice) {
 // Broadcast block-level params from rank 0
 template <typename T, typename LATTICE>
 void BroadcastAllMFParams(LATTICE& lattice,
-                          T& mu_l, T& mu_h, T& chi_l, T& chi_h, T& H0) {
+                          T& mu_l, T& mu_h, T& chi_l, T& chi_h, T& H0,
+                          T& PsiSolver_K) {
 #ifdef MPI_ENABLED
   mpi().bCast(mu_l, 0);
   mpi().bCast(mu_h, 0);
   mpi().bCast(chi_l, 0);
   mpi().bCast(chi_h, 0);
   mpi().bCast(H0, 0);
+  mpi().bCast(PsiSolver_K, 0);
 #endif
   lattice.template getField<MU_L<T>>().InitValue(mu_l);
   lattice.template getField<MU_H<T>>().InitValue(mu_h);
   lattice.template getField<CHI_L<T>>().InitValue(chi_l);
   lattice.template getField<CHI_H<T>>().InitValue(chi_h);
   lattice.template getField<H_0<T>>().InitValue(H0);
+  lattice.template getField<PSI_K<T>>().InitValue(PsiSolver_K);
 }
 
 }  // namespace mfield

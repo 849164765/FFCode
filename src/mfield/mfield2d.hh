@@ -24,8 +24,15 @@ __any__ void MFUpdateCoeffs2D<PFCELL, MFCELL>::apply(PFCELL& pf_cell,
   T mu  = mu_l  + phi * (mu_h  - mu_l);
   T chi = chi_l + phi * (chi_h - chi_l);
 
-  // tau = 0.5 + mu / cs²  (diffusion: D = mu,  tau = 0.5 + D/cs²)
-  T tau_psi = T{0.5} + mu / LatSet::cs2;
+  // tau = 0.5 + PsiSolver_K * mu  (diffusion D = cs²·(tau-0.5) = cs²·K·mu ∝ mu)
+  // Any K leaves the continuum ∇·(μ∇ψ)=0 fixed point unchanged; K=1/cs² is the
+  // classical choice. K=0.5 (omega(μ=9)=0.2, omega(μ=1)=1.0) boosts the
+  // relaxation so the discrete fixed point is smooth (grid-scale |H|
+  // oscillation 0.040→0.008·H0, numerical spike 2.58→1.91; the residual ~1.9
+  // is the physical pole concentration 2μ_f/(μ_f+μ_b)) and the sub-iterated
+  // solve converges in ~100 iterations — see .scratch/psi_boost_experiment.py.
+  T PsiSolver_K = mf_cell.template get<PSI_K<T>>();
+  T tau_psi = T{0.5} + PsiSolver_K * mu;
   T omega_psi = T{1} / tau_psi;
   if (omega_psi > T{1.95}) omega_psi = T{1.95};
   if (omega_psi < T{0.01}) omega_psi = T{0.01};
