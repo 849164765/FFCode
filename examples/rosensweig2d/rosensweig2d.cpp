@@ -58,7 +58,6 @@ void readParam(int argc, char* argv[]) {
   eta_l=r.getValue<T>("Two_Phase","eta_l");
   eta_h=r.getValue<T>("Two_Phase","eta_h");
   sigma=r.getValue<T>("Two_Phase","sigma");
-  gravity=r.getValue<T>("Two_Phase","gravity");
   MaxStep=r.getValue<int>("Simulation_Settings","TotalStep");
   OutputStep=r.getValue<int>("Simulation_Settings","OutputStep");
   // Magnetic
@@ -71,6 +70,10 @@ void readParam(int argc, char* argv[]) {
   PsiSolver_Iter=r.getValue<int>("Magnetic_Field","PsiSolver_Iter");
   PsiSolver_K=r.getValue<T>("Magnetic_Field","PsiSolver_K");
   if(H0_kAm_override>=T{0}) H0_kAm=H0_kAm_override;
+  // Physical reference (Cowley-Rosensweig unit conversion)
+  T Lx_phys_mm = r.getValue<T>("Physical","Lx_mm");
+  T sigma_phys_mNm = r.getValue<T>("Physical","sigma_mNm");
+  T lambda_c_phys_mm = r.getValue<T>("Physical","lambda_c_mm");
 
   DeltaRho=rho_h-rho_l;
   Beta=T(12.0)*sigma/Interface_Width;
@@ -79,16 +82,26 @@ void readParam(int argc, char* argv[]) {
   Tau_ns=T(0.5)+eta_h/rho_h/LatSet::cs2;
   Lambda_Seed=T(Ni)*Cell_Len/PerturbPeriods;  // integer # of wavelengths across Lx
 
-  // H0 from the paper's Cowley–Rosensweig critical field (Eq. 71, mu0=1 in
-  // lattice units): Hc^2 = 2*(mu0/mu+1)/(mu0/mu-1)^2 * sqrt(sigma*g*DeltaRho),
-  // then scale by the physical field ratio H0_phys/Hc_phys (Hc_phys=4.7 kA/m).
-  // mu is the RELATIVE permeability mu_r = mu_h/mu_l (the lattice mu values may
-  // be rescaled by a common factor to accelerate the psi-solver relaxation;
-  // ∇·(μ∇ψ)=0 is homogeneous in μ so the steady-state ψ is unchanged).
-  T mu_r=mu_h/mu_l;
-  T F_cr=(T{1}/mu_r+T{1})/((T{1}/mu_r-T{1})*(T{1}/mu_r-T{1}));
-  Hc_lat=std::sqrt(T{2}*F_cr*std::sqrt(sigma*gravity*DeltaRho));
-  H0=Hc_lat*(H0_kAm/Hc_kAm);
+  // gravity from the Cowley-Rosensweig critical wavelength:
+  //   lambda_c = 2*pi*sqrt(sigma/(g*DeltaRho))  ->  g = sigma/DeltaRho*(2*pi/lambda_c)^2
+  // with lambda_c_lattice = lambda_c_phys * Ni / Lx_phys (same physical lambda_c).
+  T lambda_c_lattice = lambda_c_phys_mm * T(Ni) / Lx_phys_mm;
+  gravity = sigma / (DeltaRho * std::pow(lambda_c_lattice / (T{2} * T{M_PI}), T{2}));
+
+  // H0 from physical field strength via critical-field (Bo_m_c) consistency,
+  // the reference-validated conversion: the dimensionless magnetic Bond number
+  //   Bo_m_c = mu0*Hc^2*lambda_c/(2*sigma)   (SI)
+  //   Bo_m_c = Hc_lat^2*lambda_c_lat/(2*sigma_lat)   (mu0 = 1 in lattice)
+  // is preserved between physical and lattice units:
+  //   Hc_lat = Hc_phys*sqrt(mu0*sigma_lat*lambda_c_phys/(sigma_phys*lambda_c_lat))
+  T mu0_phys = T{4} * T{M_PI} * T{1e-7};
+  T Hc_phys_Am = Hc_kAm * T{1e3};
+  T sigma_phys = sigma_phys_mNm * T{1e-3};   // N/m
+  T lambda_c_phys_m = lambda_c_phys_mm * T{1e-3};
+  Hc_lat = std::sqrt(mu0_phys * Hc_phys_Am * Hc_phys_Am *
+                     lambda_c_phys_m * sigma / (sigma_phys * lambda_c_lattice));
+  T H_conv = Hc_lat / Hc_kAm;                // lattice units per (kA/m)
+  H0 = H0_kAm * H_conv;
 
   MPI_RANK(0){
     printf("---- Rosensweig Instability of Ferrofluid Layer ----\n");
@@ -107,6 +120,30 @@ void readParam(int argc, char* argv[]) {
     printf("---------------------------------------\n");
   }
 }
+
+// ---- PreForceScaled2D ----
+// F_p = -(p/3) * DeltaRho * grad_phi * PrC_SCALE
+// Example-local copy of ff::FFPreForce2D with the reference-validated
+// PrC_SCALE=0.6 (uniform-mesh interface is much thicker than the paper's AMR
+// finest level, so the full PrC=1.0 over-damps and suppresses peak growth;
+// PrC=0.6 gives the correct nonlinear saturation toward the theoretical peak
+// height eta_peak = (lambda_c/4*pi)*sqrt(2*(H0/Hc)^2-2) = 0.454mm).
+// The framework functor stays untouched so bubbleMag2d keeps PrC=1.0.
+template <typename PFCELL, typename NSCELL>
+struct PreForceScaled2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell) {
+    constexpr T PrC_SCALE = T{0.6};
+    T p = ns_cell.template get<PRESSURE<T>>();
+    T delta_rho = pf_cell.template get<ff::DELTARHO<T>>();
+    const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
+    T coeff = -p / T{3} * delta_rho * PrC_SCALE;
+    auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
+    ns_force[0] += coeff * grad_phi[0];
+    ns_force[1] += coeff * grad_phi[1];
+  }
+};
 
 int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
@@ -326,7 +363,7 @@ int main(int argc, char* argv[]) {
   BlockLatManagerCoupling STC(PFLattice,NSLattice);
   using GrT=tmp::Key_TypePair<BulkFlag,ff::FFGravityForce2D<PFCELL,NSCELL>>;
   BlockLatManagerCoupling GrC(PFLattice,NSLattice);
-  using PrT=tmp::Key_TypePair<BulkFlag,ff::FFPreForce2D<PFCELL,NSCELL>>;
+  using PrT=tmp::Key_TypePair<BulkFlag,PreForceScaled2D<PFCELL,NSCELL>>;
   BlockLatManagerCoupling PrC(PFLattice,NSLattice);
   using ViT=tmp::Key_TypePair<BulkFlag,ff::FFViscoForce2D<PFCELL,NSCELL>>;
   BlockLatManagerCoupling ViC(PFLattice,NSLattice);
