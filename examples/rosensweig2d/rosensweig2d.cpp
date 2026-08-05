@@ -41,7 +41,6 @@ void readParam(int argc, char* argv[]) {
   T H0_kAm_override = T{-1};
   if (argc > 1) ininame = argv[1];
   if (argc > 2) H0_kAm_override = std::atof(argv[2]);
-
   iniReader r(ininame);
   work_dir = r.getValue<std::string>("workdir","workdir_");
   Thread_Num = r.getValue<int>("parallel","thread_num");
@@ -59,6 +58,7 @@ void readParam(int argc, char* argv[]) {
   eta_h=r.getValue<T>("Two_Phase","eta_h");
   sigma=r.getValue<T>("Two_Phase","sigma");
   MaxStep=r.getValue<int>("Simulation_Settings","TotalStep");
+  if (argc > 3) MaxStep = std::atoi(argv[3]);  // TotalStep override
   OutputStep=r.getValue<int>("Simulation_Settings","OutputStep");
   // Magnetic
   chi_l=r.getValue<T>("Magnetic_Field","chi_l");
