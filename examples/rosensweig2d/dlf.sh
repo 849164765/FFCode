@@ -3,6 +3,7 @@
 #SBATCH -N 1
 #SBATCH -n 64
 source /public3/soft/modules/module.sh
+module unload gcc 2>/dev/null
 module load mpich/3.1.4-gcc8.1.0
 module load gcc/12.2
 

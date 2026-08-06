@@ -6,6 +6,7 @@
 # Each case runs in its own directory; post-process with:
 #   python3 plot_peak_vs_H0.py
 source /public3/soft/modules/module.sh
+module unload gcc 2>/dev/null
 module load mpich/3.1.4-gcc8.1.0
 module load gcc/12.2
 
