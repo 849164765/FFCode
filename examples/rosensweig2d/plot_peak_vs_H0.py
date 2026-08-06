@@ -21,7 +21,9 @@ import matplotlib.pyplot as plt
 NI = 512
 NJ = 171
 LX_MM = 21.0          # physical domain length (mm)
-DX_MM = LX_MM / NI    # mm per cell
+LY_MM = 7.0           # physical domain height (mm)
+DX_MM = LX_MM / NI    # mm per cell (x)
+DY_MM = LY_MM / NJ    # mm per cell (y)
 
 def decode_vti_payload(s):
     s = re.sub(rb'\s', b'', s)
@@ -68,7 +70,9 @@ def interface_profile(stepdir):
         for j in range(NJ - 1):
             a, b = col[j], col[j + 1]
             if not np.isnan(a) and not np.isnan(b) and (a - 0.5) * (b - 0.5) <= 0 and a != b:
-                y_if[x] = j + (0.5 - a) / (b - a)
+                # physical y (cells from the bottom edge; origin = bottom-left
+                # corner of the domain): row j spans [j, j+1], crossing at j+0.5+frac
+                y_if[x] = j + 0.5 + (0.5 - a) / (b - a)
                 break
     return y_if
 
@@ -91,7 +95,7 @@ def peak_valley(case_dir):
     m = np.nanmean(y_if)
     ph = np.nanmax(y_if) - m          # peak height (cells)
     vd = m - np.nanmin(y_if)          # valley depth (cells)
-    return step, ph * DX_MM, vd * DX_MM
+    return step, ph * DY_MM, vd * DY_MM
 
 def main():
     prefix = sys.argv[1] if len(sys.argv) > 1 else 'case_H0_'
