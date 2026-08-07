@@ -115,6 +115,45 @@ __constexpr__ Fraction<> s<2,5>[5] = {
 template <>
 __constexpr__ int shearIndexes<2,5> = 0;
 
+// ---------------------------------------------------------------------------
+// D3Q7 MRT: diffusion equation (3D magnetic potential operator)
+// c = {(0,0,0) (±1,0,0) (0,±1,0) (0,0,±1)}  w = {1/4 1/8 1/8 1/8 1/8 1/8 1/8}
+// Orthogonal moments: m0=psi m1=jx m2=jy m3=jz m4=e m5=pxx m6=pyy+2pzz
+//   m6 = (0,1,1,1,1,-2,-2) is the unique vector orthogonal to the other six
+//   within the {v0=0, ±pair-equal, Σv=0} subspace (Gram-Schmidt on m5).
+// row norms: |m0|^2=7 |m1|^2=2 |m2|^2=2 |m3|^2=2 |m4|^2=42 |m5|^2=4 |m6|^2=12
+// InvM = M^T / norm² (orthogonal rows).
+// ---------------------------------------------------------------------------
+template <>
+__constexpr__ Fraction<> M<3,7>[7][7] = {
+  { 1,  1,  1,  1,  1,  1,  1},   // m0: psi (conserved)
+  { 0,  1, -1,  0,  0,  0,  0},   // m1: jx
+  { 0,  0,  0,  1, -1,  0,  0},   // m2: jy
+  { 0,  0,  0,  0,  0,  1, -1},   // m3: jz
+  {-6,  1,  1,  1,  1,  1,  1},   // m4: e  (energy-like)
+  { 0,  1,  1, -1, -1,  0,  0},   // m5: pxx
+  { 0,  1,  1,  1,  1, -2, -2}    // m6: pyy-2pzz (orthogonal complement)
+};
+
+template <>
+__constexpr__ Fraction<> InvM<3,7>[7][7] = {
+  {{1, 7},     {0},     {0},     {0}, {-1, 7},     {0},     {0}},
+  {{1, 7},  {1, 2},     {0},     {0}, {1, 42},  {1, 4},  {1, 12}},
+  {{1, 7}, {-1, 2},     {0},     {0}, {1, 42},  {1, 4},  {1, 12}},
+  {{1, 7},     {0},  {1, 2},     {0}, {1, 42}, {-1, 4},  {1, 12}},
+  {{1, 7},     {0}, {-1, 2},     {0}, {1, 42}, {-1, 4},  {1, 12}},
+  {{1, 7},     {0},     {0},  {1, 2}, {1, 42},     {0}, {-1, 6}},
+  {{1, 7},     {0},     {0}, {-1, 2}, {1, 42},     {0}, {-1, 6}}
+};
+
+template <>
+__constexpr__ Fraction<> s<3,7>[7] = {
+  {0}, {1}, {1}, {1}, {1}, {1}, {1}
+};
+
+template <>
+__constexpr__ int shearIndexes<3,7> = 0;
+
 template <>
 __constexpr__ Fraction<> M<3,19>[19][19] = {
 { 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1},

@@ -94,6 +94,19 @@ class iniReader {
     return val;
   }
 
+  // get value with default (returns default if section/key absent)
+  template <typename T>
+  T getValue(const std::string& section, const std::string& name, const T& defval) {
+    if (iniContent.find(section) == iniContent.end()) return defval;
+    auto secIt = iniContent[section];
+    if (secIt.find(name) == secIt.end()) return defval;
+    std::string value = secIt[name];
+    std::istringstream is_value(value);
+    T val;
+    is_value >> val;
+    return val;
+  }
+
   // get all values from a section
   template <typename T>
   void getVector(const std::string& section, std::vector<T>& vec) {
