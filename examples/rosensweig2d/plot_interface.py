@@ -83,10 +83,13 @@ def interface_profile(phi):
     return y_if
 
 def last_step(vtidata):
-    files = sorted(glob.glob(os.path.join(vtidata, 'rosensweig2d_T*_B0.vti')))
+    files = glob.glob(os.path.join(vtidata, 'rosensweig2d_T*_B0.vti'))
     if not files:
         return None
-    return int(re.search(r'_T(\d+)_', os.path.basename(files[-1])).group(1))
+    # numeric max: lexicographic would pick T9000 over T20000
+    def step_of(f):
+        return int(re.search(r'_T(\d+)_', os.path.basename(f)).group(1))
+    return step_of(max(files, key=step_of))
 
 def main():
     if len(sys.argv) < 2:

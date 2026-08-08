@@ -77,14 +77,16 @@ def interface_profile(stepdir):
     return y_if
 
 def last_step_dir(case_dir):
-    """Return the vtidata directory of the last output step in case_dir."""
-    files = sorted(glob.glob(os.path.join(case_dir, 'vtkoutput', 'vtidata',
-                                          'rosensweig2d_T*_B0.vti')))
+    """Return the vtidata directory of the last (largest) output step."""
+    files = glob.glob(os.path.join(case_dir, 'vtkoutput', 'vtidata',
+                                   'rosensweig2d_T*_B0.vti'))
     if not files:
         return None
-    last = files[-1]
-    step = int(re.search(r'_T(\d+)_', os.path.basename(last)).group(1))
-    return os.path.join(case_dir, 'vtkoutput', 'vtidata'), step
+    # numeric sort by step: lexicographic would pick T9000 over T20000
+    def step_of(f):
+        return int(re.search(r'_T(\d+)_', os.path.basename(f)).group(1))
+    last = max(files, key=step_of)
+    return os.path.join(case_dir, 'vtkoutput', 'vtidata'), step_of(last)
 
 def peak_valley(case_dir):
     vtidata, step = last_step_dir(case_dir)
