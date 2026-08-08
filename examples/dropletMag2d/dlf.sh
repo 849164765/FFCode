@@ -8,4 +8,4 @@ module load gcc/12.2
 
 make clean
 make
-mpiexec -n 128 ./rosensweig2d.exe
+mpiexec -n 128 ./dropletMag2d.exe

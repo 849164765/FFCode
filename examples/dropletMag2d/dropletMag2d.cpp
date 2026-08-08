@@ -1,6 +1,9 @@
-// rosensweig2d.cpp — Rosensweig instability of a ferrofluid layer
-// (Paper Sec. III.D: vertical uniform magnetic field, ferrofluid bottom 1/3)
-// Phase field + NS + Magnetic, mirroring the bubbleMag2d framework.
+// dropletMag2d.cpp — ferrofluid droplet deformation in a uniform magnetic
+// field (paper Sec. III.B, Flament experiment benchmark): validates the
+// magnetic Kelvin force. A circular ferrofluid droplet (mu2, chi2) deforms
+// into a prolate shape along the field; the aspect ratio b/a vs H0 is
+// compared with the literature.
+// Phase field + NS + Magnetic, mirroring the rosensweig2d framework.
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
@@ -16,9 +19,8 @@ int Ni, Nj;
 T Cell_Len;
 int BlockCellLen, Thread_Num;
 
-// interface (ferrofluid occupies the bottom 1/3, organic solvent the top 2/3)
-T InterfaceY0, PerturbAmp, PerturbPeriods;
-T Lambda_Seed;
+// droplet (ferrofluid circle at the center, radius R)
+T Droplet_Radius, Droplet_Cx, Droplet_Cy;
 
 // phase field
 T Interface_Width, Mobility, Tau_phi, Omega_phi, Kappa, Beta;
@@ -47,9 +49,9 @@ void readParam(int argc, char* argv[]) {
   Ni = r.getValue<int>("Mesh","Ni"); Nj = r.getValue<int>("Mesh","Nj");
   Cell_Len = r.getValue<T>("Mesh","Cell_Len");
   BlockCellLen = r.getValue<int>("Mesh","BlockCellLen");
-  InterfaceY0 = r.getValue<T>("Interface","Y0");
-  PerturbAmp = r.getValue<T>("Interface","PerturbAmp");
-  PerturbPeriods = r.getValue<T>("Interface","PerturbPeriods");
+  Droplet_Radius = r.getValue<T>("Droplet","Radius");
+  Droplet_Cx = r.getValue<T>("Droplet","CenterX");
+  Droplet_Cy = r.getValue<T>("Droplet","CenterY");
   Interface_Width=r.getValue<T>("Phase_Field","Interface_Width");
   Mobility=r.getValue<T>("Phase_Field","Mobility");
   rho_l=r.getValue<T>("Two_Phase","rho_l");
@@ -80,7 +82,6 @@ void readParam(int argc, char* argv[]) {
   Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
   Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
   Tau_ns=T(0.5)+eta_h/rho_h/LatSet::cs2;
-  Lambda_Seed=T(Ni)*Cell_Len/PerturbPeriods;  // integer # of wavelengths across Lx
 
   // gravity from the Cowley-Rosensweig critical wavelength:
   //   lambda_c = 2*pi*sqrt(sigma/(g*DeltaRho))  ->  g = sigma/DeltaRho*(2*pi/lambda_c)^2
@@ -88,32 +89,31 @@ void readParam(int argc, char* argv[]) {
   T lambda_c_lattice = lambda_c_phys_mm * T(Ni) / Lx_phys_mm;
   gravity = sigma / (DeltaRho * std::pow(lambda_c_lattice / (T{2} * T{M_PI}), T{2}));
 
-  // H0 from physical field strength via critical-field (Bo_m_c) consistency,
-  // the reference-validated conversion: the dimensionless magnetic Bond number
-  //   Bo_m_c = mu0*Hc^2*lambda_c/(2*sigma)   (SI)
-  //   Bo_m_c = Hc_lat^2*lambda_c_lat/(2*sigma_lat)   (mu0 = 1 in lattice)
-  // is preserved between physical and lattice units:
-  //   Hc_lat = Hc_phys*sqrt(mu0*sigma_lat*lambda_c_phys/(sigma_phys*lambda_c_lat))
+  // H0 from the physical field strength via the DIRECT dimensional
+  // conversion (mesh-independent): the lattice magnetic field unit follows
+  // from the Kelvin-force consistency mu0_conv*H_conv^2 = rho_conv*U^2,
+  //   H_conv = sqrt(rho_conv*U^2/mu0_phys)
+  // with rho_conv = rho_l_phys/rho_l, U = eta_conv/(rho_conv*dx),
+  // eta_conv = eta_l_phys/eta_l, dx = Lx_phys/Ni.
+  T rho_l_phys = r.getValue<T>("Physical","rho_l_phys");   // kg/m^3
+  T eta_l_phys = r.getValue<T>("Physical","eta_l_phys");   // Pa*s
   T mu0_phys = T{4} * T{M_PI} * T{1e-7};
-  T Hc_phys_Am = Hc_kAm * T{1e3};
-  T sigma_phys = sigma_phys_mNm * T{1e-3};   // N/m
-  T lambda_c_phys_m = lambda_c_phys_mm * T{1e-3};
-  Hc_lat = std::sqrt(mu0_phys * Hc_phys_Am * Hc_phys_Am *
-                     lambda_c_phys_m * sigma / (sigma_phys * lambda_c_lattice));
-  T H_conv = Hc_lat / Hc_kAm;                // lattice units per (kA/m)
-  H0 = H0_kAm * H_conv;
+  T rho_conv = rho_l_phys / rho_l;
+  T eta_conv = eta_l_phys / eta_l;
+  T dx_phys = Lx_phys_mm * T{1e-3} / T(Ni);
+  T U_phys = eta_conv / (rho_conv * dx_phys);
+  T H_conv = std::sqrt(rho_conv * U_phys * U_phys / mu0_phys);  // A/m per lattice unit
+  Hc_lat = H_conv * Hc_kAm * T{1e3};   // lattice critical field (report only)
+  H0 = H0_kAm * T{1e3} / H_conv;
 
   MPI_RANK(0){
-    printf("---- Rosensweig Instability of Ferrofluid Layer ----\n");
+    printf("---- Ferrofluid Droplet Deformation (Paper Sec. III.B) ----\n");
     printf("Mesh: %dx%d  BlockCellLen=%d\n",Ni,Nj,BlockCellLen);
-    printf("Interface: y0=%.1f perturb amp=%.2f periods=%.0f lambda_seed=%.2f\n",
-           InterfaceY0,PerturbAmp,PerturbPeriods,Lambda_Seed);
-    printf("rho: l=%.3f h=%.3f  eta: l=%.5f h=%.5f  sigma=%.5f g=%.3e\n",rho_l,rho_h,eta_l,eta_h,sigma,gravity);
+    printf("Droplet: R=%.1f center=(%.0f,%.0f)\n",Droplet_Radius,Droplet_Cx,Droplet_Cy);
+    printf("rho: l=%.3f h=%.3f  eta: l=%.5f h=%.5f  sigma=%.5f\n",rho_l,rho_h,eta_l,eta_h,sigma);
     printf("W=%.1f M=%.3f tau_phi=%.3f tau_ns=%.3f\n",Interface_Width,Mobility,Tau_phi,Tau_ns);
     printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f) Hc_lat=%.4f\n",chi_l,chi_h,mu_l,mu_h,Hc_lat);
     printf("H0: phys=%.2f kA/m (Hc=%.2f) -> lat=%.4f\n",H0_kAm,Hc_kAm,H0);
-    printf("PsiWall: ferrofluid H=H0*mu_l/mu_h=%.4f, solvent H=H0=%.4f (layered+evanescent)\n",
-           H0*mu_l/mu_h,H0);
     printf("PsiSolver: K=%.3f iter=%d (omega_mu=%.3f omega_1=%.3f)\n",PsiSolver_K,PsiSolver_Iter,
            T{1}/(T{0.5}+PsiSolver_K*mu_h),T{1}/(T{0.5}+PsiSolver_K*mu_l));
     printf("SeamSync: MPI-aware field sync (v2)\n");
@@ -224,10 +224,9 @@ int main(int argc, char* argv[]) {
   BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
   MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
 
-  // -- init phi: ferrofluid (phi=1) below flat interface + cos perturbation --
-  T y0_iface=InterfaceY0*Cell_Len, W_phys=Interface_Width*Cell_Len;
-  T amp_iface=PerturbAmp*Cell_Len;
-  T lam_iface=Lambda_Seed;
+  // -- init phi: circular ferrofluid droplet (phi=1 inside, phi=0 outside) --
+  T R_phys=Droplet_Radius*Cell_Len, W_phys=Interface_Width*Cell_Len;
+  T xc_d=Droplet_Cx*Cell_Len, yc_d=Droplet_Cy*Cell_Len;
   const T Pi=T{3.14159265358979323846};
   auto& phiField=PFLattice.getField<PHI<T>>();
   for(int b=0;b<Geo.getBlockNum();++b){
@@ -239,8 +238,8 @@ int main(int argc, char* argv[]) {
       T y=my+T(j)*vs;
       for(int i=ov;i<bk.getNx()-ov;++i){
         T x=mx+T(i)*vs;
-        T ys=y0_iface+amp_iface*std::cos(T{2.0}*Pi*x/lam_iface);
-        T phi=T{0.5}-T{0.5}*std::tanh(T{2.0}*(y-ys)/W_phys);
+        T dist=std::sqrt((x-xc_d)*(x-xc_d)+(y-yc_d)*(y-yc_d));
+        T phi=T{0.5}-T{0.5}*std::tanh(T{2.0}*(dist-R_phys)/W_phys);
         bPhi.get(j*pr[1]+i)=phi;
       }
     }
@@ -273,40 +272,17 @@ int main(int argc, char* argv[]) {
       }
   }
 
-  // init MF: flat-interface layered solution + analytical evanescent
-  // perturbation correction (validated in the reference Rosen implementation).
-  //   Below (y<y0, ferrofluid): psi = -Hbelow*y + Cb*cos(kx)*exp(k(y-y0))
-  //   Above (y>y0, solvent):    psi = psi_y0 - H0*(y-y0) + Ca*cos(kx)*exp(-k(y-y0))
-  // with Hbelow = H0*mu_l/mu_h (B = mu*H continuous across the interface,
-  // mu0=1). Pinning a single linear slope at both walls (bubble-style)
-  // violates mu*dpsi/dy continuity and leaves |H| = H0 inside the ferrofluid
-  // (mu_r^2 too strong a force). The evanescent mode is an exact fixed point
-  // of the D2Q5 diffusion solver: it must be seeded in the initial field and
-  // maintained by the wall BC, or the correct magnetic-force variation for the
-  // wavy interface is lost.
-  const T y0_lat = InterfaceY0 * Cell_Len;
-  const T Hbelow = H0 * mu_l / mu_h;
-  const T psi_y0 = -Hbelow * y0_lat;
-  const T wk_bc  = T{2} * T{Pi} * PerturbPeriods / (T(Ni) * Cell_Len);
-  const T mu_ratio = mu_l / mu_h;
-  const T Ca_bc = PerturbAmp * Cell_Len * H0 * (T{1} - mu_ratio) * mu_h / (mu_h + mu_l);
-  const T Cb_bc = -mu_ratio * Ca_bc;
+  // init MF: uniform far field psi = -H0*y (walls are in the outer solvent;
+  // the droplet is local and distorts the field only in its vicinity).
   {
     auto& psiF=MFLattice.getField<PSI<T>>();
     for(int b=0;b<Geo.getBlockNum();++b){
       auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
       auto& bPsi=psiF.getBlockField(b);
-      T vs=bk.getVoxelSize(),my=bk.getMin()[1],mx=bk.getMin()[0];
+      T vs=bk.getVoxelSize(),my=bk.getMin()[1];
       for(int j=0;j<bk.getNy();++j){
-        T y=my+T(j)*vs;
+        T y=my+T(j)*vs, psi=-H0*y;
         for(int i=0;i<bk.getNx();++i){
-          T x=mx+T(i)*vs;
-          T psi_flat, dpsi;
-          if(y>=y0_lat){ psi_flat = psi_y0 - H0*(y-y0_lat);
-                         dpsi = Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat)); }
-          else         { psi_flat = -Hbelow*y;
-                         dpsi = Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat)); }
-          T psi=psi_flat+dpsi;
           std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
           for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi;
           bPsi.get(id)=psi;
@@ -385,8 +361,46 @@ int main(int argc, char* argv[]) {
   vtmo::ScalarWriter Hyw("HY",MFLattice.getField<HY<T>>());
   // Keep the default output (1 ghost column per side): ParaView needs the
   // overlapping columns to tile the blocks seamlessly (no gaps between blocks).
-  vtmo::vtmWriter<T,2> MW("rosensweig2d",Geo);
+  vtmo::vtmWriter<T,2> MW("dropletMag2d",Geo);
   MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw);
+
+  // -- droplet aspect-ratio probe: b/a of the phi=0.5 contour (b: vertical,
+  // a: horizontal). Writes droplet_probe.dat (step, a_cells, b_cells, b/a).
+  FILE* probeF=nullptr;
+  IF_MPI_RANK(0){ probeF=std::fopen("droplet_probe.dat","w");
+    std::fprintf(probeF,"# step  a  b  b_over_a\n"); }
+  auto WriteProbe = [&](T step){
+    T amin=T{1e30},amax=-T{1e30},bmin=T{1e30},bmax=-T{1e30};
+    auto& pF=PFLattice.getField<PHI<T>>();
+    for(int b=0;b<Geo.getBlockNum();++b){
+      const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+      auto& bP=pF.getBlockField(b);
+      T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1];
+      int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
+      for(int j=ov;j<ny-ov;++j){
+        T y=my+T(j)*vs;
+        for(int i=ov;i<nx-ov;++i){
+          T x=mx+T(i)*vs;
+          if(bP.get(j*pr[1]+i)>=T{0.5}){
+            if(x<amin)amin=x; if(x>amax)amax=x;
+            if(y<bmin)bmin=y; if(y>bmax)bmax=y;
+          }
+        }
+      }
+    }
+    T a=amax-amin, b=bmax-bmin;
+#ifdef MPI_ENABLED
+    mpi().reduceAndBcast<T>(amin,MPI_MIN,0);
+    mpi().reduceAndBcast<T>(amax,MPI_MAX,0);
+    mpi().reduceAndBcast<T>(bmin,MPI_MIN,0);
+    mpi().reduceAndBcast<T>(bmax,MPI_MAX,0);
+    a=amax-amin; b=bmax-bmin;
+#endif
+    IF_MPI_RANK(0){
+      std::fprintf(probeF,"%g %g %g %g\n",step,a,b,b/a);
+      std::fflush(probeF);
+    }
+  };
 
   // ===== initial setup =====
   PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
@@ -404,8 +418,8 @@ int main(int argc, char* argv[]) {
   Printer::Print_BigBanner(std::string("Start Calculation..."));
   Timer t; Timer ot;
   T H_global=T(Nj)*Cell_Len;
-  const T phiBottom=T{1};  // ferrofluid wets the bottom wall
-  const T phiTop=T{0};     // organic solvent at the top wall
+  const T phiBottom=T{0};  // solvent at the bottom wall
+  const T phiTop=T{0};     // solvent at the top wall
 
   while(t()<MaxStep){
     // ===== Phase 0: Magnetic field solve =====
@@ -413,10 +427,8 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: Set wall psi to the layered far field + evanescent perturbation
-    // correction (see the init block for the formulas) and wall pops =
-    // feq(psi_bc) (Dirichlet pinning). The evanescent term keeps the wall BC
-    // from draining the seeded perturbation.
+    // 0b: Set wall psi = -H0*y (uniform far field, walls in the outer solvent)
+    // and wall pops = feq(psi_bc) (Dirichlet pinning)
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
       const T nwall=Cell_Len*T{3.0};
@@ -424,15 +436,12 @@ int main(int argc, char* argv[]) {
         auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         auto& bPsi=psiF.getBlockField(b);
         int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],minX=bk.getMin()[0],vs=bk.getVoxelSize();
+        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
         for(int jj=0;jj<ny;++jj){
           T y=minY+T(jj-ov)*vs;
           if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
+            T psi_w=-H0*y;
             for(int ii=0;ii<nx;++ii){
-              T x=minX+T(ii)*vs;
-              T psi_w;
-              if(y<=nwall) psi_w = -Hbelow*y + Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat));
-              else         psi_w = psi_y0 - H0*(y-y0_lat) + Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat));
               std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
               for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
               bPsi.get(id)=psi_w;
@@ -575,15 +584,12 @@ int main(int argc, char* argv[]) {
           auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
           auto& bPsi=psiF.getBlockField(b);
           int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-          T minY=bk.getMin()[1],minX=bk.getMin()[0],vs=bk.getVoxelSize();
+          T minY=bk.getMin()[1],vs=bk.getVoxelSize();
           for(int jj=0;jj<ny;++jj){
             T y=minY+T(jj-ov)*vs;
             if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
+              T psi_w=-H0*y;
               for(int ii=0;ii<nx;++ii){
-                T x=minX+T(ii)*vs;
-                T psi_w;
-                if(y<=nwall) psi_w = -Hbelow*y + Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat));
-                else         psi_w = psi_y0 - H0*(y-y0_lat) + Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat));
                 std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
                 for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
                 bPsi.get(id)=psi_w;
@@ -797,9 +803,11 @@ int main(int argc, char* argv[]) {
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
       Printer::Endl();
       MW.WriteBinary(t());
+      WriteProbe(t());
     }
   }
 
+  IF_MPI_RANK(0){ if(probeF) std::fclose(probeF); }
   Printer::Print_BigBanner(std::string("Calculation Complete!"));
   t.Print_MainLoopPerformance(Geo.getTotalCellNum());
   return 0;
