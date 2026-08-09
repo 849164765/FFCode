@@ -1,13 +1,3 @@
-// bubbleMag3d.cpp — 3D bubble rising in ferrofluid (Phase field + NS + Magnetic)
-//
-// 3D 移植自 bubbleMag2d:
-//   - NS / Phase-Field : D3Q19
-//   - Magnetic field   : D3Q7 (ψ 扩散方程 + Kelvin 力)
-//   - x/y 方向周期性, z 方向固壁 (bounce-back)
-//   - 重力沿 -z, 外加均匀磁场 H0 沿 +z (ψ = -H0·z)
-//   - ψ 求解器子迭代 (PsiSolver_Iter 次碰撞+迁移, 增强松弛 PsiSolver_K)
-//   - z 壁面绝对坐标钉扎 ψ = -H0·z, 周期性 x/y 方向的 MF 场 ghost 同步
-//   - 壁面附近 (|z|<=12 或 |z-H_global|<=12) Kelvin 力清零 (数值伪影防护)
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
@@ -35,8 +25,6 @@ T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Eo, Re, U_g, Tau_ns;
 // magnetic field
 T chi_l, chi_h, mu_l, mu_h, H0, Bom, DeltaRho;
 
-// psi-solver: boosted relaxation tau = 0.5 + PsiSolver_K*mu (K=0.5 -> smooth
-// fixed point, ~100 sub-iterations; K=3.0 = 1/cs² reproduces original solve)
 int PsiSolver_Iter; T PsiSolver_K;
 
 int MaxStep, OutputStep;
@@ -73,7 +61,6 @@ void readParam() {
   PsiSolver_K=r.getValue<T>("Magnetic_Field","PsiSolver_K");
 
   eta_l=T(0.0568)/T(100.0); eta_h=T(0.0568);
-  // 可选: 从 ini 覆盖格子粘度 (PureNSPF3D 使用 0.6/3500, 0.6/35)
   eta_l=r.getValue<T>("Two_Phase","eta_l",eta_l);
   eta_h=r.getValue<T>("Two_Phase","eta_h",eta_h);
   // Compute sigma, gravity from Eo and Re (Guo 2025 definitions)
@@ -129,15 +116,11 @@ int main(int argc, char* argv[]) {
   AABB<T,3> front ({0,T(-Cell_Len),0},{T(Ni*Cell_Len),0,T(Nk*Cell_Len)});
   AABB<T,3> back  ({0,T(Nj*Cell_Len),0},{T(Ni*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
   BlockGeometryHelper3D<T> GeoHelper(Ni,Nj,Nk,domain,Cell_Len,BlockCellLen);
-  GeoHelper.CreateBlocks(2,2,4);
+  GeoHelper.CreateBlocks(4,4,8);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
   BlockGeometry3D<T> Geo(GeoHelper);
 
-  // ---- 全局 block 表 (用于跨 rank 周期 ghost 同步) ----
-  // 每条 11 个 double: rank, minX, minY, minZ, nx, ny, nz, atL, atR, atF, atB
-  // x/y 周期方向的对侧 block 可能位于其他 rank (128进程=每进程1块),
-  // SyncMFPeriodicGhosts 无法只在本地查找, 必须通过该表定位 partner 并 MPI 交换。
   std::vector<double> GlobalBlockTable;
   {
     const int nranks = mpi().getSize();
@@ -157,9 +140,6 @@ int main(int argc, char* argv[]) {
     // 各 rank 条目数汇聚到 rank 0 再广播
     std::vector<int> counts(nranks, 0);
     {
-      // 注意: MPI_Sendrecv 的发送/接收缓冲必须分离 (集群 MPICH 3.1.4 对重叠
-      // 缓冲直接断言 abort: ch3u_buffer.c memcpy overlap)。这里发送用 tmp,
-      // 接收用独立的 dummy。
       double tmp[1], dummy[1];
       if (mpi().getRank() == 0) {
         for (int r = 0; r < nranks; ++r) {
@@ -383,16 +363,9 @@ int main(int argc, char* argv[]) {
 
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-  vtmo::ScalarWriter PS("PSI",MFLattice.getField<PSI<T>>());
-  vtmo::VectorWriter VW("Velocity",NSLattice.getField<VELOCITY<T,3>>());
-  vtmo::ScalarWriter Dw("Density",NSLattice.getField<DENSITY<T>>());
-  vtmo::VectorWriter Fw("Force",NSLattice.getField<FORCE<T,3>>());
-  vtmo::ScalarWriter Hxw("HX",MFLattice.getField<HX<T>>());
-  vtmo::ScalarWriter Hyw("HY",MFLattice.getField<HY<T>>());
-  vtmo::ScalarWriter Hzw("HZ",MFLattice.getField<HZ<T>>());
   vtmo::ScalarWriter Hmw("HMAG",MFLattice.getField<HMAG<T>>());
   vtmo::vtmWriter<T,3> MW("bubbleMag3d",Geo);
-  MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw,Hzw,Hmw);
+  MW.addWriterSet(PW,Hmw);
 
   // ===== initial setup =====
   PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();

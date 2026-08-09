@@ -1,14 +1,3 @@
-// droplet_validate.cpp — 磁力验证: 无重力铁磁流体液滴在匀强磁场中的变形
-// 与 bubbleMag3d 相同, 仅 readParam 增加重力=0 + sigma 手动指定 (Validation 节)
-//
-// 3D 移植自 bubbleMag2d:
-//   - NS / Phase-Field : D3Q19
-//   - Magnetic field   : D3Q7 (ψ 扩散方程 + Kelvin 力)
-//   - x/y 方向周期性, z 方向固壁 (bounce-back)
-//   - 重力沿 -z, 外加均匀磁场 H0 沿 +z (ψ = -H0·z)
-//   - ψ 求解器子迭代 (PsiSolver_Iter 次碰撞+迁移, 增强松弛 PsiSolver_K)
-//   - z 壁面绝对坐标钉扎 ψ = -H0·z, 周期性 x/y 方向的 MF 场 ghost 同步
-//   - 壁面附近 (|z|<=12 或 |z-H_global|<=12) Kelvin 力清零 (数值伪影防护)
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
