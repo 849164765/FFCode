@@ -18,6 +18,7 @@ constexpr T mu_h  = 5.0;
 constexpr T chi_l = 0.0;
 constexpr T chi_h = 1.0;
 constexpr T H0    = 0.01;
+constexpr T PsiSolver_K = 3.0;  // 1/cs², matching the legacy omega expectation
 
 // Expected values at phi = 0.5
 constexpr T phi_test  = 0.5;
@@ -71,14 +72,14 @@ int main() {
   BaseConverter<T> MFBaseConv(D2Q5<T>::cs2);
   MFBaseConv.SimplifiedConverterFromRT(Ni, T(0.01), T(1.0));
   ValuePack MFInit(T{}, T{}, T{}, T{}, T{}, T{}, T{},
-                   mu_l, mu_h, chi_l, chi_h, H0);
+                   mu_l, mu_h, chi_l, chi_h, H0, PsiSolver_K);
   BlockLatticeManager<T, D2Q5<T>, MFPACK> MFLattice(
     Geo, MFInit, MFBaseConv, &PFLattice.getField<PHI<T>>());
 
   // Broadcast block-level params
   mfield::BroadcastAllMFParams<T>(MFLattice, const_cast<T&>(mu_l), const_cast<T&>(mu_h),
                                   const_cast<T&>(chi_l), const_cast<T&>(chi_h),
-                                  const_cast<T&>(H0));
+                                  const_cast<T&>(H0), const_cast<T&>(PsiSolver_K));
 
   // ------------------ init phi = 0.5 everywhere ------------------
   PFLattice.getField<PHI<T>>().InitValue(T{0.5});

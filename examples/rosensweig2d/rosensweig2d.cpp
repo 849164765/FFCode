@@ -1,806 +1,933 @@
-// rosensweig2d.cpp — Rosensweig instability of a ferrofluid layer
-// (Paper Sec. III.D: vertical uniform magnetic field, ferrofluid bottom 1/3)
-// Phase field + NS + Magnetic, mirroring the bubbleMag2d framework.
+// rosensweig2d.cpp - clean Rosensweig instability benchmark
+// Phase field + incompressible flow + scalar-potential magnetic field.
+
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
-#include <cstring>
+
+#include <cmath>
+#include <cstdlib>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 using T = FLOAT;
 using LatSet = D2Q9<T>;
 using MFLatSet = D2Q5<T>;
 using namespace mfield;
 
-// ---- Simulation Parameters ----
-int Ni, Nj;
-T Cell_Len;
-int BlockCellLen, Thread_Num;
+int Thread_Num = 1;
+T RosenPressureScale = T{0.6};
 
-// interface (ferrofluid occupies the bottom 1/3, organic solvent the top 2/3)
-T InterfaceY0, PerturbAmp, PerturbPeriods;
-T Lambda_Seed;
+struct RosenParams {
+  int Ni{}, Nj{}, BlockCellLen{}, ThreadNum{};
+  T CellLen{};
+  T InterfaceY{}, SeedAmplitude{}, SeedPeriods{}, InterfaceWidth{}, Mobility{};
+  T rho_l{}, rho_h{}, eta_l{}, eta_h{}, sigma{}, DeltaRho{}, gravity{};
+  T chi_l{}, chi_h{}, mu_l{}, mu_h{}, H0{}, H0_kAm{}, Hc_kAm{};
+  T HcLat{}, lambdaCLat{};
+  T LxMm{}, LyMm{}, sigmaMm{}, lambdaCMm{};
+  T PhiFloor{}, PhiCeiling{};
+  int PsiSolverIter{};
+  T PsiSolverK{};
+  int PsiWallLayers{}, MagneticForceWallBand{};
+  int MaxStep{}, OutputStep{};
 
-// phase field
-T Interface_Width, Mobility, Tau_phi, Omega_phi, Kappa, Beta;
+  static constexpr T Pi = T{3.1415926535897932384626433832795};
 
-// two-phase (lattice units, paper Sec. III.D)
-T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Tau_ns, DeltaRho;
+  void read(int argc, char** argv) {
+    std::string iniName = "rosensweig2d.ini";
+    T h0Override = T{-1};
+    if (argc > 1) iniName = argv[1];
+    if (argc > 2) h0Override = std::atof(argv[2]);
 
-// magnetic field (lattice units; mu, chi are relative / per-cell)
-T chi_l, chi_h, mu_l, mu_h, H0, Hc_lat;
-T H0_kAm, Hc_kAm;  // physical field strengths (kA/m)
+    iniReader r(iniName);
+    ThreadNum = r.getValue<int>("parallel", "thread_num");
+    Ni = r.getValue<int>("Mesh", "Ni");
+    Nj = r.getValue<int>("Mesh", "Nj");
+    CellLen = r.getValue<T>("Mesh", "Cell_Len");
+    BlockCellLen = r.getValue<int>("Mesh", "BlockCellLen");
 
-// psi-solver: boosted relaxation tau = 0.5 + PsiSolver_K*mu
-int PsiSolver_Iter; T PsiSolver_K;
+    InterfaceY = r.getValue<T>("Interface", "Y0_cells");
+    SeedAmplitude = r.getValue<T>("Interface", "SeedAmplitude_cells");
+    SeedPeriods = r.getValue<T>("Interface", "SeedPeriods");
 
-int MaxStep, OutputStep;
-std::string work_dir;
+    InterfaceWidth = r.getValue<T>("Phase_Field", "InterfaceWidth");
+    Mobility = r.getValue<T>("Phase_Field", "Mobility");
 
-void readParam(int argc, char* argv[]) {
-  std::string ininame = "rosensweig2d.ini";
-  T H0_kAm_override = T{-1};
-  if (argc > 1) ininame = argv[1];
-  if (argc > 2) H0_kAm_override = std::atof(argv[2]);
-  iniReader r(ininame);
-  work_dir = r.getValue<std::string>("workdir","workdir_");
-  Thread_Num = r.getValue<int>("parallel","thread_num");
-  Ni = r.getValue<int>("Mesh","Ni"); Nj = r.getValue<int>("Mesh","Nj");
-  Cell_Len = r.getValue<T>("Mesh","Cell_Len");
-  BlockCellLen = r.getValue<int>("Mesh","BlockCellLen");
-  InterfaceY0 = r.getValue<T>("Interface","Y0");
-  PerturbAmp = r.getValue<T>("Interface","PerturbAmp");
-  PerturbPeriods = r.getValue<T>("Interface","PerturbPeriods");
-  Interface_Width=r.getValue<T>("Phase_Field","Interface_Width");
-  Mobility=r.getValue<T>("Phase_Field","Mobility");
-  rho_l=r.getValue<T>("Two_Phase","rho_l");
-  rho_h=r.getValue<T>("Two_Phase","rho_h");
-  eta_l=r.getValue<T>("Two_Phase","eta_l");
-  eta_h=r.getValue<T>("Two_Phase","eta_h");
-  sigma=r.getValue<T>("Two_Phase","sigma");
-  MaxStep=r.getValue<int>("Simulation_Settings","TotalStep");
-  if (argc > 3) MaxStep = std::atoi(argv[3]);  // TotalStep override
-  OutputStep=r.getValue<int>("Simulation_Settings","OutputStep");
-  // Magnetic
-  chi_l=r.getValue<T>("Magnetic_Field","chi_l");
-  chi_h=r.getValue<T>("Magnetic_Field","chi_h");
-  mu_l=r.getValue<T>("Magnetic_Field","mu_l");
-  mu_h=r.getValue<T>("Magnetic_Field","mu_h");
-  H0_kAm=r.getValue<T>("Magnetic_Field","H0_kAm");
-  Hc_kAm=r.getValue<T>("Magnetic_Field","Hc_kAm");
-  PsiSolver_Iter=r.getValue<int>("Magnetic_Field","PsiSolver_Iter");
-  PsiSolver_K=r.getValue<T>("Magnetic_Field","PsiSolver_K");
-  if(H0_kAm_override>=T{0}) H0_kAm=H0_kAm_override;
-  // Physical reference (Cowley-Rosensweig unit conversion)
-  T Lx_phys_mm = r.getValue<T>("Physical","Lx_mm");
-  T sigma_phys_mNm = r.getValue<T>("Physical","sigma_mNm");
-  T lambda_c_phys_mm = r.getValue<T>("Physical","lambda_c_mm");
+    rho_l = r.getValue<T>("Two_Phase", "rho_l");
+    rho_h = r.getValue<T>("Two_Phase", "rho_h");
+    eta_l = r.getValue<T>("Two_Phase", "eta_l");
+    eta_h = r.getValue<T>("Two_Phase", "eta_h");
+    sigma = r.getValue<T>("Two_Phase", "sigma");
 
-  DeltaRho=rho_h-rho_l;
-  Beta=T(12.0)*sigma/Interface_Width;
-  Kappa=T(3.0)*Interface_Width*sigma*T(0.5);
-  Tau_phi=T(3.0)*Mobility+T(0.5); Omega_phi=T(1.0)/Tau_phi;
-  Tau_ns=T(0.5)+eta_h/rho_h/LatSet::cs2;
-  Lambda_Seed=T(Ni)*Cell_Len/PerturbPeriods;  // integer # of wavelengths across Lx
+    LxMm = r.getValue<T>("Physical", "Lx_mm");
+    LyMm = r.getValue<T>("Physical", "Ly_mm");
+    sigmaMm = r.getValue<T>("Physical", "sigma_mNm");
+    lambdaCMm = r.getValue<T>("Physical", "lambda_c_mm");
 
-  // gravity from the Cowley-Rosensweig critical wavelength:
-  //   lambda_c = 2*pi*sqrt(sigma/(g*DeltaRho))  ->  g = sigma/DeltaRho*(2*pi/lambda_c)^2
-  // with lambda_c_lattice = lambda_c_phys * Ni / Lx_phys (same physical lambda_c).
-  T lambda_c_lattice = lambda_c_phys_mm * T(Ni) / Lx_phys_mm;
-  gravity = sigma / (DeltaRho * std::pow(lambda_c_lattice / (T{2} * T{M_PI}), T{2}));
+    chi_l = r.getValue<T>("Magnetic_Field", "chi_l");
+    chi_h = r.getValue<T>("Magnetic_Field", "chi_h");
+    mu_l = r.getValue<T>("Magnetic_Field", "mu_l");
+    mu_h = r.getValue<T>("Magnetic_Field", "mu_h");
+    H0_kAm = r.getValue<T>("Magnetic_Field", "H0_kAm");
+    Hc_kAm = r.getValue<T>("Magnetic_Field", "Hc_kAm");
+    PsiSolverIter = r.getValue<int>("Magnetic_Field", "PsiSolverIter");
+    PsiSolverK = r.getValue<T>("Magnetic_Field", "PsiSolverK");
 
-  // H0 from physical field strength via critical-field (Bo_m_c) consistency,
-  // the reference-validated conversion: the dimensionless magnetic Bond number
-  //   Bo_m_c = mu0*Hc^2*lambda_c/(2*sigma)   (SI)
-  //   Bo_m_c = Hc_lat^2*lambda_c_lat/(2*sigma_lat)   (mu0 = 1 in lattice)
-  // is preserved between physical and lattice units:
-  //   Hc_lat = Hc_phys*sqrt(mu0*sigma_lat*lambda_c_phys/(sigma_phys*lambda_c_lat))
-  T mu0_phys = T{4} * T{M_PI} * T{1e-7};
-  T Hc_phys_Am = Hc_kAm * T{1e3};
-  T sigma_phys = sigma_phys_mNm * T{1e-3};   // N/m
-  T lambda_c_phys_m = lambda_c_phys_mm * T{1e-3};
-  Hc_lat = std::sqrt(mu0_phys * Hc_phys_Am * Hc_phys_Am *
-                     lambda_c_phys_m * sigma / (sigma_phys * lambda_c_lattice));
-  T H_conv = Hc_lat / Hc_kAm;                // lattice units per (kA/m)
-  H0 = H0_kAm * H_conv;
+    RosenPressureScale = r.getValue<T>("Numerics", "PressureCorrectionScale");
+    PhiFloor = r.getValue<T>("Numerics", "PhiFloor");
+    PhiCeiling = r.getValue<T>("Numerics", "PhiCeiling");
+    PsiWallLayers = r.getValue<int>("Numerics", "PsiWallLayers");
+    MagneticForceWallBand = r.getValue<int>("Numerics", "MagneticForceWallBand");
 
-  MPI_RANK(0){
-    printf("---- Rosensweig Instability of Ferrofluid Layer ----\n");
-    printf("Mesh: %dx%d  BlockCellLen=%d\n",Ni,Nj,BlockCellLen);
-    printf("Interface: y0=%.1f perturb amp=%.2f periods=%.0f lambda_seed=%.2f\n",
-           InterfaceY0,PerturbAmp,PerturbPeriods,Lambda_Seed);
-    printf("rho: l=%.3f h=%.3f  eta: l=%.5f h=%.5f  sigma=%.5f g=%.3e\n",rho_l,rho_h,eta_l,eta_h,sigma,gravity);
-    printf("W=%.1f M=%.3f tau_phi=%.3f tau_ns=%.3f\n",Interface_Width,Mobility,Tau_phi,Tau_ns);
-    printf("Magnetic: chi=(%.1f,%.1f) mu=(%.1f,%.1f) Hc_lat=%.4f\n",chi_l,chi_h,mu_l,mu_h,Hc_lat);
-    printf("H0: phys=%.2f kA/m (Hc=%.2f) -> lat=%.4f\n",H0_kAm,Hc_kAm,H0);
-    printf("PsiWall: ferrofluid H=H0*mu_l/mu_h=%.4f, solvent H=H0=%.4f (layered+evanescent)\n",
-           H0*mu_l/mu_h,H0);
-    printf("PsiSolver: K=%.3f iter=%d (omega_mu=%.3f omega_1=%.3f)\n",PsiSolver_K,PsiSolver_Iter,
-           T{1}/(T{0.5}+PsiSolver_K*mu_h),T{1}/(T{0.5}+PsiSolver_K*mu_l));
-    printf("SeamSync: MPI-aware field sync (v2)\n");
-    printf("---------------------------------------\n");
-  }
-}
+    if (h0Override >= T{0}) H0_kAm = h0Override;
+    MaxStep = r.getValue<int>("Simulation_Settings", "TotalStep");
+    if (argc > 3) MaxStep = std::atoi(argv[3]);
+    OutputStep = r.getValue<int>("Simulation_Settings", "OutputStep");
 
-// ---- PreForceScaled2D ----
-// F_p = -(p/3) * DeltaRho * grad_phi * PrC_SCALE
-// Example-local copy of ff::FFPreForce2D with the reference-validated
-// PrC_SCALE=0.6 (uniform-mesh interface is much thicker than the paper's AMR
-// finest level, so the full PrC=1.0 over-damps and suppresses peak growth;
-// PrC=0.6 gives the correct nonlinear saturation toward the theoretical peak
-// height eta_peak = (lambda_c/4*pi)*sqrt(2*(H0/Hc)^2-2) = 0.454mm).
-// The framework functor stays untouched so bubbleMag2d keeps PrC=1.0.
-template <typename PFCELL, typename NSCELL>
-struct PreForceScaled2D {
-  using T = typename PFCELL::FloatType;
-  using LatSet = typename NSCELL::LatticeSet;
-  __any__ static void apply(PFCELL& pf_cell, NSCELL& ns_cell) {
-    constexpr T PrC_SCALE = T{0.3};
-    T p = ns_cell.template get<PRESSURE<T>>();
-    T delta_rho = pf_cell.template get<ff::DELTARHO<T>>();
-    const Vector<T, LatSet::d>& grad_phi = pf_cell.template get<GRAD<T, LatSet::d>>();
-    T coeff = -p / T{3} * delta_rho * PrC_SCALE;
-    auto& ns_force = ns_cell.template get<FORCE<T, LatSet::d>>();
-    ns_force[0] += coeff * grad_phi[0];
-    ns_force[1] += coeff * grad_phi[1];
+    DeltaRho = rho_h - rho_l;
+    lambdaCLat = lambdaCMm * T(Ni) / LxMm;
+    gravity = sigma /
+      (DeltaRho * std::pow(lambdaCLat / (T{2} * Pi), T{2}));
+
+    const T mu0 = T{4} * Pi * T{1e-7};
+    const T sigmaPhysical = sigmaMm * T{1e-3};
+    const T lambdaPhysical = lambdaCMm * T{1e-3};
+    const T HcPhysical = Hc_kAm * T{1e3};
+    HcLat = std::sqrt(mu0 * HcPhysical * HcPhysical * lambdaPhysical * sigma /
+                      (sigmaPhysical * lambdaCLat));
+    H0 = H0_kAm * HcLat / Hc_kAm;
+
+    MPI_RANK(0) {
+      printf("---- Clean Rosensweig benchmark ----\n");
+      printf("mesh=%dx%d blocks=%d cell=%.3f\n", Ni, Nj, BlockCellLen, CellLen);
+      printf("interface_y=%.3f seed_amp=%.3f seed_periods=%.0f W=%.3f\n",
+             InterfaceY, SeedAmplitude, SeedPeriods, InterfaceWidth);
+      printf("rho=(%.5f,%.5f) eta=(%.5f,%.5f) sigma=%.6g gravity=%.6g\n",
+             rho_l, rho_h, eta_l, eta_h, sigma, gravity);
+      printf("mu=(%.5f,%.5f) chi=(%.5f,%.5f) H0=%.6g HcLat=%.6g\n",
+             mu_l, mu_h, chi_l, chi_h, H0, HcLat);
+      printf("H0 physical=%.4f kA/m, Hc=%.4f kA/m, lambda_c=%.4f cells\n",
+             H0_kAm, Hc_kAm, lambdaCLat);
+      printf("psi_iter=%d psi_K=%.6g pressure_scale=%.6g\n",
+             PsiSolverIter, PsiSolverK, RosenPressureScale);
+      printf("phi_floor=%.6g phi_ceiling=%.6g force_wall_band=%d\n",
+             PhiFloor, PhiCeiling, MagneticForceWallBand);
+      printf("steps=%d output=%d\n", MaxStep, OutputStep);
+      printf("--------------------------------------\n");
+    }
   }
 };
 
-int main(int argc, char* argv[]) {
-  constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
-  mpi().init(&argc,&argv); MPI_DEBUG_WAIT
-  Printer::Print_BigBanner(std::string("Initializing Rosensweig Instability..."));
-  readParam(argc,argv);
+template <typename PFCELL, typename NSCELL>
+struct RosenPressureForce2D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename NSCELL::LatticeSet;
 
-  // -- converters --
-  BaseConverter<T> BaseConv(LatSet::cs2);
-  BaseConv.SimplifiedConverterFromRT(Ni,T(0.01),Tau_ns);
-  BaseConverter<T> PFBaseConv(LatSet::cs2);
-  PFBaseConv.SimplifiedConverterFromRT(Ni,T(0.01),Tau_phi);
-  BaseConverter<T> MFBaseConv(MFLatSet::cs2);
-  MFBaseConv.SimplifiedConverterFromRT(Ni,T(0.01),T(1.0));
-  UnitConvManager<T> ConvManager(&BaseConv); ConvManager.Check_and_Print();
-
-  // -- geometry --
-  AABB<T,2> domain({0,0},{T(Ni*Cell_Len),T(Nj*Cell_Len)});
-  AABB<T,2> left({T(-Cell_Len),0},{0,T(Nj*Cell_Len)});
-  AABB<T,2> right({T(Ni*Cell_Len),0},{T((Ni+1)*Cell_Len),T(Nj*Cell_Len)});
-  BlockGeometryHelper2D<T> GeoHelper(Ni,Nj,domain,Cell_Len,BlockCellLen);
-  GeoHelper.CreateBlocks(8,16);
-  GeoHelper.AdaptiveOptimization(mpi().getSize());
-  GeoHelper.LoadBalancing(mpi().getSize());
-  BlockGeometry2D<T> Geo(GeoHelper);
-
-  // -- flag --
-  BlockFieldManager<FLAG,T,2> FlagFM(Geo,VoidFlag);
-  FlagFM.forEach(domain,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
-  FlagFM.forEach(left,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
-  FlagFM.forEach(right,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
-  FlagFM.template SetupBoundary<LatSet>(domain,BouncebackFlag);
-  // FIX: SetupBoundary marks ALL domain-boundary cells (including the left/
-  // right columns x=0 and x=Ni-1) as BouncebackFlag because their periodic
-  // ghost neighbors lie outside the domain AABB. This would treat the left/
-  // right boundaries as no-slip walls instead of periodic, causing boundary
-  // artifacts and premature peak growth at the seam. Reset those two columns
-  // to BulkFlag (the corner rows keep the top/bottom wall BC).
-  AABB<T,2> left_col({T{0},Cell_Len},{Cell_Len,T((Nj-1)*Cell_Len)});
-  AABB<T,2> right_col({T((Ni-1)*Cell_Len),Cell_Len},{T(Ni*Cell_Len),T((Nj-1)*Cell_Len)});
-  FlagFM.forEach(left_col,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
-  FlagFM.forEach(right_col,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
-
-  // -- NS lattice --
-  using NSFIELDS=TypePack<DENSITY<T>,VELOCITY<T,2>,POP<T,LatSet::q>,FORCE<T,2>,OMEGA<T>,PRESSURE<T>>;
-  T omega_ns=T{1}/Tau_ns;
-  ValuePack NSI(T{1},Vector<T,2>{0,0},T{},Vector<T,2>{0,0},omega_ns,T{});
-  using NSCELL=Cell<T,LatSet,NSFIELDS>;
-  BlockLatticeManager<T,LatSet,NSFIELDS> NSLattice(Geo,NSI,BaseConv);
-
-  // -- PF lattice --
-  using PFFIELDS=TypePack<PHI<T>,POP<T,LatSet::q>,GRAD<T,2>,NORMAL<T,2>,INTERFACEWIDTH<T>,
-    ff::LAPLACIAN<T>,ff::CHEMICALPOTENTIAL<T>,
-    ff::GRAVITY<T>,ff::BETA<T>,ff::KAPPA<T>,
-    ff::RHO_L<T>,ff::RHO_H<T>,ff::ETA_L<T>,ff::ETA_H<T>,ff::DELTARHO<T>>;
-  using PFREF=TypePack<VELOCITY<T,2>>;
-  using PFPACK=TypePack<PFFIELDS,PFREF>;
-  ValuePack PFI(T{},T{},Vector<T,2>{0,0},Vector<T,2>{0,0},Interface_Width,
-    T{},T{},gravity,Beta,Kappa,rho_l,rho_h,eta_l,eta_h,DeltaRho);
-  using PFCELL=Cell<T,LatSet,ExtractFieldPack<PFPACK>::mergedpack>;
-  BlockLatticeManager<T,LatSet,PFPACK> PFLattice(Geo,PFI,PFBaseConv,
-    &NSLattice.getField<VELOCITY<T,2>>());
-
-  ff::BroadcastAllParams<T>(PFLattice,rho_l,rho_h,eta_l,eta_h,gravity,Beta,Kappa);
-  PFLattice.template getField<ff::DELTARHO<T>>().InitValue(DeltaRho);
-
-  // -- MF lattice (D2Q5) --
-  using MFFIELDS=TypePack<PSI<T>,OMEGA_PSI<T>,MU_PERCELL<T>,CHI_PERCELL<T>,
-    HX<T>,HY<T>,HMAG<T>,POP<T,MFLatSet::q>,
-    MU_L<T>,MU_H<T>,CHI_L<T>,CHI_H<T>,H_0<T>,PSI_K<T>>;
-  using MFREF=TypePack<PHI<T>>;
-  using MFPACK=TypePack<MFFIELDS,MFREF>;
-  ValuePack MFI(T{},T{1.0},T{mu_l},T{chi_l},T{},T{},T{},T{},
-    mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
-  using MFCELL=Cell<T,MFLatSet,ExtractFieldPack<MFPACK>::mergedpack>;
-  BlockLatticeManager<T,MFLatSet,MFPACK> MFLattice(Geo,MFI,MFBaseConv,
-    &PFLattice.getField<PHI<T>>());
-  BroadcastAllMFParams<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
-  MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
-
-  // -- init phi: ferrofluid (phi=1) below flat interface + cos perturbation --
-  T y0_iface=InterfaceY0*Cell_Len, W_phys=Interface_Width*Cell_Len;
-  T amp_iface=PerturbAmp*Cell_Len;
-  T lam_iface=Lambda_Seed;
-  const T Pi=T{3.14159265358979323846};
-  auto& phiField=PFLattice.getField<PHI<T>>();
-  for(int b=0;b<Geo.getBlockNum();++b){
-    const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-    auto& bPhi=phiField.getBlockField(b);
-    T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1];
-    int ov=0;
-    for(int j=ov;j<bk.getNy()-ov;++j){
-      T y=my+T(j)*vs;
-      for(int i=ov;i<bk.getNx()-ov;++i){
-        T x=mx+T(i)*vs;
-        T ys=y0_iface+amp_iface*std::cos(T{2.0}*Pi*x/lam_iface);
-        T phi=T{0.5}-T{0.5}*std::tanh(T{2.0}*(y-ys)/W_phys);
-        bPhi.get(j*pr[1]+i)=phi;
-      }
-    }
+  __any__ static void apply(PFCELL& pfCell, NSCELL& nsCell) {
+    const T pressure = nsCell.template get<PRESSURE<T>>();
+    const T deltaRho = pfCell.template get<ff::DELTARHO<T>>();
+    const auto& gradPhi = pfCell.template get<GRAD<T, LatSet::d>>();
+    const T coefficient = -pressure * deltaRho * RosenPressureScale / T{3};
+    auto& force = nsCell.template get<FORCE<T, LatSet::d>>();
+    force[0] += coefficient * gradPhi[0];
+    force[1] += coefficient * gradPhi[1];
   }
-  // init PF pops
-  for(int b=0;b<Geo.getBlockNum();++b){
-    auto& bl=PFLattice.getBlockLat(b); auto& bPhi=phiField.getBlockField(b);
-    const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-    int ov=0;
-    for(int j=ov;j<bk.getNy()-ov;++j)
-      for(int i=ov;i<bk.getNx()-ov;++i){
-        std::size_t id=j*pr[1]+i; PFCELL c(id,bl); T phi=bPhi.get(id);
-        for(unsigned k=0;k<LatSet::q;++k) c[k]=latset::w<LatSet>(k)*phi*(T{1}+LatSet::InvCs2*T{0});
-      }
-  }
-  PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
+};
 
-  // init NS pops (p=0, u=0)
-  Vector<T,2> uz{0,0}; T pz=0;
-  for(int b=0;b<Geo.getBlockNum();++b){
-    auto& bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-    int ov=0;
-    for(int j=ov;j<bk.getNy()-ov;++j)
-      for(int i=ov;i<bk.getNx()-ov;++i){
-        std::size_t id=j*pr[1]+i; NSCELL c(id,bl);
-        for(unsigned k=0;k<LatSet::q;++k){
-          T uc=uz*latset::c<LatSet>(k);
-          c[k]=latset::w<LatSet>(k)*(pz+LatSet::InvCs2*uc+uc*uc*T{0.5}*LatSet::InvCs4-LatSet::InvCs2*T{0});
-        }
-      }
-  }
+int main(int argc, char** argv) {
+  constexpr std::uint8_t VoidFlag = 1;
+  constexpr std::uint8_t BulkFlag = 2;
+  constexpr std::uint8_t BouncebackFlag = 4;
+  constexpr std::uint8_t PeriodicFlag = 8;
 
-  // init MF: flat-interface layered solution + analytical evanescent
-  // perturbation correction (validated in the reference Rosen implementation).
-  //   Below (y<y0, ferrofluid): psi = -Hbelow*y + Cb*cos(kx)*exp(k(y-y0))
-  //   Above (y>y0, solvent):    psi = psi_y0 - H0*(y-y0) + Ca*cos(kx)*exp(-k(y-y0))
-  // with Hbelow = H0*mu_l/mu_h (B = mu*H continuous across the interface,
-  // mu0=1). Pinning a single linear slope at both walls (bubble-style)
-  // violates mu*dpsi/dy continuity and leaves |H| = H0 inside the ferrofluid
-  // (mu_r^2 too strong a force). The evanescent mode is an exact fixed point
-  // of the D2Q5 diffusion solver: it must be seeded in the initial field and
-  // maintained by the wall BC, or the correct magnetic-force variation for the
-  // wavy interface is lost.
-  const T y0_lat = InterfaceY0 * Cell_Len;
-  const T Hbelow = H0 * mu_l / mu_h;
-  const T psi_y0 = -Hbelow * y0_lat;
-  const T wk_bc  = T{2} * T{Pi} * PerturbPeriods / (T(Ni) * Cell_Len);
-  const T mu_ratio = mu_l / mu_h;
-  const T Ca_bc = PerturbAmp * Cell_Len * H0 * (T{1} - mu_ratio) * mu_h / (mu_h + mu_l);
-  const T Cb_bc = -mu_ratio * Ca_bc;
-  {
-    auto& psiF=MFLattice.getField<PSI<T>>();
-    for(int b=0;b<Geo.getBlockNum();++b){
-      auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-      auto& bPsi=psiF.getBlockField(b);
-      T vs=bk.getVoxelSize(),my=bk.getMin()[1],mx=bk.getMin()[0];
-      for(int j=0;j<bk.getNy();++j){
-        T y=my+T(j)*vs;
-        for(int i=0;i<bk.getNx();++i){
-          T x=mx+T(i)*vs;
-          T psi_flat, dpsi;
-          if(y>=y0_lat){ psi_flat = psi_y0 - H0*(y-y0_lat);
-                         dpsi = Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat)); }
-          else         { psi_flat = -Hbelow*y;
-                         dpsi = Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat)); }
-          T psi=psi_flat+dpsi;
-          std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
-          for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi;
-          bPsi.get(id)=psi;
-        }
+  mpi().init(&argc, &argv);
+  MPI_DEBUG_WAIT
+
+  RosenParams p;
+  p.read(argc, argv);
+  Thread_Num = p.ThreadNum;
+
+  BaseConverter<T> NSConv(LatSet::cs2);
+  const T tauNS = T{0.5} + p.eta_h / p.rho_h / LatSet::cs2;
+  NSConv.SimplifiedConverterFromRT(p.Ni, T{0.01}, tauNS);
+  BaseConverter<T> PFConv(LatSet::cs2);
+  const T tauPhi = T{0.5} + T{3} * p.Mobility;
+  PFConv.SimplifiedConverterFromRT(p.Ni, T{0.01}, tauPhi);
+  BaseConverter<T> MFConv(MFLatSet::cs2);
+  MFConv.SimplifiedConverterFromRT(p.Ni, T{0.01}, T{1});
+
+  AABB<T, 2> domain({0, 0}, {T(p.Ni) * p.CellLen, T(p.Nj) * p.CellLen});
+  AABB<T, 2> left({-p.CellLen, 0}, {0, T(p.Nj) * p.CellLen});
+  AABB<T, 2> right({T(p.Ni) * p.CellLen, 0},
+                   {T(p.Ni + 1) * p.CellLen, T(p.Nj) * p.CellLen});
+  BlockGeometryHelper2D<T> geoHelper(
+    p.Ni, p.Nj, domain, p.CellLen, p.BlockCellLen);
+  geoHelper.CreateBlocks(8, 16);
+  geoHelper.AdaptiveOptimization(mpi().getSize());
+  geoHelper.LoadBalancing(mpi().getSize());
+  BlockGeometry2D<T> geo(geoHelper);
+
+  BlockFieldManager<FLAG, T, 2> flags(geo, VoidFlag);
+  flags.forEach(domain, [&](FLAG& flag, std::size_t id) {
+    flag.SetField(id, BulkFlag);
+  });
+  flags.forEach(left, [&](FLAG& flag, std::size_t id) {
+    flag.SetField(id, PeriodicFlag);
+  });
+  flags.forEach(right, [&](FLAG& flag, std::size_t id) {
+    flag.SetField(id, PeriodicFlag);
+  });
+  flags.template SetupBoundary<LatSet>(domain, BouncebackFlag);
+  AABB<T, 2> leftColumn({0, p.CellLen},
+                        {p.CellLen, T(p.Nj - 1) * p.CellLen});
+  AABB<T, 2> rightColumn({T(p.Ni - 1) * p.CellLen, p.CellLen},
+                         {T(p.Ni) * p.CellLen,
+                          T(p.Nj - 1) * p.CellLen});
+  flags.forEach(leftColumn, [&](FLAG& flag, std::size_t id) {
+    flag.SetField(id, BulkFlag);
+  });
+  flags.forEach(rightColumn, [&](FLAG& flag, std::size_t id) {
+    flag.SetField(id, BulkFlag);
+  });
+
+  using NSFIELDS = TypePack<
+    DENSITY<T>, VELOCITY<T, 2>, POP<T, LatSet::q>, FORCE<T, 2>,
+    OMEGA<T>, PRESSURE<T>>;
+  ValuePack NSInit(
+    T{1}, Vector<T, 2>{0, 0}, T{}, Vector<T, 2>{0, 0}, T{1} / tauNS, T{});
+  using NSCELL = Cell<T, LatSet, NSFIELDS>;
+  BlockLatticeManager<T, LatSet, NSFIELDS> NS(geo, NSInit, NSConv);
+
+  using PFFIELDS = TypePack<
+    PHI<T>, POP<T, LatSet::q>, GRAD<T, 2>, NORMAL<T, 2>, INTERFACEWIDTH<T>,
+    ff::LAPLACIAN<T>, ff::CHEMICALPOTENTIAL<T>, ff::GRAVITY<T>, ff::BETA<T>,
+    ff::KAPPA<T>, ff::RHO_L<T>, ff::RHO_H<T>, ff::ETA_L<T>, ff::ETA_H<T>,
+    ff::DELTARHO<T>>;
+  using PFREF = TypePack<VELOCITY<T, 2>>;
+  using PFPACK = TypePack<PFFIELDS, PFREF>;
+  T beta = T{12} * p.sigma / p.InterfaceWidth;
+  T kappa = T{3} * p.InterfaceWidth * p.sigma / T{2};
+  ValuePack PFInit(
+    T{}, T{}, Vector<T, 2>{0, 0}, Vector<T, 2>{0, 0}, p.InterfaceWidth,
+    T{}, T{}, p.gravity, beta, kappa, p.rho_l, p.rho_h,
+    p.eta_l, p.eta_h, p.DeltaRho);
+  using PFCELL = Cell<T, LatSet, ExtractFieldPack<PFPACK>::mergedpack>;
+  BlockLatticeManager<T, LatSet, PFPACK> PF(
+    geo, PFInit, PFConv, &NS.getField<VELOCITY<T, 2>>());
+  ff::BroadcastAllParams<T>(
+    PF, p.rho_l, p.rho_h, p.eta_l, p.eta_h, p.gravity, beta, kappa);
+  PF.getField<ff::DELTARHO<T>>().InitValue(p.DeltaRho);
+
+  using MFFIELDS = TypePack<
+    PSI<T>, OMEGA_PSI<T>, MU_PERCELL<T>, CHI_PERCELL<T>, HX<T>, HY<T>,
+    HMAG<T>, POP<T, MFLatSet::q>, MU_L<T>, MU_H<T>, CHI_L<T>, CHI_H<T>,
+    H_0<T>, PSI_K<T>>;
+  using MFREF = TypePack<PHI<T>>;
+  using MFPACK = TypePack<MFFIELDS, MFREF>;
+  ValuePack MFInit(
+    T{}, T{1}, T{p.mu_l}, T{p.chi_l}, T{}, T{}, T{}, T{},
+    p.mu_l, p.mu_h, p.chi_l, p.chi_h, p.H0, p.PsiSolverK);
+  using MFCELL = Cell<T, MFLatSet, ExtractFieldPack<MFPACK>::mergedpack>;
+  BlockLatticeManager<T, MFLatSet, MFPACK> MF(
+    geo, MFInit, MFConv, &PF.getField<PHI<T>>());
+  BroadcastAllMFParams<T>(
+    MF, p.mu_l, p.mu_h, p.chi_l, p.chi_h, p.H0, p.PsiSolverK);
+  MF.getField<OMEGA_PSI<T>>().InitValue(T{1});
+
+  const T y0 = p.InterfaceY * p.CellLen;
+  const T width = p.InterfaceWidth * p.CellLen;
+  const T domainHeight = T(p.Nj) * p.CellLen;
+  const T domainWidth = T(p.Ni) * p.CellLen;
+  const T waveNumber = T{2} * RosenParams::Pi * p.SeedPeriods / domainWidth;
+
+  auto& phiField = PF.getField<PHI<T>>();
+  for (int b = 0; b < geo.getBlockNum(); ++b) {
+    const auto& block = geo.getBlock(b);
+    const auto& projection = block.getProjection();
+    auto& blockPhi = phiField.getBlockField(b);
+    const T voxel = block.getVoxelSize();
+    const T minX = block.getMin()[0];
+    const T minY = block.getMin()[1];
+    for (int j = 0; j < block.getNy(); ++j) {
+      const T y = minY + T(j) * voxel;
+      for (int i = 0; i < block.getNx(); ++i) {
+        const T x = minX + T(i) * voxel;
+        const T interfaceY = y0 + p.SeedAmplitude * p.CellLen *
+          std::cos(waveNumber * x);
+        blockPhi.get(j * projection[1] + i) =
+          T{0.5} - T{0.5} * std::tanh(T{2} * (y - interfaceY) / width);
       }
     }
   }
 
-  // -- BCs --
-  using LM_NS=BlockLatticeManager<T,LatSet,NSFIELDS>;
-  using LM_PF=BlockLatticeManager<T,LatSet,PFPACK>;
-  using LM_MF=BlockLatticeManager<T,MFLatSet,MFPACK>;
-  using FM=BlockFieldManager<FLAG,T,2>;
-
-  BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>,LM_NS,FM>
-    NS_BB("NS_BB",NSLattice,FlagFM,BouncebackFlag,VoidFlag);
-  BBLikeFixedBlockBdManager<bounceback::normal<PFCELL>,LM_PF,FM>
-    PF_BB("PF_BB",PFLattice,FlagFM,BouncebackFlag,VoidFlag);
-
-  FixedPeriodicBoundaryManager<LM_NS,FM> NS_Per("NS_Per",NSLattice,FlagFM,PeriodicFlag,VoidFlag);
-  NS_Per.Setup(left,NbrDirection::XN,right,NbrDirection::XP);
-  NS_Per.Setup(right,NbrDirection::XP,left,NbrDirection::XN);
-  FixedPeriodicBoundaryManager<LM_PF,FM> PF_Per("PF_Per",PFLattice,FlagFM,PeriodicFlag,VoidFlag);
-  PF_Per.Setup(left,NbrDirection::XN,right,NbrDirection::XP);
-  PF_Per.Setup(right,NbrDirection::XP,left,NbrDirection::XN);
-  FixedPeriodicBoundaryManager<LM_MF,FM> MF_Per("MF_Per",MFLattice,FlagFM,PeriodicFlag,VoidFlag);
-  MF_Per.Setup(left,NbrDirection::XN,right,NbrDirection::XP);
-  MF_Per.Setup(right,NbrDirection::XP,left,NbrDirection::XN);
-#ifdef MPI_ENABLED
-  NS_Per.SetupMPI(GeoHelper); PF_Per.SetupMPI(GeoHelper); MF_Per.SetupMPI(GeoHelper);
-#endif
-
-  // -- PF tasks --
-  using PFNT=tmp::Key_TypePair<BulkFlag,ff::FF2D<PFCELL>>;
-  using PFLT=tmp::Key_TypePair<BulkFlag,ff::FFLaplacian2D<PFCELL>>;
-  using PFCT=tmp::Key_TypePair<BulkFlag,ff::FFChemPotential2D<PFCELL>>;
-  using PFSelN=TaskSelector<std::uint8_t,PFCELL,PFNT>;
-  using PFSelL=TaskSelector<std::uint8_t,PFCELL,PFLT>;
-  using PFSelC=TaskSelector<std::uint8_t,PFCELL,PFCT>;
-  using PFColT=tmp::Key_TypePair<BulkFlag,
-    collision::MRTSource<equilibrium::FirstOrder<PFCELL>,NORMAL<T,2>,true,true>>;
-  using PFPerT=tmp::Key_TypePair<PeriodicFlag,collision::PeriodicBoundary<PFCELL>>;
-  using PFAll=tmp::TupleWrapper<PFColT,PFPerT>;
-  using PFSel=tmp::TaskSelector<PFAll,std::uint8_t,PFCELL>;
-
-  // -- NS tasks --
-  using NSMT=tmp::Key_TypePair<BulkFlag,collision::MRTForce<NSCELL,FORCE<T,2>>>;
-  using NSPT=tmp::Key_TypePair<PeriodicFlag,collision::PeriodicBoundary<NSCELL>>;
-  using NSAll=tmp::TupleWrapper<NSMT,NSPT>;
-  using NSSel=tmp::TaskSelector<NSAll,std::uint8_t,NSCELL>;
-
-  // -- Coupling tasks --
-  using STT=tmp::Key_TypePair<BulkFlag,ff::FFSurfaceTension2D<PFCELL,NSCELL>>;
-  BlockLatManagerCoupling STC(PFLattice,NSLattice);
-  using GrT=tmp::Key_TypePair<BulkFlag,ff::FFGravityForce2D<PFCELL,NSCELL>>;
-  BlockLatManagerCoupling GrC(PFLattice,NSLattice);
-  using PrT=tmp::Key_TypePair<BulkFlag,PreForceScaled2D<PFCELL,NSCELL>>;
-  BlockLatManagerCoupling PrC(PFLattice,NSLattice);
-  using ViT=tmp::Key_TypePair<BulkFlag,ff::FFViscoForce2D<PFCELL,NSCELL>>;
-  BlockLatManagerCoupling ViC(PFLattice,NSLattice);
-  using RoT=tmp::Key_TypePair<BulkFlag,ff::FFRhoOmegaUpdate2D<PFCELL,NSCELL>>;
-  BlockLatManagerCoupling RoC(PFLattice,NSLattice);
-
-  // MF coupling: PF→MF (coeff update)
-  using MCT=tmp::Key_TypePair<BulkFlag,MFUpdateCoeffs2D<PFCELL,MFCELL>>;
-  using MCSel=CoupledTaskSelector<std::uint8_t,PFCELL,MFCELL,MCT>;
-  BlockLatManagerCoupling MCC(PFLattice,MFLattice);
-
-  // Writers
-  vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-  vtmo::ScalarWriter PS("PSI",MFLattice.getField<PSI<T>>());
-  vtmo::VectorWriter VW("Velocity",NSLattice.getField<VELOCITY<T,2>>());
-  vtmo::ScalarWriter Dw("Density",NSLattice.getField<DENSITY<T>>());
-  vtmo::VectorWriter Fw("Force",NSLattice.getField<FORCE<T,2>>());
-  vtmo::ScalarWriter Hxw("HX",MFLattice.getField<HX<T>>());
-  vtmo::ScalarWriter Hyw("HY",MFLattice.getField<HY<T>>());
-  // Keep the default output (1 ghost column per side): ParaView needs the
-  // overlapping columns to tile the blocks seamlessly (no gaps between blocks).
-  vtmo::vtmWriter<T,2> MW("rosensweig2d",Geo);
-  MW.addWriterSet(PW,PS,VW,Dw,Fw,Hxw,Hyw);
-
-  // ===== initial setup =====
-  PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
-  NS_Per.Apply(); PF_Per.Apply();
-
-  PFLattice.template ApplyInnerCellDynamics<PFSelN>(FlagFM);
-  PFLattice.template ApplyInnerCellDynamics<PFSelL>(FlagFM);
-  PFLattice.template ApplyInnerCellDynamics<PFSelC>(FlagFM);
-  PFLattice.getField<NORMAL<T,2>>().Communicate();
-  PFLattice.getField<GRAD<T,2>>().Communicate();
-  ff::CommunicateAllSelfFields<T>(PFLattice);
-  RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(0,FlagFM);
-  MW.WriteBinary(0);
-
-  Printer::Print_BigBanner(std::string("Start Calculation..."));
-  Timer t; Timer ot;
-  T H_global=T(Nj)*Cell_Len;
-  const T phiBottom=T{1};  // ferrofluid wets the bottom wall
-  const T phiTop=T{0};     // organic solvent at the top wall
-
-  while(t()<MaxStep){
-    // ===== Phase 0: Magnetic field solve =====
-    // 0a: Update per-cell mu, chi, omega_psi from phi
-    MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
-    CommunicateOMEGAPSI<T>(MFLattice);
-
-    // 0b: Set wall psi to the layered far field + evanescent perturbation
-    // correction (see the init block for the formulas) and wall pops =
-    // feq(psi_bc) (Dirichlet pinning). The evanescent term keeps the wall BC
-    // from draining the seeded perturbation.
-    {
-      auto& psiF=MFLattice.getField<PSI<T>>();
-      const T nwall=Cell_Len*T{3.0};
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bPsi=psiF.getBlockField(b);
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T minY=bk.getMin()[1],minX=bk.getMin()[0],vs=bk.getVoxelSize();
-        for(int jj=0;jj<ny;++jj){
-          T y=minY+T(jj-ov)*vs;
-          if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
-            for(int ii=0;ii<nx;++ii){
-              T x=minX+T(ii)*vs;
-              T psi_w;
-              if(y<=nwall) psi_w = -Hbelow*y + Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat));
-              else         psi_w = psi_y0 - H0*(y-y0_lat) + Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat));
-              std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-              for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-              bPsi.get(id)=psi_w;
-            }
-          }
+  for (int b = 0; b < geo.getBlockNum(); ++b) {
+    auto& blockLat = PF.getBlockLat(b);
+    auto& blockPhi = phiField.getBlockField(b);
+    const auto& block = geo.getBlock(b);
+    const auto& projection = block.getProjection();
+    for (int j = 0; j < block.getNy(); ++j) {
+      for (int i = 0; i < block.getNx(); ++i) {
+        const std::size_t id = j * projection[1] + i;
+        PFCELL cell(id, blockLat);
+        const T phi = blockPhi.get(id);
+        for (unsigned k = 0; k < LatSet::q; ++k) {
+          cell[k] = latset::w<LatSet>(k) * phi;
         }
       }
     }
+  }
+  PF.getField<INTERFACEWIDTH<T>>().InitValue(p.InterfaceWidth);
 
-    // SyncSeamField: mirror the physical edge columns of a per-cell field
-    // across the periodic seam into the opposite x-wrapped ghost columns.
-    // The framework's FixedPeriodicBoundaryManager copies only pops + GenericRho,
-    // so the wrapped ghost columns of PSI/HX/HY/HMAG/VELOCITY/... stay frozen;
-    // and a local-only mirror (bubbleMag2d's SyncMFPeriodicGhosts) fails when
-    // the seam blocks live on different ranks. This version handles both:
-    // same-rank pairs are copied directly, cross-rank pairs exchange via MPI.
-    // (Block-interior ghosts are already filled by the per-field Communicate.)
-    auto SyncSeamField = [&](auto& field) {
-      using ValT = typename std::decay_t<decltype(field.getBlockField(0))>::value_type;
-      const int valSz = static_cast<int>(sizeof(ValT));
-      const T Lx = T(Ni) * Cell_Len;
-      const int myRank = mpi().getRank();
-      const auto& gGeo = GeoHelper.getBlockGeometry();
-      const int nb = Geo.getBlockNum();
-#ifdef MPI_ENABLED
-      std::vector<std::vector<char>> sendBufs, recvBufs;
-      std::vector<MPI_Request> sendReqs, recvReqs;
-      std::vector<std::pair<int, int>> recvJobs;  // (localBlock, ghostCol0)
-#endif
-      for (int b = 0; b < nb; ++b) {
-        const auto& bk = Geo.getBlock(b);
-        const bool atL = bk.getMin()[0] < Cell_Len * T{0.5};
-        const bool atR = bk.getMax()[0] > Lx - Cell_Len * T{0.5};
-        if (!atL && !atR) continue;
-        const int nx = bk.getNx(), ny = bk.getNy(), ov = bk.getOverlap();
-        const auto& pr = bk.getProjection();
-        // counterpart: global edge block on the opposite side with same y-range
-        const T ymid = (bk.getMin()[1] + bk.getMax()[1]) * T{0.5};
-        const T xprobe = atL ? (Lx - Cell_Len * T{0.5}) : (Cell_Len * T{0.5});
-        int srcGid = -1;
-        for (std::size_t sbi = 0; sbi < gGeo.getBlockNum(); ++sbi) {
-          const auto& gb = gGeo.getBlock(sbi);
-          if (gb.getSelfBlock().isInside(Vector<T, 2>{xprobe, ymid})) {
-            srcGid = gb.getBlockId(); break;
-          }
-        }
-        if (srcGid < 0) continue;
-        const int ghostCol0 = atL ? 0 : nx - ov;
-        const int theirPhysCol = atL ? (nx - 1 - ov) : ov;
-        if (GeoHelper.whichRank(srcGid) == myRank) {
-          // same-rank: direct copy (counterpart is a local block)
-          const int srcBlock = Geo.findBlockIndex(srcGid);
-          auto& bF = field.getBlockField(b);
-          auto& sF = field.getBlockField(srcBlock);
-          for (int j = 0; j < ny; ++j) {
-            const ValT v = sF.get(j * pr[1] + theirPhysCol);
-            for (int c = 0; c < ov; ++c) bF.get(j * pr[1] + ghostCol0 + c) = v;
-          }
-        } else {
-          // cross-rank: exchange my physical edge column with the counterpart's
-#ifdef MPI_ENABLED
-          const int myPhysCol = atL ? ov : nx - 1 - ov;
-          std::vector<char> snd(ny * valSz);
-          auto& bF = field.getBlockField(b);
-          for (int j = 0; j < ny; ++j) {
-            const ValT v = bF.get(j * pr[1] + myPhysCol);
-            std::memcpy(&snd[j * valSz], &v, valSz);
-          }
-          sendBufs.emplace_back(std::move(snd));
-          MPI_Request sreq;
-          mpi().iSend(sendBufs.back().data(), static_cast<int>(sendBufs.back().size()),
-                      GeoHelper.whichRank(srcGid), &sreq, 9500 + bk.getBlockId());
-          sendReqs.push_back(sreq);
-          recvBufs.emplace_back(ny * valSz);
-          recvJobs.emplace_back(b, ghostCol0);
-          MPI_Request rreq;
-          mpi().iRecv(recvBufs.back().data(), static_cast<int>(recvBufs.back().size()),
-                      GeoHelper.whichRank(srcGid), &rreq, 9500 + srcGid);
-          recvReqs.push_back(rreq);
-#endif
+  for (int b = 0; b < geo.getBlockNum(); ++b) {
+    auto& blockLat = NS.getBlockLat(b);
+    const auto& block = geo.getBlock(b);
+    const auto& projection = block.getProjection();
+    for (int j = 0; j < block.getNy(); ++j) {
+      for (int i = 0; i < block.getNx(); ++i) {
+        NSCELL cell(j * projection[1] + i, blockLat);
+        for (unsigned k = 0; k < LatSet::q; ++k) {
+          // 必须从零压初始化（与旧版 pz=0 一致）：w*(-3) 给出负密度/负压力，
+          // 压力修正力 -p*DeltaRho/3*grad_phi 会被负 p 反向放大，界面整体
+          // 上漂直至淹没顶壁，导致峰/谷提取全部为 0。
+          cell[k] = T{0};
         }
       }
-#ifdef MPI_ENABLED
-      MPI_Waitall(static_cast<int>(sendReqs.size()), sendReqs.data(), MPI_STATUSES_IGNORE);
-      for (std::size_t i = 0; i < recvReqs.size(); ++i) {
-        MPI_Wait(&recvReqs[i], MPI_STATUS_IGNORE);
-        auto& bF = field.getBlockField(recvJobs[i].first);
-        const auto& bk = Geo.getBlock(recvJobs[i].first);
-        const auto& pr = bk.getProjection();
-        const int ov = bk.getOverlap();
-        const int gCol0 = recvJobs[i].second;
-        const auto& buf = recvBufs[i];
-        for (int j = 0; j < bk.getNy(); ++j) {
-          ValT v;
-          std::memcpy(&v, &buf[j * valSz], valSz);
-          for (int c = 0; c < ov; ++c) bF.get(j * pr[1] + gCol0 + c) = v;
+    }
+  }
+
+  // Seed the exact flat-interface solution plus the evanescent field of the
+  // initial cosine perturbation. This removes a long magnetic transient while
+  // keeping the boundary data tied to the declared initial interface.
+  const T hBelow = p.H0 * p.mu_l / p.mu_h;
+  const T psiAtY0 = -hBelow * y0;
+  const T muRatio = p.mu_l / p.mu_h;
+  const T ca = p.SeedAmplitude * p.CellLen * p.H0 * (T{1} - muRatio) *
+    p.mu_h / (p.mu_h + p.mu_l);
+  const T cb = -muRatio * ca;
+  auto seedPsi = [&](T x, T y) {
+    if (y >= y0) {
+      return psiAtY0 - p.H0 * (y - y0) +
+        ca * std::cos(waveNumber * x) * std::exp(-waveNumber * (y - y0));
+    }
+    return -hBelow * y +
+      cb * std::cos(waveNumber * x) * std::exp(waveNumber * (y - y0));
+  };
+  auto& psiField = MF.getField<PSI<T>>();
+  for (int b = 0; b < geo.getBlockNum(); ++b) {
+    auto& blockLat = MF.getBlockLat(b);
+    const auto& block = geo.getBlock(b);
+    const auto& projection = block.getProjection();
+    const T voxel = block.getVoxelSize();
+    const T minX = block.getMin()[0];
+    const T minY = block.getMin()[1];
+    auto& blockPsi = psiField.getBlockField(b);
+    for (int j = 0; j < block.getNy(); ++j) {
+      const T y = minY + T(j) * voxel;
+      for (int i = 0; i < block.getNx(); ++i) {
+        const T x = minX + T(i) * voxel;
+        const T psi = seedPsi(x, y);
+        const std::size_t id = j * projection[1] + i;
+        MFCELL cell(id, blockLat);
+        for (unsigned k = 0; k < MFLatSet::q; ++k) {
+          cell[k] = latset::w<MFLatSet>(k) * psi;
         }
+        blockPsi.get(id) = psi;
       }
+    }
+  }
+
+  using LM_NS = BlockLatticeManager<T, LatSet, NSFIELDS>;
+  using LM_PF = BlockLatticeManager<T, LatSet, PFPACK>;
+  using LM_MF = BlockLatticeManager<T, MFLatSet, MFPACK>;
+  using FM = BlockFieldManager<FLAG, T, 2>;
+  BBLikeFixedBlockBdManager<bounceback::normal<NSCELL>, LM_NS, FM>
+    NSBounce("NSBounce", NS, flags, BouncebackFlag, VoidFlag);
+  BBLikeFixedBlockBdManager<bounceback::normal<PFCELL>, LM_PF, FM>
+    PFBounce("PFBounce", PF, flags, BouncebackFlag, VoidFlag);
+
+  FixedPeriodicBoundaryManager<LM_NS, FM> NSPeriodic(
+    "NSPeriodic", NS, flags, PeriodicFlag, VoidFlag);
+  FixedPeriodicBoundaryManager<LM_PF, FM> PFPeriodic(
+    "PFPeriodic", PF, flags, PeriodicFlag, VoidFlag);
+  FixedPeriodicBoundaryManager<LM_MF, FM> MFPeriodic(
+    "MFPeriodic", MF, flags, PeriodicFlag, VoidFlag);
+  NSPeriodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  NSPeriodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+  PFPeriodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  PFPeriodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+  MFPeriodic.Setup(left, NbrDirection::XN, right, NbrDirection::XP);
+  MFPeriodic.Setup(right, NbrDirection::XP, left, NbrDirection::XN);
+#ifdef MPI_ENABLED
+  NSPeriodic.SetupMPI(geoHelper);
+  PFPeriodic.SetupMPI(geoHelper);
+  MFPeriodic.SetupMPI(geoHelper);
 #endif
+
+  using PFNormalTask = tmp::Key_TypePair<BulkFlag, ff::FF2D<PFCELL>>;
+  using PFLaplacianTask = tmp::Key_TypePair<BulkFlag, ff::FFLaplacian2D<PFCELL>>;
+  using PFChemicalTask = tmp::Key_TypePair<BulkFlag, ff::FFChemPotential2D<PFCELL>>;
+  using PFNormalSelector = TaskSelector<std::uint8_t, PFCELL, PFNormalTask>;
+  using PFLaplacianSelector = TaskSelector<std::uint8_t, PFCELL, PFLaplacianTask>;
+  using PFChemicalSelector = TaskSelector<std::uint8_t, PFCELL, PFChemicalTask>;
+  using PFCollisionTask = tmp::Key_TypePair<BulkFlag,
+    collision::MRTSource<equilibrium::FirstOrder<PFCELL>, NORMAL<T, 2>, true, true>>;
+  using PFPeriodicTask = tmp::Key_TypePair<PeriodicFlag,
+    collision::PeriodicBoundary<PFCELL>>;
+  using PFAllTasks = tmp::TupleWrapper<PFCollisionTask, PFPeriodicTask>;
+  using PFSelector = tmp::TaskSelector<PFAllTasks, std::uint8_t, PFCELL>;
+
+  using NSCollisionTask = tmp::Key_TypePair<BulkFlag,
+    collision::MRTForce<NSCELL, FORCE<T, 2>>>;
+  using NSPeriodicTask = tmp::Key_TypePair<PeriodicFlag,
+    collision::PeriodicBoundary<NSCELL>>;
+  using NSAllTasks = tmp::TupleWrapper<NSCollisionTask, NSPeriodicTask>;
+  using NSSelector = tmp::TaskSelector<NSAllTasks, std::uint8_t, NSCELL>;
+
+  using SurfaceTask = tmp::Key_TypePair<BulkFlag,
+    ff::FFSurfaceTension2D<PFCELL, NSCELL>>;
+  using GravityTask = tmp::Key_TypePair<BulkFlag,
+    ff::FFGravityForce2D<PFCELL, NSCELL>>;
+  using PressureTask = tmp::Key_TypePair<BulkFlag,
+    RosenPressureForce2D<PFCELL, NSCELL>>;
+  using RhoOmegaTask = tmp::Key_TypePair<BulkFlag,
+    ff::FFRhoOmegaUpdate2D<PFCELL, NSCELL>>;
+  BlockLatManagerCoupling surfaceCoupling(PF, NS);
+  BlockLatManagerCoupling gravityCoupling(PF, NS);
+  BlockLatManagerCoupling pressureCoupling(PF, NS);
+  BlockLatManagerCoupling rhoOmegaCoupling(PF, NS);
+
+  using MagneticCoefficientsTask = tmp::Key_TypePair<BulkFlag,
+    MFUpdateCoeffs2D<PFCELL, MFCELL>>;
+  using MagneticCoefficientsSelector = CoupledTaskSelector<
+    std::uint8_t, PFCELL, MFCELL, MagneticCoefficientsTask>;
+  BlockLatManagerCoupling magneticCoefficients(PF, MF);
+
+  vtmo::ScalarWriter phiWriter("PHI", PF.getField<PHI<T>>());
+  vtmo::ScalarWriter hmagWriter("HMAG", MF.getField<HMAG<T>>());
+  vtmo::vtmWriter<T, 2> writer("rosensweig2d", geo);
+  writer.addWriterSet(phiWriter, hmagWriter);
+
+  // The framework periodic manager synchronizes populations, but per-cell
+  // diagnostic fields need the same seam treatment. This helper handles both
+  // same-rank and cross-rank edge blocks for arbitrary scalar/vector fields.
+  auto syncPeriodicField = [&](auto& field) {
+    using FieldBlock = std::decay_t<decltype(field.getBlockField(0))>;
+    using Value = typename FieldBlock::value_type;
+    constexpr int valueComponents =
+      std::is_same_v<Value, Vector<T, 2>> ? 2 : 1;
+    const T widthX = T(p.Ni) * p.CellLen;
+    const int rank = mpi().getRank();
+    const auto& globalGeometry = geoHelper.getBlockGeometry();
+#ifdef MPI_ENABLED
+    std::vector<std::vector<T>> sendBuffers;
+    std::vector<std::vector<T>> receiveBuffers;
+    std::vector<MPI_Request> sendRequests;
+    std::vector<MPI_Request> receiveRequests;
+    std::vector<std::pair<int, int>> receiveJobs;
+#endif
+
+    auto writeValue = [&](std::vector<T>& buffer, int row, const Value& value) {
+      if constexpr (valueComponents == 2) {
+        buffer[row * valueComponents] = value[0];
+        buffer[row * valueComponents + 1] = value[1];
+      } else {
+        buffer[row] = value;
+      }
+    };
+    auto readValue = [&](const std::vector<T>& buffer, int row) {
+      if constexpr (valueComponents == 2) {
+        return Value{buffer[row * valueComponents],
+                     buffer[row * valueComponents + 1]};
+      } else {
+        return Value{buffer[row]};
+      }
     };
 
-    // 0c-0e+: psi-solver sub-iterations (see bubbleMag2d notes)
-    for(int sub=0;sub<PsiSolver_Iter;++sub){
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        int ov=bk.getOverlap();
-        for(int j=ov;j<bk.getNy()-ov;++j){
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            MFCELL c(j*pr[1]+i,bl);
-            collision::MRTDiffusion<MFCELL,OMEGA_PSI<T>>::apply(c);
-          }
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      const auto& block = geo.getBlock(b);
+      const bool atLeft = block.getMin()[0] < p.CellLen * T{0.5};
+      const bool atRight = block.getMax()[0] > widthX - p.CellLen * T{0.5};
+      if (!atLeft && !atRight) continue;
+
+      const int nx = block.getNx();
+      const int ny = block.getNy();
+      const int overlap = block.getOverlap();
+      const auto& projection = block.getProjection();
+      const T yMid = (block.getMin()[1] + block.getMax()[1]) / T{2};
+      const T xProbe = atLeft ? widthX - p.CellLen * T{0.5}
+                              : p.CellLen * T{0.5};
+      int sourceGlobalId = -1;
+      for (std::size_t candidate = 0;
+           candidate < globalGeometry.getBlockNum(); ++candidate) {
+        const auto& source = globalGeometry.getBlock(candidate);
+        if (source.getSelfBlock().isInside(Vector<T, 2>{xProbe, yMid})) {
+          sourceGlobalId = source.getBlockId();
+          break;
         }
       }
-      MF_Per.Apply();
+      if (sourceGlobalId < 0) continue;
 
-      MFLattice.NormalFullCommunicate();
-      MFLattice.Stream();
-      MFLattice.NormalFullCommunicate();
-
-      {
-        auto& psiF=MFLattice.getField<PSI<T>>();
-        for(int b=0;b<Geo.getBlockNum();++b){
-          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-          auto& bPsi=psiF.getBlockField(b); int ov=bk.getOverlap();
-          for(int j=ov;j<bk.getNy()-ov;++j){
-            for(int i=ov;i<bk.getNx()-ov;++i){
-              std::size_t id=j*pr[1]+i; MFCELL c(id,bl);
-              T psi=0; for(unsigned k=0;k<MFLatSet::q;++k)psi+=c[k];
-              bPsi.get(id)=psi;
-            }
+      const int ghostColumn = atLeft ? 0 : nx - overlap;
+      const int sourceColumn = atLeft ? nx - 1 - overlap : overlap;
+      const int sourceRank = geoHelper.whichRank(sourceGlobalId);
+      if (sourceRank == rank) {
+        const int sourceBlock = geo.findBlockIndex(sourceGlobalId);
+        auto& targetField = field.getBlockField(b);
+        const auto& sourceField = field.getBlockField(sourceBlock);
+        for (int j = 0; j < ny; ++j) {
+          const Value value = sourceField.get(j * projection[1] + sourceColumn);
+          for (int c = 0; c < overlap; ++c) {
+            targetField.get(j * projection[1] + ghostColumn + c) = value;
           }
         }
-      }
-      CommunicatePSI<T>(MFLattice);
-
-      {
-        auto& psiF=MFLattice.getField<PSI<T>>();
-        const T nwall=Cell_Len*T{3.0};
-        for(int b=0;b<Geo.getBlockNum();++b){
-          auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-          auto& bPsi=psiF.getBlockField(b);
-          int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-          T minY=bk.getMin()[1],minX=bk.getMin()[0],vs=bk.getVoxelSize();
-          for(int jj=0;jj<ny;++jj){
-            T y=minY+T(jj-ov)*vs;
-            if((y<=nwall&&y>=-nwall)||(y<=H_global+nwall&&y>=H_global-nwall)){
-              for(int ii=0;ii<nx;++ii){
-                T x=minX+T(ii)*vs;
-                T psi_w;
-                if(y<=nwall) psi_w = -Hbelow*y + Cb_bc*std::cos(wk_bc*x)*std::exp( wk_bc*(y-y0_lat));
-                else         psi_w = psi_y0 - H0*(y-y0_lat) + Ca_bc*std::cos(wk_bc*x)*std::exp(-wk_bc*(y-y0_lat));
-                std::size_t id=jj*pr[1]+ii; MFCELL c(id,bl);
-                for(unsigned k=0;k<MFLatSet::q;++k) c[k]=latset::w<MFLatSet>(k)*psi_w;
-                bPsi.get(id)=psi_w;
-              }
-            }
-          }
+      } else {
+#ifdef MPI_ENABLED
+        const int physicalColumn = atLeft ? overlap : nx - 1 - overlap;
+        std::vector<T> send(ny * valueComponents);
+        auto& targetField = field.getBlockField(b);
+        for (int j = 0; j < ny; ++j) {
+          const Value value = targetField.get(j * projection[1] + physicalColumn);
+          writeValue(send, j, value);
         }
-      }
-    }
-    SyncSeamField(MFLattice.getField<PSI<T>>());
+        sendBuffers.emplace_back(std::move(send));
+        MPI_Request sendRequest;
+        mpi().iSend(sendBuffers.back().data(),
+                    static_cast<int>(sendBuffers.back().size()), sourceRank,
+                    &sendRequest, 9600 + block.getBlockId());
+        sendRequests.push_back(sendRequest);
 
-    // 0f: Compute H = -∇ψ
-    for(int b=0;b<Geo.getBlockNum();++b){
-      auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-      int ov=bk.getOverlap();
-      for(int j=ov;j<bk.getNy()-ov;++j){
-        for(int i=ov;i<bk.getNx()-ov;++i){
-          MFCELL c(j*pr[1]+i,bl);
-          MFComputeH2D<MFCELL>::apply(c);
-        }
+        receiveBuffers.emplace_back(ny * valueComponents);
+        receiveJobs.emplace_back(b, ghostColumn);
+        MPI_Request receiveRequest;
+        mpi().iRecv(receiveBuffers.back().data(),
+                    static_cast<int>(receiveBuffers.back().size()), sourceRank,
+                    &receiveRequest, 9600 + sourceGlobalId);
+        receiveRequests.push_back(receiveRequest);
+#endif
       }
     }
-    CommunicateAllMFFields<T>(MFLattice);
-    SyncSeamField(MFLattice.getField<HX<T>>());
-    SyncSeamField(MFLattice.getField<HY<T>>());
-    SyncSeamField(MFLattice.getField<HMAG<T>>());
 
-    // ===== Phase A: Force setup =====
-    RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(t(),FlagFM);
-    NSLattice.getField<FORCE<T,2>>().InitValue(Vector<T,2>{0,0});
-    STC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,STT>>(t(),FlagFM);
-
-    // A4: Magnetic force (Kelvin form, mu0=1) — zeroed in wall bands where the
-    // pinned psi solver leaves spurious |H| spikes (see bubbleMag2d notes).
-    if(H0>T{0}){
-      const T band=T{12.0};
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
-        auto& ns_bl=NSLattice.getBlockLat(b);
-        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        int ov=bk.getOverlap();
-        T minY=bk.getMin()[1],vs=bk.getVoxelSize();
-        for(int j=ov;j<bk.getNy()-ov;++j){
-          T y=minY+T(j-ov)*vs;
-          if(y<=band||y>=H_global-band) continue;
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            std::size_t id=j*pr[1]+i;
-            PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
-            MFMagneticForce2D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
-          }
+#ifdef MPI_ENABLED
+    MPI_Waitall(static_cast<int>(sendRequests.size()), sendRequests.data(),
+                MPI_STATUSES_IGNORE);
+    for (std::size_t i = 0; i < receiveRequests.size(); ++i) {
+      MPI_Wait(&receiveRequests[i], MPI_STATUS_IGNORE);
+      auto& targetField = field.getBlockField(receiveJobs[i].first);
+      const auto& block = geo.getBlock(receiveJobs[i].first);
+      const auto& projection = block.getProjection();
+      const int overlap = block.getOverlap();
+      const int ghostColumn = receiveJobs[i].second;
+      const auto& buffer = receiveBuffers[i];
+      for (int j = 0; j < block.getNy(); ++j) {
+        const Value value = readValue(buffer, j);
+        for (int c = 0; c < overlap; ++c) {
+          targetField.get(j * projection[1] + ghostColumn + c) = value;
         }
       }
     }
+#endif
+  };
 
-    GrC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,GrT>>(t(),FlagFM);
-    PrC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,PrT>>(t(),FlagFM);
-    NSLattice.getField<FORCE<T,2>>().Communicate();
-
-    // ===== Phase B-C: PF + NS collision =====
-    PFLattice.template ApplyInnerCellDynamics<PFSel>(FlagFM);
-    PF_Per.Apply(); PFLattice.NormalFullCommunicate();
-
-    // ViC (visco-force correction) disabled: the reference paper model does
-    // not use it, and it adds damping that suppresses peak growth (validated
-    // in the reference Rosen implementation).
-    // ViC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,ViT>>(t(),FlagFM);
-    NSLattice.template ApplyInnerCellDynamics<NSSel>(FlagFM);
-    NS_Per.Apply(); NSLattice.NormalFullCommunicate();
-
-    // ===== Phase D: Streaming =====
-    PF_BB.Apply(t());
-    { // PF Y ghost pop fix
-      T Hg=T(Nj)*Cell_Len;
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=PFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5})
-          for(int i=0;i<nx;++i){PFCELL g(0*pr[1]+i,bl),w(ov*pr[1]+i,bl); for(unsigned k=0;k<LatSet::q;++k)g[k]=w[k];}
-        if(My>Hg-Cell_Len*T{1.5})
-          for(int i=0;i<nx;++i){PFCELL g((ny-1)*pr[1]+i,bl),w((ny-1-ov)*pr[1]+i,bl); for(unsigned k=0;k<LatSet::q;++k)g[k]=w[k];}
-      }
-    }
-    PFLattice.Stream(); PFLattice.NormalFullCommunicate();
-
-    NS_BB.Apply(t());
-    { // NS Y ghost pop fix
-      T Hg=T(Nj)*Cell_Len;
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5})
-          for(int i=0;i<nx;++i){NSCELL g(0*pr[1]+i,bl),w(ov*pr[1]+i,bl); for(unsigned k=0;k<LatSet::q;++k)g[k]=w[k];}
-        if(My>Hg-Cell_Len*T{1.5})
-          for(int i=0;i<nx;++i){NSCELL g((ny-1)*pr[1]+i,bl),w((ny-1-ov)*pr[1]+i,bl); for(unsigned k=0;k<LatSet::q;++k)g[k]=w[k];}
-      }
-    }
-    NSLattice.Stream(); NSLattice.NormalFullCommunicate();
-
-    // ===== Phase E: Macro update =====
-    // phi = sum(g_i)
-    {
-      auto& pF=PFLattice.getField<PHI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=PFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bP=pF.getBlockField(b); int ov=bk.getOverlap();
-        for(int j=ov;j<bk.getNy()-ov;++j)
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            std::size_t id=j*pr[1]+i; PFCELL c(id,bl);
-            T pn=0; for(unsigned k=0;k<LatSet::q;++k)pn+=c[k];
-            // phi floor/cap at 0.01/0.999: prevents trough collapse (numerical
-            // divergence when a peak trough becomes extremely thin). Far from
-            // the interface transition (phi 0.3-0.7), so no physics is affected.
-            if(pn<T{0.01})pn=T{0.01}; if(pn>T{0.999})pn=T{0.999}; bP.get(id)=pn;
+  auto setPsiWalls = [&]() {
+    auto& field = MF.getField<PSI<T>>();
+    const T wallDistance = T(p.PsiWallLayers) * p.CellLen;
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = MF.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockField = field.getBlockField(b);
+      const int overlap = block.getOverlap();
+      const T minX = block.getMin()[0];
+      const T minY = block.getMin()[1];
+      const T voxel = block.getVoxelSize();
+      for (int j = 0; j < block.getNy(); ++j) {
+        const T y = minY + T(j - overlap) * voxel;
+        const bool nearBottom = y <= wallDistance && y >= -wallDistance;
+        const bool nearTop = y <= domainHeight + wallDistance &&
+          y >= domainHeight - wallDistance;
+        if (!nearBottom && !nearTop) continue;
+        for (int i = 0; i < block.getNx(); ++i) {
+          const T x = minX + T(i) * voxel;
+          const T psi = seedPsi(x, y);
+          const std::size_t id = j * projection[1] + i;
+          MFCELL cell(id, blockLat);
+          for (unsigned k = 0; k < MFLatSet::q; ++k) {
+            cell[k] = latset::w<MFLatSet>(k) * psi;
           }
+          blockField.get(id) = psi;
+        }
       }
     }
-    PFLattice.getField<PHI<T>>().Communicate();
+  };
 
-    // wall phi BC: ferrofluid (1) at bottom, solvent (0) at top
-    {
-      auto& pF=PFLattice.getField<PHI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bP=pF.getBlockField(b); int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5}) for(int i=0;i<nx;++i)bP.get(ov*pr[1]+i)=phiBottom;
-        if(My>H_global-Cell_Len*T{1.5}){int jj=ny-1-ov;for(int i=0;i<nx;++i)bP.get(jj*pr[1]+i)=phiTop;}
+  auto updatePsiFromPops = [&]() {
+    auto& field = MF.getField<PSI<T>>();
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = MF.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockField = field.getBlockField(b);
+      const int overlap = block.getOverlap();
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          MFCELL cell(j * projection[1] + i, blockLat);
+          T psi = T{0};
+          for (unsigned k = 0; k < MFLatSet::q; ++k) psi += cell[k];
+          blockField.get(j * projection[1] + i) = psi;
+        }
       }
     }
-    PFLattice.getField<PHI<T>>().Communicate();
+  };
 
-    // wall phi ghost fix
-    {
-      auto& pF=PFLattice.getField<PHI<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bP=pF.getBlockField(b); int nx=bk.getNx(),ny=bk.getNy(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5}) for(int j=0;j<ov;++j) for(int i=0;i<nx;++i) bP.get(j*pr[1]+i)=phiBottom;
-        if(My>H_global-Cell_Len*T{1.5}) for(int j=ny-ov;j<ny;++j) for(int i=0;i<nx;++i) bP.get(j*pr[1]+i)=phiTop;
+  auto computeMagneticField = [&]() {
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = MF.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      const int overlap = block.getOverlap();
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          MFCELL cell(j * projection[1] + i, blockLat);
+          MFComputeH2D<MFCELL>::apply(cell);
+        }
       }
     }
-    // seam PHI: the periodic manager's GenericRho copy runs before the macro
-    // update, so re-sync the x-wrapped ghosts to the current field
-    SyncSeamField(PFLattice.getField<PHI<T>>());
+    CommunicateAllMFFields<T>(MF);
+    syncPeriodicField(MF.getField<HX<T>>());
+    syncPeriodicField(MF.getField<HY<T>>());
+    syncPeriodicField(MF.getField<HMAG<T>>());
+  };
 
-    // gradients
-    PFLattice.template ApplyInnerCellDynamics<PFSelN>(FlagFM);
-    PFLattice.template ApplyInnerCellDynamics<PFSelL>(FlagFM);
-    PFLattice.template ApplyInnerCellDynamics<PFSelC>(FlagFM);
-    PFLattice.getField<NORMAL<T,2>>().Communicate();
-    PFLattice.getField<GRAD<T,2>>().Communicate();
-    ff::CommunicateAllSelfFields<T>(PFLattice);
-
-    // wall grad/chempot fix (PF)
-    {
-      auto& gF=PFLattice.getField<GRAD<T,2>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bG=gF.getBlockField(b); int nx=bk.getNx(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5}) for(int i=ov;i<nx-ov;++i) bG.get(ov*pr[1]+i)[1]=bG.get((ov+1)*pr[1]+i)[1];
-        if(My>H_global-Cell_Len*T{1.5}){int jj=bk.getNy()-1-ov;for(int i=ov;i<nx-ov;++i)bG.get(jj*pr[1]+i)[1]=bG.get((jj-1)*pr[1]+i)[1];}
+  auto copyPFYGhosts = [&]() {
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = PF.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      const int overlap = block.getOverlap();
+      const int nx = block.getNx();
+      const int ny = block.getNy();
+      const T minY = block.getMin()[1];
+      const T maxY = block.getMax()[1];
+      if (minY < p.CellLen * T{1.5}) {
+        for (int i = 0; i < nx; ++i) {
+          PFCELL ghost(i, blockLat);
+          PFCELL wall(overlap * projection[1] + i, blockLat);
+          for (unsigned k = 0; k < LatSet::q; ++k) ghost[k] = wall[k];
+        }
+      }
+      if (maxY > domainHeight - p.CellLen * T{1.5}) {
+        for (int i = 0; i < nx; ++i) {
+          PFCELL ghost((ny - 1) * projection[1] + i, blockLat);
+          PFCELL wall((ny - 1 - overlap) * projection[1] + i, blockLat);
+          for (unsigned k = 0; k < LatSet::q; ++k) ghost[k] = wall[k];
+        }
       }
     }
-    {
-      auto& cF=PFLattice.getField<ff::CHEMICALPOTENTIAL<T>>();
-      for(int b=0;b<Geo.getBlockNum();++b){
-        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& bC=cF.getBlockField(b); int nx=bk.getNx(),ov=bk.getOverlap();
-        T my=bk.getMin()[1],My=bk.getMax()[1];
-        if(my<Cell_Len*T{1.5}) for(int i=ov;i<nx-ov;++i) bC.get(ov*pr[1]+i)=(T{4}*bC.get((ov+1)*pr[1]+i)-bC.get((ov+2)*pr[1]+i))/T{3};
-        if(My>H_global-Cell_Len*T{1.5}){int jj=bk.getNy()-1-ov;for(int i=ov;i<nx-ov;++i)bC.get(jj*pr[1]+i)=(T{4}*bC.get((jj-1)*pr[1]+i)-bC.get((jj-2)*pr[1]+i))/T{3};}
+  };
+
+  auto copyNSYGhosts = [&]() {
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = NS.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      const int overlap = block.getOverlap();
+      const int nx = block.getNx();
+      const int ny = block.getNy();
+      const T minY = block.getMin()[1];
+      const T maxY = block.getMax()[1];
+      if (minY < p.CellLen * T{1.5}) {
+        for (int i = 0; i < nx; ++i) {
+          NSCELL ghost(i, blockLat);
+          NSCELL wall(overlap * projection[1] + i, blockLat);
+          for (unsigned k = 0; k < LatSet::q; ++k) ghost[k] = wall[k];
+        }
+      }
+      if (maxY > domainHeight - p.CellLen * T{1.5}) {
+        for (int i = 0; i < nx; ++i) {
+          NSCELL ghost((ny - 1) * projection[1] + i, blockLat);
+          NSCELL wall((ny - 1 - overlap) * projection[1] + i, blockLat);
+          for (unsigned k = 0; k < LatSet::q; ++k) ghost[k] = wall[k];
+        }
       }
     }
-    ff::CommunicateAllSelfFields<T>(PFLattice);
+  };
 
-    // NS macro
-    {
-      for(int b=0;b<Geo.getBlockNum();++b){
-        auto& bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
-        auto& rF=NSLattice.getField<DENSITY<T>>(); auto& pF=NSLattice.getField<PRESSURE<T>>();
-        auto& vF=NSLattice.getField<VELOCITY<T,2>>(); auto& fF=NSLattice.getField<FORCE<T,2>>();
-        auto& bR=rF.getBlockField(b); auto& bP=pF.getBlockField(b);
-        auto& bV=vF.getBlockField(b); auto& bF=fF.getBlockField(b);
-        int ov=bk.getOverlap();
-        for(int j=ov;j<bk.getNy()-ov;++j)
-          for(int i=ov;i<bk.getNx()-ov;++i){
-            std::size_t id=j*pr[1]+i; NSCELL c(id,bl);
-            T p=0,ux=0,uy=0;
-            for(unsigned k=0;k<LatSet::q;++k){p+=c[k];ux+=latset::c<LatSet>(k)[0]*c[k];uy+=latset::c<LatSet>(k)[1]*c[k];}
-            T rho=bR.get(id); auto F=bF.get(id);
-            bP.get(id)=p; bV.get(id)=Vector<T,2>{ux+T{0.5}*F[0]/rho,uy+T{0.5}*F[1]/rho};
+  auto setPhaseWalls = [&]() {
+    auto& field = PF.getField<PHI<T>>();
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockField = field.getBlockField(b);
+      const int overlap = block.getOverlap();
+      const int nx = block.getNx();
+      const int ny = block.getNy();
+      const T minY = block.getMin()[1];
+      const T maxY = block.getMax()[1];
+      if (minY < p.CellLen * T{1.5}) {
+        for (int i = 0; i < nx; ++i) {
+          blockField.get(overlap * projection[1] + i) = T{1};
+        }
+      }
+      if (maxY > domainHeight - p.CellLen * T{1.5}) {
+        const int row = ny - 1 - overlap;
+        for (int i = 0; i < nx; ++i) {
+          blockField.get(row * projection[1] + i) = T{0};
+        }
+      }
+      if (minY < p.CellLen * T{1.5}) {
+        for (int j = 0; j < overlap; ++j) {
+          for (int i = 0; i < nx; ++i) {
+            blockField.get(j * projection[1] + i) = T{1};
           }
+        }
+      }
+      if (maxY > domainHeight - p.CellLen * T{1.5}) {
+        for (int j = ny - overlap; j < ny; ++j) {
+          for (int i = 0; i < nx; ++i) {
+            blockField.get(j * projection[1] + i) = T{0};
+          }
+        }
       }
     }
-    NSLattice.getField<VELOCITY<T,2>>().Communicate();
-    NSLattice.getField<PRESSURE<T>>().Communicate();
-    NSLattice.getField<DENSITY<T>>().Communicate();
-    NSLattice.getField<OMEGA<T>>().Communicate();
+  };
 
-    // keep the seam ghost columns of the NS fields consistent for the VTK output
-    SyncSeamField(NSLattice.getField<VELOCITY<T,2>>());
-    SyncSeamField(NSLattice.getField<PRESSURE<T>>());
-    SyncSeamField(NSLattice.getField<FORCE<T,2>>());
+  auto updatePhaseAndGradients = [&]() {
+    auto& field = PF.getField<PHI<T>>();
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = PF.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockField = field.getBlockField(b);
+      const int overlap = block.getOverlap();
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          PFCELL cell(j * projection[1] + i, blockLat);
+          T phi = T{0};
+          for (unsigned k = 0; k < LatSet::q; ++k) phi += cell[k];
+          phi = std::max(p.PhiFloor, std::min(p.PhiCeiling, phi));
+          blockField.get(j * projection[1] + i) = phi;
+        }
+      }
+    }
+    field.Communicate();
+    setPhaseWalls();
+    field.Communicate();
+    syncPeriodicField(field);
 
-    ++t; ++ot;
-    if(t()%OutputStep==0){
-      ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
+    PF.template ApplyInnerCellDynamics<PFNormalSelector>(flags);
+    PF.template ApplyInnerCellDynamics<PFLaplacianSelector>(flags);
+    PF.template ApplyInnerCellDynamics<PFChemicalSelector>(flags);
+    PF.getField<NORMAL<T, 2>>().Communicate();
+    PF.getField<GRAD<T, 2>>().Communicate();
+    ff::CommunicateAllSelfFields<T>(PF);
+
+    auto& grad = PF.getField<GRAD<T, 2>>();
+    auto& chemical = PF.getField<ff::CHEMICALPOTENTIAL<T>>();
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockGrad = grad.getBlockField(b);
+      auto& blockChemical = chemical.getBlockField(b);
+      const int overlap = block.getOverlap();
+      const int nx = block.getNx();
+      const T minY = block.getMin()[1];
+      const T maxY = block.getMax()[1];
+      if (minY < p.CellLen * T{1.5}) {
+        for (int i = overlap; i < nx - overlap; ++i) {
+          blockGrad.get(overlap * projection[1] + i)[1] =
+            blockGrad.get((overlap + 1) * projection[1] + i)[1];
+          blockChemical.get(overlap * projection[1] + i) =
+            (T{4} * blockChemical.get((overlap + 1) * projection[1] + i) -
+             blockChemical.get((overlap + 2) * projection[1] + i)) / T{3};
+        }
+      }
+      if (maxY > domainHeight - p.CellLen * T{1.5}) {
+        const int row = block.getNy() - 1 - overlap;
+        for (int i = overlap; i < nx - overlap; ++i) {
+          blockGrad.get(row * projection[1] + i)[1] =
+            blockGrad.get((row - 1) * projection[1] + i)[1];
+          blockChemical.get(row * projection[1] + i) =
+            (T{4} * blockChemical.get((row - 1) * projection[1] + i) -
+             blockChemical.get((row - 2) * projection[1] + i)) / T{3};
+        }
+      }
+    }
+    ff::CommunicateAllSelfFields<T>(PF);
+  };
+
+  auto updateNSMacros = [&]() {
+    auto& density = NS.getField<DENSITY<T>>();
+    auto& pressure = NS.getField<PRESSURE<T>>();
+    auto& velocity = NS.getField<VELOCITY<T, 2>>();
+    auto& force = NS.getField<FORCE<T, 2>>();
+    for (int b = 0; b < geo.getBlockNum(); ++b) {
+      auto& blockLat = NS.getBlockLat(b);
+      const auto& block = geo.getBlock(b);
+      const auto& projection = block.getProjection();
+      auto& blockDensity = density.getBlockField(b);
+      auto& blockPressure = pressure.getBlockField(b);
+      auto& blockVelocity = velocity.getBlockField(b);
+      auto& blockForce = force.getBlockField(b);
+      const int overlap = block.getOverlap();
+      for (int j = overlap; j < block.getNy() - overlap; ++j) {
+        for (int i = overlap; i < block.getNx() - overlap; ++i) {
+          const std::size_t id = j * projection[1] + i;
+          NSCELL cell(id, blockLat);
+          T pressureValue = T{0};
+          T ux = T{0};
+          T uy = T{0};
+          for (unsigned k = 0; k < LatSet::q; ++k) {
+            pressureValue += cell[k];
+            ux += latset::c<LatSet>(k)[0] * cell[k];
+            uy += latset::c<LatSet>(k)[1] * cell[k];
+          }
+          const T rho = blockDensity.get(id);
+          const auto bodyForce = blockForce.get(id);
+          blockPressure.get(id) = pressureValue;
+          blockVelocity.get(id) = Vector<T, 2>{
+            ux + bodyForce[0] / (T{2} * rho),
+            uy + bodyForce[1] / (T{2} * rho)};
+        }
+      }
+    }
+    density.Communicate();
+    pressure.Communicate();
+    velocity.Communicate();
+    force.Communicate();
+    syncPeriodicField(velocity);
+    syncPeriodicField(force);
+  };
+
+  PF.NormalFullCommunicate();
+  NS.NormalFullCommunicate();
+  MF.NormalFullCommunicate();
+  NSPeriodic.Apply();
+  PFPeriodic.Apply();
+  MFPeriodic.Apply();
+  PF.template ApplyInnerCellDynamics<PFNormalSelector>(flags);
+  PF.template ApplyInnerCellDynamics<PFLaplacianSelector>(flags);
+  PF.template ApplyInnerCellDynamics<PFChemicalSelector>(flags);
+  PF.getField<NORMAL<T, 2>>().Communicate();
+  PF.getField<GRAD<T, 2>>().Communicate();
+  ff::CommunicateAllSelfFields<T>(PF);
+  magneticCoefficients.ApplyInnerCellDynamics<MagneticCoefficientsSelector>(0, flags);
+  CommunicateOMEGAPSI<T>(MF);
+  syncPeriodicField(MF.getField<PSI<T>>());
+  computeMagneticField();
+  updateNSMacros();
+  writer.WriteBinary(0);
+
+  Printer::Print_BigBanner(std::string("Start Rosensweig calculation..."));
+  Timer timer;
+  Timer outputTimer;
+  const T psiWallHeight = domainHeight;
+
+  while (timer() < p.MaxStep) {
+    magneticCoefficients.ApplyInnerCellDynamics<MagneticCoefficientsSelector>(
+      timer(), flags);
+    CommunicateOMEGAPSI<T>(MF);
+
+    for (int sub = 0; sub < p.PsiSolverIter; ++sub) {
+      setPsiWalls();
+      for (int b = 0; b < geo.getBlockNum(); ++b) {
+        auto& blockLat = MF.getBlockLat(b);
+        const auto& block = geo.getBlock(b);
+        const auto& projection = block.getProjection();
+        const int overlap = block.getOverlap();
+        for (int j = overlap; j < block.getNy() - overlap; ++j) {
+          for (int i = overlap; i < block.getNx() - overlap; ++i) {
+            MFCELL cell(j * projection[1] + i, blockLat);
+            collision::MRTDiffusion<MFCELL, OMEGA_PSI<T>>::apply(cell);
+          }
+        }
+      }
+      MFPeriodic.Apply();
+      MF.NormalFullCommunicate();
+      MF.Stream();
+      MF.NormalFullCommunicate();
+      updatePsiFromPops();
+      CommunicatePSI<T>(MF);
+      setPsiWalls();
+    }
+    syncPeriodicField(MF.getField<PSI<T>>());
+    computeMagneticField();
+
+    rhoOmegaCoupling.ApplyInnerCellDynamics<
+      CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, RhoOmegaTask>>(
+        timer(), flags);
+    NS.getField<FORCE<T, 2>>().InitValue(Vector<T, 2>{0, 0});
+    surfaceCoupling.ApplyInnerCellDynamics<
+      CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, SurfaceTask>>(
+        timer(), flags);
+
+    if (p.H0 > T{0}) {
+      for (int b = 0; b < geo.getBlockNum(); ++b) {
+        auto& pfBlock = PF.getBlockLat(b);
+        auto& mfBlock = MF.getBlockLat(b);
+        auto& nsBlock = NS.getBlockLat(b);
+        const auto& block = geo.getBlock(b);
+        const auto& projection = block.getProjection();
+        const int overlap = block.getOverlap();
+        const T minY = block.getMin()[1];
+        const T voxel = block.getVoxelSize();
+        for (int j = overlap; j < block.getNy() - overlap; ++j) {
+          const T y = minY + T(j - overlap) * voxel;
+          if (y <= T(p.MagneticForceWallBand) * p.CellLen ||
+              y >= psiWallHeight - T(p.MagneticForceWallBand) * p.CellLen) {
+            continue;
+          }
+          for (int i = overlap; i < block.getNx() - overlap; ++i) {
+            const std::size_t id = j * projection[1] + i;
+            PFCELL pfCell(id, pfBlock);
+            MFCELL mfCell(id, mfBlock);
+            NSCELL nsCell(id, nsBlock);
+            MFMagneticForce2D<PFCELL, MFCELL, NSCELL>::apply(
+              pfCell, mfCell, nsCell);
+          }
+        }
+      }
+    }
+
+    gravityCoupling.ApplyInnerCellDynamics<
+      CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, GravityTask>>(
+        timer(), flags);
+    pressureCoupling.ApplyInnerCellDynamics<
+      CoupledTaskSelector<std::uint8_t, PFCELL, NSCELL, PressureTask>>(
+        timer(), flags);
+    NS.getField<FORCE<T, 2>>().Communicate();
+
+    PF.template ApplyInnerCellDynamics<PFSelector>(flags);
+    PFPeriodic.Apply();
+    PF.NormalFullCommunicate();
+    NS.template ApplyInnerCellDynamics<NSSelector>(flags);
+    NSPeriodic.Apply();
+    NS.NormalFullCommunicate();
+
+    PFBounce.Apply(timer());
+    copyPFYGhosts();
+    PF.Stream();
+    PF.NormalFullCommunicate();
+
+    NSBounce.Apply(timer());
+    copyNSYGhosts();
+    NS.Stream();
+    NS.NormalFullCommunicate();
+
+    updatePhaseAndGradients();
+    updateNSMacros();
+
+    ++timer;
+    ++outputTimer;
+    if (timer() % p.OutputStep == 0) {
+      outputTimer.Print_InnerLoopPerformance(geo.getTotalCellNum(), p.OutputStep);
       Printer::Endl();
-      MW.WriteBinary(t());
+      writer.WriteBinary(timer());
     }
   }
 
-  Printer::Print_BigBanner(std::string("Calculation Complete!"));
-  t.Print_MainLoopPerformance(Geo.getTotalCellNum());
+  Printer::Print_BigBanner(std::string("Rosensweig calculation complete"));
+  timer.Print_MainLoopPerformance(geo.getTotalCellNum());
   return 0;
 }

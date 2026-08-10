@@ -24,18 +24,18 @@ __any__ void FF2D<CELL>::apply(CELL& cell) {
   cell.template get<GRAD<T, LatSet::d>>() = grad;
 
   T grad_mag = grad.getnorm();
-  // Physical threshold normalization (replaces Fortran's eps=1e-30 which is too small):
-  // Interface width W=5, max |grad_phi|~0.2 at interface.
-  // Use cutoff=0.02 (~10% of max gradient): far from interface where |grad|<cutoff,
-  // |n| smoothly decays to 0 instead of being pinned at 1 by numerical noise.
-  // Impact on physics: negligible — NORMAL is only used in MRTSource Allen-Cahn term,
-  // which has a 4*phi*(1-phi) factor that zeroes the source outside the interface anyway.
-  T cutoff = T{0.02};
+  // Suppress numerical phase-field leakage in the bulk while retaining the
+  // interface normal. The squared mask makes the normal decay faster than the
+  // regularized inverse alone when |grad(phi)| is only round-off noise.
+  T cutoff = T{0.01};
   T eps = cutoff * cutoff;
-  T inv_mag = T{1} / std::sqrt(grad_mag * grad_mag + eps);
+  T grad2 = grad_mag * grad_mag;
+  T inv_mag = T{1} / std::sqrt(grad2 + eps);
+  T ratio = grad2 / (grad2 + eps);
+  T mask = ratio * ratio;
   Vector<T, LatSet::d> n;
-  n[0] = grad[0] * inv_mag;
-  n[1] = grad[1] * inv_mag;
+  n[0] = grad[0] * inv_mag * mask;
+  n[1] = grad[1] * inv_mag * mask;
   cell.template get<NORMAL<T, LatSet::d>>() = n;
 }
 

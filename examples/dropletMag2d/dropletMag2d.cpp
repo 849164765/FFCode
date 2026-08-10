@@ -39,7 +39,7 @@ int MaxStep, OutputStep;
 std::string work_dir;
 
 void readParam(int argc, char* argv[]) {
-  std::string ininame = "rosensweig2d.ini";
+  std::string ininame = "dropletMag2d.ini";
   T H0_kAm_override = T{-1};
   if (argc > 1) ininame = argv[1];
   if (argc > 2) H0_kAm_override = std::atof(argv[2]);
