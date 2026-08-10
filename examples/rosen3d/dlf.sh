@@ -8,4 +8,4 @@ module load gcc/12.2
 
 make clean
 make
-mpiexec -n 128 ./bubbleMag2d.exe
+mpiexec -n 128 ./rosen3d.exe
