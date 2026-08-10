@@ -17,5 +17,4 @@
 #include "lbm/lattice_set.h"
 // lbm dynamics
 #include "lbm/lbm.h"
-// magnetic field coupling
-#include "mfield/mfield2d.h"
+// (each example includes the specific mfield header it needs)
