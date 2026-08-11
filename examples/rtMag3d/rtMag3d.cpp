@@ -12,17 +12,18 @@ int Ni, Nj, Nk;
 T Cell_Len;
 int BlockCellLen, Thread_Num;
 
-// ferrofluid layer
-T InterfaceZ, LambdaC, PerturbAmp, PerturbRand, PhaseX, PhaseY;
+// interface (heavy ferrofluid on top, light solvent below)
+T InterfaceZ, PerturbAmp, PerturbPeriods;
 
 // phase field
 T Interface_Width, Mobility, Tau_phi, Omega_phi, Kappa, Beta;
 
-// two-phase
-T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Tau_ns;
+// two-phase (RT dimensionless -> lattice)
+T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Tau_ns, DeltaRho;
+T At, Re, Ca, U0, L_dom;
 
 // magnetic field
-T chi_l, chi_h, mu_l, mu_h, H0, Hc, Bom_c, DeltaRho;
+T chi_l, chi_h, mu_l, mu_h, H0, Bo_m;
 
 int PsiSolver_Iter; T PsiSolver_K;
 int PreForce;
@@ -30,38 +31,28 @@ int PreForce;
 int MaxStep, OutputStep;
 std::string work_dir;
 
-// 确定性 2D 噪声 (仅依赖全局坐标, MPI 各 rank 结果一致), 输出 [-1,1]
-T hashNoise2D(T x, T y) {
-  T n1 = std::sin(x * T(12.9898) + y * T(78.233)) * T(43758.5453);
-  T n = n1 - std::floor(n1);
-  return T{2} * n - T{1};
-}
-
-void readParam() {
-  iniReader r("rosenMag3d.ini");
+void readParam(int argc, char* argv[]) {
+  std::string iniName = "rtMag3d.ini";
+  if (argc > 1) iniName = argv[1];
+  iniReader r(iniName);
   work_dir = r.getValue<std::string>("workdir","workdir_");
   Thread_Num = r.getValue<int>("parallel","thread_num");
   Ni = r.getValue<int>("Mesh","Ni"); Nj = r.getValue<int>("Mesh","Nj");
   Nk = r.getValue<int>("Mesh","Nk");
   Cell_Len = r.getValue<T>("Mesh","Cell_Len");
   BlockCellLen = r.getValue<int>("Mesh","BlockCellLen");
-  InterfaceZ   = r.getValue<T>("Layer","InterfaceZ");
-  LambdaC      = r.getValue<T>("Layer","LambdaC");
-  PerturbAmp   = r.getValue<T>("Layer","PerturbAmp",T{1.0});
-  PerturbRand  = r.getValue<T>("Layer","PerturbRand",T{0.0});
-  // 峰位相位: 默认 λ/2 使峰位于域内部 (周期接缝 (x=0/y=0 平面) 存在相场
-  // 伪影, 峰落在接缝上会被压制变形)
-  PhaseX       = r.getValue<T>("Layer","PhaseX",T{-1});
-  PhaseY       = r.getValue<T>("Layer","PhaseY",T{-1});
-  if(PhaseX < T{0}) PhaseX = LambdaC * T{0.5};
-  if(PhaseY < T{0}) PhaseY = LambdaC * T{0.5};
+  InterfaceZ   = r.getValue<T>("Interface","Z0_cells");
+  PerturbAmp   = r.getValue<T>("Interface","PerturbAmp_cells");
+  PerturbPeriods = r.getValue<T>("Interface","PerturbPeriods");
   Interface_Width=r.getValue<T>("Phase_Field","Interface_Width");
   Mobility=r.getValue<T>("Phase_Field","Mobility");
-  rho_l=r.getValue<T>("Two_Phase","rho_l");
-  rho_h=r.getValue<T>("Two_Phase","rho_h");
-  sigma=r.getValue<T>("Two_Phase","sigma");
-  eta_l=r.getValue<T>("Two_Phase","eta_l");
-  eta_h=r.getValue<T>("Two_Phase","eta_h");
+  // RT 无量纲数 (论文 E 节)
+  At  = r.getValue<T>("Two_Phase","At");
+  Re  = r.getValue<T>("Two_Phase","Re");
+  Ca  = r.getValue<T>("Two_Phase","Ca");
+  U0  = r.getValue<T>("Two_Phase","U0");
+  rho_l = r.getValue<T>("Two_Phase","rho_l");
+  eta_h = r.getValue<T>("Two_Phase","eta_h");
   MaxStep=r.getValue<int>("Simulation_Settings","TotalStep");
   OutputStep=r.getValue<int>("Simulation_Settings","OutputStep");
   // Magnetic
@@ -69,49 +60,56 @@ void readParam() {
   chi_h=r.getValue<T>("Magnetic_Field","chi_h");
   mu_l=r.getValue<T>("Magnetic_Field","mu_l");
   mu_h=r.getValue<T>("Magnetic_Field","mu_h");
-  H0=r.getValue<T>("Magnetic_Field","H0");
+  Bo_m=r.getValue<T>("Magnetic_Field","Bo_m");
   PsiSolver_Iter=r.getValue<int>("Magnetic_Field","PsiSolver_Iter");
   PreForce=r.getValue<int>("Two_Phase","PreForce",1);
   PsiSolver_K=r.getValue<T>("Magnetic_Field","PsiSolver_K");
 
-  DeltaRho=rho_h-rho_l;
-  // 重力由临界波长 λ_c 反推 (Cowley & Rosensweig 1967):
-  //   λ_c = 2π √(σ/(g Δρ))  →  g = σ/Δρ · (2π/λ_c)²
-  // 也可在 ini 直接指定 Gravity 覆盖 (如 g=0 用于无重力验证)
+  // 由无量纲数推导格子参数 (论文 E 节):
+  //   At=(rho_h-rho_l)/(rho_h+rho_l),  U0=sqrt(gL),
+  //   Re=rho_l*U0*L/eta_l,  Ca=eta_l*U0/sigma,  Bo_m=mu0*H0^2*L/(2*sigma) (mu0=1)
   const T pi = std::acos(T{-1});
-  gravity = r.getValue<T>("Two_Phase","Gravity", T{-1});
-  if(gravity < T{0}) gravity = sigma / DeltaRho * std::pow(T{2}*pi/LambdaC, T{2});
-  // 临界磁场 (论文 Eq. 71, μ₀≡1):
-  //   H_c = [2(μ₀/μ+1)/(μ₀/μ-1)²]^{1/2} · (σ g Δρ)^{1/4}
-  T R = (T{1}/mu_h + T{1}) / ((T{1}/mu_h - T{1})*(T{1}/mu_h - T{1}));
-  Hc = std::sqrt(T{2}*R) * std::pow(sigma*gravity*DeltaRho, T{0.25});
-  // 磁 Bond 数 (特征长度取毛细长度 l_c = λ_c/2π): Bo_m = χ H0² l_c / (2σ)
-  Bom_c = chi_h * H0*H0 * (LambdaC/(T{2}*pi)) / (T{2}*sigma);
+  L_dom = T(Ni)*Cell_Len;
+  rho_h = rho_l*(T{1}+At)/(T{1}-At);
+  gravity = U0*U0/L_dom;
+  eta_l = rho_l*U0*L_dom/Re;
+  sigma = eta_l*U0/Ca;
+  // 显式覆盖 (可选): 若 ini 直接给出这些格子值则优先
+  rho_h   = r.getValue<T>("Two_Phase","rho_h", rho_h);
+  eta_l   = r.getValue<T>("Two_Phase","eta_l", eta_l);
+  sigma   = r.getValue<T>("Two_Phase","sigma", sigma);
+  gravity = r.getValue<T>("Two_Phase","Gravity", gravity);
+  DeltaRho=rho_h-rho_l;
+  H0 = r.getValue<T>("Magnetic_Field","H0", T{-1});
+  if(H0 < T{0}) H0 = std::sqrt(T{2}*sigma*Bo_m/L_dom);   // mu0=1
+
   Beta=T{12.0}*sigma/Interface_Width;
   Kappa=T{3.0}*Interface_Width*sigma*T{0.5};
   Tau_phi=T{3.0}*Mobility+T{0.5}; Omega_phi=T{1.0}/Tau_phi;
   Tau_ns=T{0.5}+eta_h/rho_h/LatSet::cs2;
 
   MPI_RANK(0){
-    printf("---- Rosensweig Instability in Ferrofluid (3D) ----\n");
-    printf("Mesh: %dx%dx%d  BlockCellLen=%d\n",Ni,Nj,Nk,BlockCellLen);
-    printf("Layer: interface z=%.2f  LambdaC=%.1f  perturb A=%.2f rand=%.3f\n",
-           InterfaceZ,LambdaC,PerturbAmp,PerturbRand);
-    printf("rho: l=%.4f h=%.4f  eta: l=%.5f h=%.5f  sigma=%.4f\n",rho_l,rho_h,eta_l,eta_h,sigma);
-    printf("Theory: lambda_c=%.2f g=%.3e tau_ns=%.4f tau_phi=%.4f\n",LambdaC,gravity,Tau_ns,Tau_phi);
-    printf("Magnetic: chi=(%.2f,%.2f) mu=(%.2f,%.2f)  H_c=%.4f  H0=%.4f (H0/Hc=%.2f)  Bo_m=%.2f\n",
-           chi_l,chi_h,mu_l,mu_h,Hc,H0,H0/Hc,Bom_c);
-    printf("PsiSolver: K=%.3f iter=%d\n",PsiSolver_K,PsiSolver_Iter);
+    printf("---- Rayleigh-Taylor Instability in Ferrofluid (3D) ----\n");
+    printf("Mesh: %dx%dx%d  BlockCellLen=%d  L=%.0f\n",Ni,Nj,Nk,BlockCellLen,L_dom);
+    printf("Interface: z0=%.1f  perturb A=%.2f (0.1L=%.1f)  periods=%.0f  W=%.1f\n",
+           InterfaceZ,PerturbAmp,T{0.1}*L_dom,PerturbPeriods,Interface_Width);
+    printf("Dimensionless: At=%.2f  Re=%.0f  Ca=%.2f  U0=%.4f\n",At,Re,Ca,U0);
+    printf("rho: l=%.4f h=%.4f  eta: l=%.5f h=%.5f  sigma=%.3e  g=%.3e\n",
+           rho_l,rho_h,eta_l,eta_h,sigma,gravity);
+    printf("Magnetic: chi=(%.2f,%.2f) mu=(%.2f,%.2f)  Bo_m=%.2f  H0=%.6f\n",
+           chi_l,chi_h,mu_l,mu_h,Bo_m,H0);
+    printf("PsiSolver: K=%.3f iter=%d  tau_ns=%.4f tau_phi=%.4f\n",
+           PsiSolver_K,PsiSolver_Iter,Tau_ns,Tau_phi);
     printf("------------------------------------------\n");
-    if(H0<Hc) fprintf(stderr,"[Warn] H0=%.4f < Hc=%.4f: 界面保持平坦, 不产生尖峰\n",H0,Hc);
+    if(H0<=T{0}) printf("[Note] H0=0 (Bo_m=0): 无磁场对照\n");
   }
 }
 
 int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
   mpi().init(&argc,&argv); MPI_DEBUG_WAIT
-  Printer::Print_BigBanner(std::string("Initializing Rosensweig Instability in 3D..."));
-  readParam();
+  Printer::Print_BigBanner(std::string("Initializing Rayleigh-Taylor Instability in 3D..."));
+  readParam(argc, argv);
 
   // -- converters --
   BaseConverter<T> BaseConv(LatSet::cs2);
@@ -131,7 +129,7 @@ int main(int argc, char* argv[]) {
   AABB<T,3> back  ({0,T(Nj*Cell_Len),0},{T(Ni*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
   BlockGeometryHelper3D<T> GeoHelper(Ni,Nj,Nk,domain,Cell_Len,BlockCellLen);
   // 网格必须能被 BlockCellLen 整除: 每方向块数 = 网格/块长
-  GeoHelper.CreateBlocks(Ni/BlockCellLen,Nj/BlockCellLen,Nk/BlockCellLen);
+  GeoHelper.CreateBlocks(4,4,8);
   GeoHelper.AdaptiveOptimization(mpi().getSize());
   GeoHelper.LoadBalancing(mpi().getSize());
   BlockGeometry3D<T> Geo(GeoHelper);
@@ -250,16 +248,16 @@ int main(int argc, char* argv[]) {
   BroadcastAllMFParams3D<T>(MFLattice,mu_l,mu_h,chi_l,chi_h,H0,PsiSolver_K);
   MFLattice.getField<OMEGA_PSI<T>>().InitValue(T{1.0});
 
-  // -- init phi (3D flat layer + perturbed interface) --
-  // 铁磁流体在下 (phi=1), 溶剂在上 (phi=0):
-  //   phi(z) = 0.5 - 0.5*tanh(2(z - h(x,y))/W),  h(x,y) = z0 + (A/2)(cos+cos) + rand
-  // 周期方域上的平方晶格峰型: cos(2πx/λ_c)+cos(2πy/λ_c) (线性最快模态 k_c = 2π/λ_c)
-  T z0=InterfaceZ*Cell_Len, lam=LambdaC*Cell_Len, W_phys=Interface_Width*Cell_Len;
+  // -- init phi (heavy ferrofluid ON TOP, light solvent below) --
+  // 铁磁流体在上 (phi=1), 溶剂在下 (phi=0):
+  //   phi(z) = 0.5 + 0.5*tanh(2(z - h(x,y))/W)
+  //   h(x,y) = z0 + A*cos(2πx/L)*cos(2πy/L)   (论文 E 节 2D 为 cos(2πx/L),
+  //    3D 推广为 cos·cos 方模态: 中心与四角为峰(重流体尖钉), 四边中点为谷(轻流体前锋))
+  T z0=InterfaceZ*Cell_Len, W_phys=Interface_Width*Cell_Len;
+  T lam=L_dom/PerturbPeriods;
   T kx=T{2}*std::acos(T{-1})/lam;
   auto interfaceHeight=[&](T x, T y)->T{
-    return z0 + T{0.5}*PerturbAmp*Cell_Len*(std::cos(kx*(x-PhaseX*Cell_Len))
-                                          + std::cos(kx*(y-PhaseY*Cell_Len)))
-              + PerturbRand*Cell_Len*hashNoise2D(x,y);
+    return z0 + PerturbAmp*Cell_Len*std::cos(kx*x)*std::cos(kx*y);
   };
   auto& phiField=PFLattice.getField<PHI<T>>();
   for(int b=0;b<Geo.getBlockNum();++b){
@@ -274,7 +272,7 @@ int main(int argc, char* argv[]) {
         for(int i=ov;i<bk.getNx()-ov;++i){
           T x=mx+T(i)*vs;
           T h=interfaceHeight(x,y);
-          T phi=T{0.5}-T{0.5}*std::tanh(T{2.0}*(z-h)/W_phys);
+          T phi=T{0.5}+T{0.5}*std::tanh(T{2.0}*(z-h)/W_phys);
           bPhi.get(k*pr[2]+j*pr[1]+i)=phi;
         }
       }
@@ -294,12 +292,10 @@ int main(int argc, char* argv[]) {
   }
   PFLattice.getField<INTERFACEWIDTH<T>>().InitValue(Interface_Width);
 
-  // init NS pops (u=0, 流体静压 p(z) 分段线性):
-  // 强重力 (g~1e-3) 下 p=0 初始化会引发 ~½gt² 的自由落体瞬态 (压力波
-  // 传播期间界面下沉 1~2 格并造成相场质量损失), 故按局部界面高度 h(x,y)
-  // 初始化流体静压平衡:
-  //   z <= h: p = rho_sol*g*(H-h) + rho_ff*g*(h-z)
-  //   z >  h: p = rho_sol*g*(H-z)
+  // init NS pops (u=0, 流体静压 p(z) 分段线性, 重在上):
+  // 按局部界面高度 h(x,y) 初始化流体静压平衡, 避免 p=0 引发自由落体瞬态:
+  //   z >= h (重): p = rho_h*g*(H - z)
+  //   z <= h (轻): p = rho_h*g*(H - h) + rho_l*g*(h - z)
   T H_total = T(Nk) * Cell_Len;
   Vector<T,3> uz{0,0,0};
   for(int b=0;b<Geo.getBlockNum();++b){
@@ -313,8 +309,8 @@ int main(int argc, char* argv[]) {
         for(int i=ov;i<bk.getNx()-ov;++i){
           T x=mx+T(i)*vs;
           T h=interfaceHeight(x,y);
-          T p = (z<=h) ? rho_l*gravity*(H_total-h) + rho_h*gravity*(h-z)
-                       : rho_l*gravity*(H_total-z);
+          T p = (z>=h) ? rho_h*gravity*(H_total-z)
+                       : rho_h*gravity*(H_total-h) + rho_l*gravity*(h-z);
           std::size_t id=k*pr[2]+j*pr[1]+i; NSCELL c(id,bl);
           for(unsigned kk=0;kk<LatSet::q;++kk){
             T uc=uz*latset::c<LatSet>(kk);
@@ -326,6 +322,15 @@ int main(int argc, char* argv[]) {
   }
 
   // init MF: psi = -H0*z (uniform field along +z), g_k = w_k*psi
+  // -- init MF: 分层 psi 种子 (竖直均匀场 + 界面 B_n 连续) --
+  // 轻流体 (z<=z0): psi = -H0*z                              (H=H0)
+  // 重流体 (z> z0): psi = -H0*(mu_l/mu_h)*z - H0*(1-mu_l/mu_h)*z0  (H=H0*mu_l/mu_h)
+  // 铁磁流体(重)贴顶壁, 顶壁 psi 钉扎必须用分层值, 否则整个重流体区被强行拉
+  // 到 H=H0 (违反 B_n 跨界面连续), 界面处产生虚假 ∇|H|² 磁力。
+  auto psiLayered = [&](T z)->T{
+    if(z <= z0) return -H0*z;
+    return -H0*(mu_l/mu_h)*z - H0*(T{1}-mu_l/mu_h)*z0;
+  };
   {
     auto& psiF=MFLattice.getField<PSI<T>>();
     for(int b=0;b<Geo.getBlockNum();++b){
@@ -333,7 +338,7 @@ int main(int argc, char* argv[]) {
       auto& bPsi=psiF.getBlockField(b);
       T vs=bk.getVoxelSize(),mz=bk.getMin()[2];
       for(int k=0;k<bk.getNz();++k){
-        T z=mz+T(k)*vs, psi=-H0*z;
+        T z=mz+T(k)*vs, psi=psiLayered(z);
         for(int j=0;j<bk.getNy();++j){
           for(int i=0;i<bk.getNx();++i){
             std::size_t id=k*pr[2]+j*pr[1]+i; MFCELL c(id,bl);
@@ -414,7 +419,7 @@ int main(int argc, char* argv[]) {
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
   vtmo::ScalarWriter Hmw("HMAG",MFLattice.getField<HMAG<T>>());
-  vtmo::vtmWriter<T,3> MW("rosenMag3d",Geo);
+  vtmo::vtmWriter<T,3> MW("rtMag3d",Geo);
   MW.addWriterSet(PW,Hmw);
 
   // ===== initial setup =====
@@ -440,10 +445,10 @@ int main(int argc, char* argv[]) {
     MCC.ApplyInnerCellDynamics<MCSel>(t(),FlagFM);
     CommunicateOMEGAPSI<T>(MFLattice);
 
-    // 0b: Set wall psi = -H0*z  and wall pops = feq(psi_bc)
-    // NOTE: lattice row kk holds physical z = minZ + (kk-ov)*vs (ov halo
-    // rows below the block). Pinning by absolute z (halo + wall rows) gives
-    // the exact linear profile, so H == H0 everywhere in the far field.
+    // 0b: Set wall psi (layered: 轻流体 -H0*z, 重流体 -H0*(mu_l/mu_h)*z+C) and
+    // wall pops = feq(psi_bc). NOTE: lattice row kk holds physical z =
+    // minZ + (kk-ov)*vs (ov halo rows below the block). Pinning by absolute z
+    // (halo + wall rows) gives the exact layered profile.
     {
       auto& psiF=MFLattice.getField<PSI<T>>();
       const T nwall=Cell_Len*T{3.0};
@@ -455,7 +460,7 @@ int main(int argc, char* argv[]) {
         for(int kk=0;kk<nz;++kk){
           T z=minZ+T(kk-ov)*vs;
           if((z<=nwall&&z>=-nwall)||(z<=H_global+nwall&&z>=H_global-nwall)){
-            T psi_w=-H0*z;
+            T psi_w=psiLayered(z);
             for(int jj=0;jj<ny;++jj){
               for(int ii=0;ii<nx;++ii){
                 std::size_t id=kk*pr[2]+jj*pr[1]+ii; MFCELL c(id,bl);
@@ -665,7 +670,7 @@ int main(int argc, char* argv[]) {
           for(int kk=0;kk<nz;++kk){
             T z=minZ+T(kk-ov)*vs;
             if((z<=nwall&&z>=-nwall)||(z<=H_global+nwall&&z>=H_global-nwall)){
-              T psi_w=-H0*z;
+              T psi_w=psiLayered(z);
               for(int jj=0;jj<ny;++jj){
                 for(int ii=0;ii<nx;++ii){
                   std::size_t id=kk*pr[2]+jj*pr[1]+ii; MFCELL c(id,bl);
@@ -802,15 +807,15 @@ int main(int argc, char* argv[]) {
     }
     PFLattice.getField<PHI<T>>().Communicate();
 
-    // wall phi BC: 底壁 phi=1 (铁磁流体), 顶壁 phi=0 (溶剂)
+    // wall phi BC: 底壁 phi=0 (轻流体), 顶壁 phi=1 (重铁磁流体, 在上)
     {
       auto& pF=PFLattice.getField<PHI<T>>();
       for(int b=0;b<Geo.getBlockNum();++b){
         const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         auto& bP=pF.getBlockField(b); int nx=bk.getNx(),ny=bk.getNy(),nz=bk.getNz(),ov=bk.getOverlap();
         T mz=bk.getMin()[2],Mz=bk.getMax()[2];
-        if(mz<Cell_Len*T{1.5}) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i)bP.get(ov*pr[2]+jj*pr[1]+i)=T{1};
-        if(Mz>H_global-Cell_Len*T{1.5}){int kk=nz-1-ov;for(int jj=0;jj<ny;++jj)for(int i=0;i<nx;++i)bP.get(kk*pr[2]+jj*pr[1]+i)=T{0};}
+        if(mz<Cell_Len*T{1.5}) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i)bP.get(ov*pr[2]+jj*pr[1]+i)=T{0};
+        if(Mz>H_global-Cell_Len*T{1.5}){int kk=nz-1-ov;for(int jj=0;jj<ny;++jj)for(int i=0;i<nx;++i)bP.get(kk*pr[2]+jj*pr[1]+i)=T{1};}
       }
     }
     PFLattice.getField<PHI<T>>().Communicate();
@@ -822,8 +827,8 @@ int main(int argc, char* argv[]) {
         const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         auto& bP=pF.getBlockField(b); int nx=bk.getNx(),ny=bk.getNy(),nz=bk.getNz(),ov=bk.getOverlap();
         T mz=bk.getMin()[2],Mz=bk.getMax()[2];
-        if(mz<Cell_Len*T{1.5}) for(int k=0;k<ov;++k) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i) bP.get(k*pr[2]+jj*pr[1]+i)=T{1};
-        if(Mz>H_global-Cell_Len*T{1.5}) for(int k=nz-ov;k<nz;++k) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i) bP.get(k*pr[2]+jj*pr[1]+i)=T{0};
+        if(mz<Cell_Len*T{1.5}) for(int k=0;k<ov;++k) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i) bP.get(k*pr[2]+jj*pr[1]+i)=T{0};
+        if(Mz>H_global-Cell_Len*T{1.5}) for(int k=nz-ov;k<nz;++k) for(int jj=0;jj<ny;++jj) for(int i=0;i<nx;++i) bP.get(k*pr[2]+jj*pr[1]+i)=T{1};
       }
     }
 
@@ -885,7 +890,9 @@ int main(int argc, char* argv[]) {
 
     ++t; ++ot;
     if(t()%OutputStep==0){
-      // 界面高度诊断: 每列 (i,j) 找 phi=0.5 的 z, 输出 max/min 尖峰/谷深
+      // RT 界面诊断: 每列 (i,j) 找 phi=0.5 的 z
+      //   hmax = 轻流体前锋 (轻气泡在谷列上浮, 界面最高点, 自 z0 增大)
+      //   hmin = 重流体尖钉 (重尖钉在峰列下探, 界面最低点, 自 z0 减小)
       T hmax=-1e30, hmin=1e30;
       {
         auto& pF=PFLattice.getField<PHI<T>>();
@@ -920,8 +927,10 @@ int main(int argc, char* argv[]) {
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
       Printer::Endl();
       if (mpi().getRank() == 0) {
-        printf("[t=%d] h_max=%.3f h_min=%.3f  amp=%.3f (z0=%.2f)\n",
-               t(),hmax,hmin,(hmax-hmin)*T{0.5},InterfaceZ);
+        // 论文 E 节无量纲时间 t* = t / sqrt(L/(g*At))
+        T tstar = T(t()) / std::sqrt(L_dom/(gravity*At));
+        printf("[t=%d t*=%.3f] light_front=%.3f heavy_tip=%.3f  amp=%.3f (z0=%.2f)\n",
+               t(),tstar,hmax,hmin,(hmax-hmin)*T{0.5},InterfaceZ);
       }
       MW.WriteBinary(t());
     }
