@@ -9,4 +9,4 @@ module load gcc/12.2
 make clean
 make
 # 128x64x256 网格 / BlockCellLen=32 -> 4x2x8=64 blocks, 用 64 进程 (每进程 1 块)
-mpiexec -n 64 ./khMag3d.exe
+mpiexec -n 128 ./khMag3d.exe

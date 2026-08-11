@@ -423,9 +423,8 @@ int main(int argc, char* argv[]) {
 
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-  vtmo::ScalarWriter Hmw("HMAG",MFLattice.getField<HMAG<T>>());
-  vtmo::vtmWriter<T,3> MW("khMag3d",Geo);
-  MW.addWriterSet(PW,Hmw);
+    vtmo::vtmWriter<T,3> MW("khMag3d",Geo);
+  MW.addWriterSet(PW);
 
   // ===== initial setup =====
   PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
