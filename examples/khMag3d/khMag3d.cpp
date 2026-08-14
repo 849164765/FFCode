@@ -20,7 +20,7 @@ T Interface_Width, Mobility, Tau_phi, Omega_phi, Kappa, Beta;
 
 // two-phase (KH dimensionless -> lattice; Re/We/Fr use the SOLVENT = code "l" side)
 T rho_l, rho_h, eta_l, eta_h, sigma, gravity, Tau_ns, DeltaRho;
-T Re, We, Fr, U0, L_dom;
+T Re, We, Fr, U0, L_dom, L_ref;
 
 // magnetic field
 T chi_l, chi_h, mu_l, mu_h, H0, Bo_m;
@@ -69,13 +69,16 @@ void readParam(int argc, char* argv[]) {
   //   rho_h = rho_l*ratio_hl (铁磁流体在 φ=1, 略轻: rho_h<rho_l),
   //   Re = rho_l*U0*L/eta_l,  We = rho_l*L*U0^2/sigma,  Fr = U0^2/(gL),
   //   Bo_m = mu0*H0^2*L/(2*sigma) (mu0=1)
+  // L_dom = 域宽 (x 方向, = 2L), L_ref = 参考长度 L = Ni/2 (论文 F 节 L=256 的 4x 缩小).
+  // 无量纲数/界面波长必须都用 L_ref, 与 ini 几何 (λ=L, A=0.1L, z0=2L) 一致.
   const T pi = std::acos(T{-1});
   L_dom = T(Ni)*Cell_Len;
+  L_ref = T(Ni)*Cell_Len/T{2};
   T ratio_hl = r.getValue<T>("Two_Phase","rho_hl_ratio", T{0.99});
   rho_h = rho_l*ratio_hl;
-  eta_l = rho_l*U0*L_dom/Re;
-  sigma = rho_l*L_dom*U0*U0/We;
-  gravity = U0*U0/(Fr*L_dom);
+  eta_l = rho_l*U0*L_ref/Re;
+  sigma = rho_l*L_ref*U0*U0/We;
+  gravity = U0*U0/(Fr*L_ref);
   // 显式覆盖 (可选): 若 ini 直接给出这些格子值则优先
   rho_h   = r.getValue<T>("Two_Phase","rho_h", rho_h);
   eta_l   = r.getValue<T>("Two_Phase","eta_l", eta_l);
@@ -83,7 +86,7 @@ void readParam(int argc, char* argv[]) {
   gravity = r.getValue<T>("Two_Phase","Gravity", gravity);
   DeltaRho=rho_h-rho_l;
   H0 = r.getValue<T>("Magnetic_Field","H0", T{-1});
-  if(H0 < T{0}) H0 = std::sqrt(T{2}*sigma*Bo_m/L_dom);   // mu0=1
+  if(H0 < T{0}) H0 = std::sqrt(T{2}*sigma*Bo_m/L_ref);   // mu0=1
 
   Beta=T{12.0}*sigma/Interface_Width;
   Kappa=T{3.0}*Interface_Width*sigma*T{0.5};
@@ -92,9 +95,9 @@ void readParam(int argc, char* argv[]) {
 
   MPI_RANK(0){
     printf("---- Kelvin-Helmholtz Instability in Ferrofluid (3D) ----\n");
-    printf("Mesh: %dx%dx%d  BlockCellLen=%d  L=%.0f (2L=%.0f)\n",Ni,Nj,Nk,BlockCellLen,L_dom,T{2}*L_dom);
+    printf("Mesh: %dx%dx%d  BlockCellLen=%d  L=%.0f (2L=%.0f)\n",Ni,Nj,Nk,BlockCellLen,L_ref,T{2}*L_ref);
     printf("Interface: z0=%.1f  perturb A=%.2f (0.1L=%.1f)  periods=%.0f  W=%.1f\n",
-           InterfaceZ,PerturbAmp,T{0.1}*L_dom,PerturbPeriods,Interface_Width);
+           InterfaceZ,PerturbAmp,T{0.1}*L_ref,PerturbPeriods,Interface_Width);
     printf("Dimensionless: Re=%.0f  We=%.0f  Fr=%.2f  U0=%.4f\n",Re,We,Fr,U0);
     printf("rho: solvent(l)=%.4f ferrofluid(h)=%.4f  eta: l=%.5f h=%.5f  sigma=%.3e  g=%.3e\n",
            rho_l,rho_h,eta_l,eta_h,sigma,gravity);
@@ -443,6 +446,117 @@ int main(int argc, char* argv[]) {
   Timer t; Timer ot;
   T H_global=T(Nk)*Cell_Len;
 
+  // ---- MF periodic-seam sync plans (3D port of the 2D MFGhostSyncPlans).
+  // x/y-wrapped ghost planes of the per-cell MF fields must mirror the opposite edge's
+  // physical seam plane. MF_Per.Apply() copies only pops + GenericRho (which resolves to
+  // PHI), so these fields are never exchanged by the framework. Precompute the partner
+  // plans ONCE (same-rank direct copy; cross-rank non-blocking exchange keyed by the
+  // sender's global block id, distinct send/recv tags). The old per-call GlobalBlockTable
+  // + single-tag sendRecv corrupted the field at cross-rank seams (1-rank clean vs MPI
+  // broken at the y-seam). For KH the x-seam PSI is further fixed by SetXSeamPsiPops
+  // (ramp-shift periodic) afterwards; H fields are plain-periodic in x.
+  struct MFGhostSyncPlan {
+    std::size_t ghostBlockIdx, srcBlockIdx;
+    bool xSeam;
+    int ghostPlaneIdx, seamPlaneIdx, srcPlaneIdx, plane;
+    bool crossRank;
+    int partnerRank, sendTag, recvTag;
+  };
+  std::vector<MFGhostSyncPlan> MFGhostSyncPlans;
+  {
+    const T xLeft=T{0}, xRight=T(Ni)*Cell_Len, yFront=T{0}, yBack=T(Nj)*Cell_Len;
+    auto edgeX = [&](const auto& bk, bool& atL, bool& atR){
+      atL = bk.getMin()[0] < xLeft + Cell_Len*T{0.5};
+      atR = bk.getMax()[0] > xRight - Cell_Len*T{0.5};
+    };
+    auto edgeY = [&](const auto& bk, bool& atF, bool& atB){
+      atF = bk.getMin()[1] < yFront + Cell_Len*T{0.5};
+      atB = bk.getMax()[1] > yBack - Cell_Len*T{0.5};
+    };
+    for (std::size_t b=0;b<Geo.getBlockNum();++b){
+      const auto& bk=Geo.getBlock(b);
+      bool atL,atR; edgeX(bk,atL,atR);
+      bool atF,atB; edgeY(bk,atF,atB);
+      if(!atL&&!atR&&!atF&&!atB) continue;
+      const int ov=bk.getOverlap();
+      const int nx=bk.getNx(), ny=bk.getNy(), nz=bk.getNz();
+      if(atL||atR){
+        MFGhostSyncPlan pl;
+        pl.ghostBlockIdx=b; pl.xSeam=true; pl.crossRank=false;
+        pl.ghostPlaneIdx = atL ? (ov-1) : (nx-ov);
+        pl.seamPlaneIdx  = atL ? ov : (nx-1-ov);
+        pl.plane = ny*nz;
+        std::size_t partner=Geo.getBlockNum();
+        for(std::size_t bp=0;bp<Geo.getBlockNum();++bp){
+          const auto& bk2=Geo.getBlock(bp);
+          if(bk2.getMin()[1]!=bk.getMin()[1]||bk2.getMin()[2]!=bk.getMin()[2]) continue;
+          bool pL,pR; edgeX(bk2,pL,pR);
+          if(!((atL&&pR)||(atR&&pL))) continue;
+          partner=bp; break;
+        }
+        if(partner<Geo.getBlockNum()){
+          const auto& pb=Geo.getBlock(partner); const int pov=pb.getOverlap();
+          pl.srcBlockIdx=partner;
+          pl.srcPlaneIdx = atL ? (pb.getNx()-1-pov) : pov;
+          MFGhostSyncPlans.push_back(pl);
+        } else {
+#ifdef MPI_ENABLED
+          const auto& globalGeo=GeoHelper.getBlockGeometry();
+          int partnerId=-1;
+          for(std::size_t g=0;g<globalGeo.getBlockNum();++g){
+            const auto& gb=globalGeo.getBlock(g);
+            if(gb.getMin()[1]!=bk.getMin()[1]||gb.getMin()[2]!=bk.getMin()[2]) continue;
+            bool gL,gR; edgeX(gb,gL,gR);
+            if(!((atL&&gR)||(atR&&gL))) continue;
+            partnerId=gb.getBlockId(); break;
+          }
+          if(partnerId<0) continue;
+          pl.crossRank=true; pl.partnerRank=GeoHelper.whichRank(partnerId);
+          pl.sendTag=bk.getBlockId(); pl.recvTag=partnerId;
+          MFGhostSyncPlans.push_back(pl);
+#endif
+        }
+      }
+      if(atF||atB){
+        MFGhostSyncPlan pl;
+        pl.ghostBlockIdx=b; pl.xSeam=false; pl.crossRank=false;
+        pl.ghostPlaneIdx = atF ? (ov-1) : (ny-ov);
+        pl.seamPlaneIdx  = atF ? ov : (ny-1-ov);
+        pl.plane = nx*nz;
+        std::size_t partner=Geo.getBlockNum();
+        for(std::size_t bp=0;bp<Geo.getBlockNum();++bp){
+          const auto& bk2=Geo.getBlock(bp);
+          if(bk2.getMin()[0]!=bk.getMin()[0]||bk2.getMin()[2]!=bk.getMin()[2]) continue;
+          bool pF,pB; edgeY(bk2,pF,pB);
+          if(!((atF&&pB)||(atB&&pF))) continue;
+          partner=bp; break;
+        }
+        if(partner<Geo.getBlockNum()){
+          const auto& pb=Geo.getBlock(partner); const int pov=pb.getOverlap();
+          pl.srcBlockIdx=partner;
+          pl.srcPlaneIdx = atF ? (pb.getNy()-1-pov) : pov;
+          MFGhostSyncPlans.push_back(pl);
+        } else {
+#ifdef MPI_ENABLED
+          const auto& globalGeo=GeoHelper.getBlockGeometry();
+          int partnerId=-1;
+          for(std::size_t g=0;g<globalGeo.getBlockNum();++g){
+            const auto& gb=globalGeo.getBlock(g);
+            if(gb.getMin()[0]!=bk.getMin()[0]||gb.getMin()[2]!=bk.getMin()[2]) continue;
+            bool gF,gB; edgeY(gb,gF,gB);
+            if(!((atF&&gB)||(atB&&gF))) continue;
+            partnerId=gb.getBlockId(); break;
+          }
+          if(partnerId<0) continue;
+          pl.crossRank=true; pl.partnerRank=GeoHelper.whichRank(partnerId);
+          pl.sendTag=bk.getBlockId(); pl.recvTag=partnerId;
+          MFGhostSyncPlans.push_back(pl);
+#endif
+        }
+      }
+    }
+  }
+
   while(t()<MaxStep){
     // ===== Phase 0: Magnetic field solve =====
     // 0a: Update per-cell mu, chi, omega_psi from phi
@@ -495,133 +609,178 @@ int main(int argc, char* argv[]) {
     // 定位跨 rank partner, 用 MPI sendRecv 交换物理边平面。
     // tag = fidx*1000 + min(eLocal,ePartner)*2 + dir, 双方由同一张表计算
     // 出相同 tag, 保证消息一一配对。
-    auto SyncMFPeriodicGhosts = [&](auto& field, int fidx) {
-      const T xLeft = T{0};
-      const T xRight = T(Ni) * Cell_Len;
-      const T yFront = T{0};
-      const T yBack = T(Nj) * Cell_Len;
-      const int nEntry = int(GlobalBlockTable.size() / 11);
-      const int myRank = mpi().getRank();
-      for (int b = 0; b < Geo.getBlockNum(); ++b) {
-        const auto& bk = Geo.getBlock(b);
-        const bool atL = bk.getMin()[0] < xLeft + Cell_Len * T{0.5};
-        const bool atR = bk.getMax()[0] > xRight - Cell_Len * T{0.5};
-        const bool atF = bk.getMin()[1] < yFront + Cell_Len * T{0.5};
-        const bool atB = bk.getMax()[1] > yBack - Cell_Len * T{0.5};
-        if (!atL && !atR && !atF && !atB) continue;
+    // Execute the precomputed MFGhostSyncPlans for one per-cell field.
+    auto SyncMFPeriodicGhosts = [&](auto& field) {
+#ifdef MPI_ENABLED
+      constexpr int MF_SYNC_TAG_BASE = 9500; // distinct from PERIODIC_TAG_BASE (9000)
+      std::vector<std::vector<T>> sendBufs, recvBufs;
+      std::vector<MPI_Request> sendReqs, recvReqs;
+      std::vector<std::size_t> recvBlock;
+      std::vector<int> recvPlaneIdx;
+      std::vector<bool> recvXSeam;
+#endif
+      for (const auto& pl : MFGhostSyncPlans) {
+        auto& fg = field.getBlockField(pl.ghostBlockIdx);
+        const auto& bk = Geo.getBlock(pl.ghostBlockIdx);
         const auto& pr = bk.getProjection();
-        const int nx = bk.getNx(), ny = bk.getNy(), nz = bk.getNz();
-        auto& f1 = field.getBlockField(b);
-        // ---- x 方向: partner 同 (minY,minZ), 对侧 x 边 ----
-        if (atL || atR) {
-          int eL = -1, eP = -1;
-          for (int e = 0; e < nEntry; ++e) {
-            const double* en = &GlobalBlockTable[e * 11];
-            if (en[2] != bk.getMin()[1] || en[3] != bk.getMin()[2]) continue;
-            if (atL && en[8] > T{0.5}) eP = e;  // partner atR
-            if (atR && en[7] > T{0.5}) eP = e;  // partner atL
-            if (int(en[0]) == myRank && en[1] == bk.getMin()[0] &&
-                en[2] == bk.getMin()[1] && en[3] == bk.getMin()[2])
-              eL = e;
-          }
-          if (eP >= 0 && eL >= 0) {
-            const double* enP = &GlobalBlockTable[eP * 11];
-            const int pRank = int(enP[0]);
-            const int pnx = int(enP[4]);
-            const int plane = ny * nz;
-            if (pRank == myRank) {
-              int pb = -1;
-              for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
-                const auto& bkk = Geo.getBlock(bb);
-                if (bkk.getMin()[0] == enP[1] && bkk.getMin()[1] == enP[2] &&
-                    bkk.getMin()[2] == enP[3]) { pb = bb; break; }
-              }
-              if (pb >= 0) {
-                auto& f2 = field.getBlockField(pb);
-                const int pnx2 = Geo.getBlock(pb).getNx();
-                if (atL) for (int kk = 0; kk < nz; ++kk)
-                  for (int jj = 0; jj < ny; ++jj)
-                    f1.get(kk * pr[2] + jj * pr[1] + 0) = f2.get(kk * pr[2] + jj * pr[1] + pnx2 - 2);
-                if (atR) for (int kk = 0; kk < nz; ++kk)
-                  for (int jj = 0; jj < ny; ++jj)
-                    f1.get(kk * pr[2] + jj * pr[1] + nx - 1) = f2.get(kk * pr[2] + jj * pr[1] + 1);
-              }
-            } else {
-              const int tag = fidx * 1000 + std::min(eL, eP) * 2 + 0;
-              const int srcI = atL ? 1 : (nx - 2);
-              const int dstI = atL ? 0 : (nx - 1);
-              std::vector<T> sbuf(plane), rbuf(plane);
-              int kk = 0;
-              for (int k = 0; k < nz; ++k)
-                for (int j = 0; j < ny; ++j)
-                  sbuf[kk++] = f1.get(k * pr[2] + j * pr[1] + srcI);
-              mpi().sendRecv(sbuf.data(), rbuf.data(), plane, pRank, pRank, tag);
-              kk = 0;
-              for (int k = 0; k < nz; ++k)
-                for (int j = 0; j < ny; ++j)
-                  f1.get(k * pr[2] + j * pr[1] + dstI) = rbuf[kk++];
-            }
+        if (!pl.crossRank) {
+          auto& fs = field.getBlockField(pl.srcBlockIdx);
+          const auto& spr = Geo.getBlock(pl.srcBlockIdx).getProjection();
+          if (pl.xSeam) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j)
+                fg.get(k*pr[2]+j*pr[1]+pl.ghostPlaneIdx) = fs.get(k*spr[2]+j*spr[1]+pl.srcPlaneIdx);
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i=0;i<bk.getNx();++i)
+                fg.get(k*pr[2]+pl.ghostPlaneIdx*pr[1]+i) = fs.get(k*spr[2]+pl.srcPlaneIdx*spr[1]+i);
           }
         }
-        // ---- y 方向: partner 同 (minX,minZ), 对侧 y 边 ----
-        if (atF || atB) {
-          int eL = -1, eP = -1;
-          for (int e = 0; e < nEntry; ++e) {
-            const double* en = &GlobalBlockTable[e * 11];
-            if (en[1] != bk.getMin()[0] || en[3] != bk.getMin()[2]) continue;
-            if (atF && en[10] > T{0.5}) eP = e;  // partner atB
-            if (atB && en[9]  > T{0.5}) eP = e;  // partner atF
-            if (int(en[0]) == myRank && en[1] == bk.getMin()[0] &&
-                en[2] == bk.getMin()[1] && en[3] == bk.getMin()[2])
-              eL = e;
+#ifdef MPI_ENABLED
+        else {
+          sendBufs.emplace_back(pl.plane);
+          auto& sb = sendBufs.back();
+          int kk=0;
+          if (pl.xSeam) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j)
+                sb[kk++] = fg.get(k*pr[2]+j*pr[1]+pl.seamPlaneIdx);
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i=0;i<bk.getNx();++i)
+                sb[kk++] = fg.get(k*pr[2]+pl.seamPlaneIdx*pr[1]+i);
           }
-          if (eP >= 0 && eL >= 0) {
-            const double* enP = &GlobalBlockTable[eP * 11];
-            const int pRank = int(enP[0]);
-            const int pny = int(enP[5]);
-            const int plane = nx * nz;
-            if (pRank == myRank) {
-              int pb = -1;
-              for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
-                const auto& bkk = Geo.getBlock(bb);
-                if (bkk.getMin()[0] == enP[1] && bkk.getMin()[1] == enP[2] &&
-                    bkk.getMin()[2] == enP[3]) { pb = bb; break; }
-              }
-              if (pb >= 0) {
-                auto& f2 = field.getBlockField(pb);
-                const int pny2 = Geo.getBlock(pb).getNy();
-                if (atF) for (int kk = 0; kk < nz; ++kk)
-                  for (int ii = 0; ii < nx; ++ii)
-                    f1.get(kk * pr[2] + 0 * pr[1] + ii) = f2.get(kk * pr[2] + (pny2 - 2) * pr[1] + ii);
-                if (atB) for (int kk = 0; kk < nz; ++kk)
-                  for (int ii = 0; ii < nx; ++ii)
-                    f1.get(kk * pr[2] + (ny - 1) * pr[1] + ii) = f2.get(kk * pr[2] + 1 * pr[1] + ii);
-              }
-            } else {
-              const int tag = fidx * 1000 + std::min(eL, eP) * 2 + 1;
-              const int srcJ = atF ? 1 : (ny - 2);
-              const int dstJ = atF ? 0 : (ny - 1);
-              std::vector<T> sbuf(plane), rbuf(plane);
-              int kk = 0;
-              for (int k = 0; k < nz; ++k)
-                for (int i = 0; i < nx; ++i)
-                  sbuf[kk++] = f1.get(k * pr[2] + srcJ * pr[1] + i);
-              mpi().sendRecv(sbuf.data(), rbuf.data(), plane, pRank, pRank, tag);
-              kk = 0;
-              for (int k = 0; k < nz; ++k)
-                for (int i = 0; i < nx; ++i)
-                  f1.get(k * pr[2] + dstJ * pr[1] + i) = rbuf[kk++];
-            }
+          MPI_Request srq, rrq;
+          mpi().iSend(sb.data(), pl.plane, pl.partnerRank, &srq, MF_SYNC_TAG_BASE + pl.sendTag);
+          sendReqs.push_back(srq);
+          recvBufs.emplace_back(pl.plane);
+          recvBlock.push_back(pl.ghostBlockIdx);
+          recvPlaneIdx.push_back(pl.ghostPlaneIdx);
+          recvXSeam.push_back(pl.xSeam);
+          mpi().iRecv(recvBufs.back().data(), pl.plane, pl.partnerRank, &rrq, MF_SYNC_TAG_BASE + pl.recvTag);
+          recvReqs.push_back(rrq);
+        }
+#endif
+      }
+#ifdef MPI_ENABLED
+      if (!sendReqs.empty()) {
+        MPI_Waitall(static_cast<int>(sendReqs.size()), sendReqs.data(), MPI_STATUSES_IGNORE);
+        for (std::size_t i=0;i<recvReqs.size();++i) {
+          MPI_Wait(&recvReqs[i], MPI_STATUS_IGNORE);
+          auto& fg = field.getBlockField(recvBlock[i]);
+          const auto& bk = Geo.getBlock(recvBlock[i]);
+          const auto& pr = bk.getProjection();
+          const auto& rb = recvBufs[i];
+          int kk=0;
+          if (recvXSeam[i]) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j)
+                fg.get(k*pr[2]+j*pr[1]+recvPlaneIdx[i]) = rb[kk++];
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i2=0;i2<bk.getNx();++i2)
+                fg.get(k*pr[2]+recvPlaneIdx[i]*pr[1]+i2) = rb[kk++];
           }
         }
       }
+#endif
     };
 
-    // KH: x 缝斜坡平移周期 BC — x 缝 ghost 的 ψ 与分布函数设为
-    //   ψ_ghost = ψ(对侧物理列) + sign·(H0*Lx),  sign = +1 (atL), -1 (atR)。
-    // 对扰动部分 ψ̃=ψ+H0*x 该 BC 恰为周期(ψ̃ 在缝处连续), 故全量 ψ 求解自动含
-    // 界面磁场畸变, 无需源项/分解。在子迭代里每次 Stream 前调用以提供正确的
-    // 入流分布; 求解结束后再调用一次以修正 ghost 的 ψ 场值供 H 计算读取。
+    // ---- Seam POP exchange (fixes MF_Per's stale-ghost coverage gap at the seams).
+    // Called after MF_Per.Apply(); SetXSeamPsiPops then overrides the x-seam PSI pops
+    // with the ramp-shift.  The y-seam ghost POPs (plain periodic) are re-copied from the
+    // partner's physical seam row so the D3Q7 Stream never reads the stale cells that
+    // MF_Per leaves behind (the periodic-seam boundary artifact).
+    auto SyncMFPops = [&]() {
+#ifdef MPI_ENABLED
+      constexpr int MF_POP_TAG_BASE = 9600; // distinct from MF_SYNC_TAG_BASE (9500)
+      std::vector<std::vector<T>> sendBufs, recvBufs;
+      std::vector<MPI_Request> sendReqs, recvReqs;
+      std::vector<std::size_t> recvBlock;
+      std::vector<int> recvPlaneIdx;
+      std::vector<bool> recvXSeam;
+#endif
+      for (const auto& pl : MFGhostSyncPlans) {
+        auto& gbl = MFLattice.getBlockLat(pl.ghostBlockIdx);
+        const auto& bk = Geo.getBlock(pl.ghostBlockIdx);
+        const auto& pr = bk.getProjection();
+        if (!pl.crossRank) {
+          auto& sbl = MFLattice.getBlockLat(pl.srcBlockIdx);
+          const auto& spr = Geo.getBlock(pl.srcBlockIdx).getProjection();
+          if (pl.xSeam) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j) {
+                MFCELL gc(k*pr[2]+j*pr[1]+pl.ghostPlaneIdx, gbl);
+                MFCELL sc(k*spr[2]+j*spr[1]+pl.srcPlaneIdx, sbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) gc[q]=sc[q];
+              }
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i=0;i<bk.getNx();++i) {
+                MFCELL gc(k*pr[2]+pl.ghostPlaneIdx*pr[1]+i, gbl);
+                MFCELL sc(k*spr[2]+pl.srcPlaneIdx*spr[1]+i, sbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) gc[q]=sc[q];
+              }
+          }
+        }
+#ifdef MPI_ENABLED
+        else {
+          sendBufs.emplace_back(pl.plane * MFLatSet::q);
+          auto& sb = sendBufs.back();
+          int kk=0;
+          if (pl.xSeam) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j) {
+                MFCELL c(k*pr[2]+j*pr[1]+pl.seamPlaneIdx, gbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) sb[kk++]=c[q];
+              }
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i=0;i<bk.getNx();++i) {
+                MFCELL c(k*pr[2]+pl.seamPlaneIdx*pr[1]+i, gbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) sb[kk++]=c[q];
+              }
+          }
+          MPI_Request srq, rrq;
+          mpi().iSend(sb.data(), static_cast<int>(pl.plane*MFLatSet::q), pl.partnerRank, &srq, MF_POP_TAG_BASE + pl.sendTag);
+          sendReqs.push_back(srq);
+          recvBufs.emplace_back(pl.plane * MFLatSet::q);
+          recvBlock.push_back(pl.ghostBlockIdx);
+          recvPlaneIdx.push_back(pl.ghostPlaneIdx);
+          recvXSeam.push_back(pl.xSeam);
+          mpi().iRecv(recvBufs.back().data(), static_cast<int>(pl.plane*MFLatSet::q), pl.partnerRank, &rrq, MF_POP_TAG_BASE + pl.recvTag);
+          recvReqs.push_back(rrq);
+        }
+#endif
+      }
+#ifdef MPI_ENABLED
+      if (!sendReqs.empty()) {
+        MPI_Waitall(static_cast<int>(sendReqs.size()), sendReqs.data(), MPI_STATUSES_IGNORE);
+        for (std::size_t i=0;i<recvReqs.size();++i) {
+          MPI_Wait(&recvReqs[i], MPI_STATUS_IGNORE);
+          auto& gbl = MFLattice.getBlockLat(recvBlock[i]);
+          const auto& bk = Geo.getBlock(recvBlock[i]);
+          const auto& pr = bk.getProjection();
+          const auto& rb = recvBufs[i];
+          int kk=0;
+          if (recvXSeam[i]) {
+            for (int k=0;k<bk.getNz();++k)
+              for (int j=0;j<bk.getNy();++j) {
+                MFCELL gc(k*pr[2]+j*pr[1]+recvPlaneIdx[i], gbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) gc[q]=rb[kk++];
+              }
+          } else {
+            for (int k=0;k<bk.getNz();++k)
+              for (int i2=0;i2<bk.getNx();++i2) {
+                MFCELL gc(k*pr[2]+recvPlaneIdx[i]*pr[1]+i2, gbl);
+                for (unsigned q=0;q<MFLatSet::q;++q) gc[q]=rb[kk++];
+              }
+          }
+        }
+      }
+#endif
+    };
+
     const T Lx = T(Ni) * Cell_Len;
     const T rampShift = H0 * Lx;
     auto SetXSeamPsiPops = [&]() {
@@ -719,6 +878,7 @@ int main(int argc, char* argv[]) {
         }
       }
       MF_Per.Apply();
+      SyncMFPops();   // re-exchange the seam ghost POPs (SetXSeamPsiPops overrides x-seam)
 
       // 0d: Stream (先施加 x 缝斜坡平移周期 BC: 提供正确的入流分布)
       MFLattice.NormalFullCommunicate();
@@ -777,7 +937,7 @@ int main(int argc, char* argv[]) {
     // read by A4 below, after the sync that follows 0f.
     // PSI 缝同步: y 向普通周期 (SyncMFPeriodicGhosts), x 向用斜坡平移周期 BC 覆写
     // (SyncMFPeriodicGhosts 会把斜坡按普通周期卷绕而错位, SetXSeamPsiPops 修正 x)。
-    SyncMFPeriodicGhosts(MFLattice.getField<PSI<T>>(), 0);
+    SyncMFPeriodicGhosts(MFLattice.getField<PSI<T>>());
     SetXSeamPsiPops();
 
     // 0f: Compute H = -∇ψ
@@ -794,10 +954,10 @@ int main(int argc, char* argv[]) {
       }
     }
     CommunicateAllMFFields3D<T>(MFLattice);
-    SyncMFPeriodicGhosts(MFLattice.getField<HX<T>>(), 1);
-    SyncMFPeriodicGhosts(MFLattice.getField<HY<T>>(), 2);
-    SyncMFPeriodicGhosts(MFLattice.getField<HZ<T>>(), 3);
-    SyncMFPeriodicGhosts(MFLattice.getField<HMAG<T>>(), 4);
+    SyncMFPeriodicGhosts(MFLattice.getField<HX<T>>());
+    SyncMFPeriodicGhosts(MFLattice.getField<HY<T>>());
+    SyncMFPeriodicGhosts(MFLattice.getField<HZ<T>>());
+    SyncMFPeriodicGhosts(MFLattice.getField<HMAG<T>>());
 
     // ===== Phase A: Force setup =====
     RoC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,RoT>>(t(),FlagFM);
@@ -1018,8 +1178,8 @@ int main(int argc, char* argv[]) {
       ot.Print_InnerLoopPerformance(Geo.getTotalCellNum(),OutputStep);
       Printer::Endl();
       if (mpi().getRank() == 0) {
-        // 论文 F 节无量纲时间 t* = t*sqrt(g/L)
-        T tstar = T(t()) * std::sqrt(gravity/L_dom);
+        // 论文 F 节无量纲时间 t* = t*sqrt(g/L) (L = L_ref = Ni/2)
+        T tstar = T(t()) * std::sqrt(gravity/L_ref);
         printf("[t=%d t*=%.3f] mixed_layer_h=%.3f (hmax=%.3f hmin=%.3f)  (z0=%.2f)\n",
                t(),tstar,(hmax-hmin),hmax,hmin,InterfaceZ);
       }

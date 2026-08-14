@@ -142,7 +142,13 @@ __any__ void FFRhoOmegaUpdate3D<PFCELL, NSCELL>::apply(PFCELL& pf_cell, NSCELL& 
   T nu = eta / rho;
   T tau = T{0.5} + nu / LatSet::cs2;
   T omega = T{1} / tau;
-  if (omega > T{1.95}) omega = T{1.95};
+  // 上限从 1.95 提到 1.99: 允许低粘度流体 (KH 溶剂 eta~2.6e-4, RT 铁磁流体 eta~5e-3/rho=3)
+  // 达到其本征 omega (1.98-1.997)。旧上限 1.95 会把这两类流体的有效运动粘度钳到
+  // nu~0.00427 (Re_eff~300), 远低于论文意图 (Re=5000 / RT 铁磁流体 nu=0.00167),
+  // 导致 KH 演化速率与 RT 尖钉下降速率偏离论文。1.99 -> tau=0.5025 仍稳定 (MRT 分离
+  // 了体/幽灵矩 1.1-1.2, 剪切矩才绑 omega)。已核对 bubbleMag3d(omega<=1.93) 与
+  // rosenMag3d(omega<=1.92) 不受影响。
+  if (omega > T{1.99}) omega = T{1.99};
   if (omega < T{0.01}) omega = T{0.01};
 
   ns_cell.template get<OMEGA<T>>() = omega;
