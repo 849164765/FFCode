@@ -36,3 +36,11 @@ data*/
 # Scripts and tests temporary
 scripts/__pycache__/
 tests/__pycache__/
+
+# Additional simulation outputs / caches
+vtkoutput*/
+vtidata/
+*.vti
+*.vtm
+*.pyc
+__pycache__/

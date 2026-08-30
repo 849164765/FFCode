@@ -1,4 +1,6 @@
 #include <cstring>
+#include <cstdlib>
+#include <map>
 #include "freelb.h"
 #include "freelb.hh"
 #include "ff/ff2d.h"
@@ -38,7 +40,7 @@ int MaxStep, OutputStep;
 std::string work_dir;
 
 void readParam(int argc, char* argv[]) {
-  std::string iniName = "khMag3d.ini";
+  std::string iniName = "khMag3dMaxwell.ini";
   if (argc > 1) iniName = argv[1];
   iniReader r(iniName);
   work_dir = r.getValue<std::string>("workdir","workdir_");
@@ -131,6 +133,20 @@ void readParam(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
+#ifdef MPI_ENABLED
+  // MPICH CH3/nemesis 在共享内存 LMT 双向大消息下存在竞态:
+  //   MPID_nem_lmt_shm_start_send -> MPID_nem_delete_shm_region ->
+  //   MPIU_SHMW_Seg_detach: unable to remove shared memory (unlink ENOENT)
+  // 且报错总是落在 MPI_Waitall(count=176/286, MPI_STATUS_IGNORE) 上。
+  // 该错误来自 MPICH 内部共享内存 large-message transfer, 与本案例的
+  // request 数量没有直接关系; 本地/集群测试显示 np=8 最容易触发。
+  // 在 MPI_Init 之前设置 NOLOCAL, 让 MPICH 把所有进程当作跨节点处理,
+  // 完全关闭 CH3/nemesis 的共享内存通信路径。兼容旧版 CH3 的变量名
+  // 也一并设置。该设置只影响 MPI 传输层选择, 不改变计算结果。
+  setenv("MPIR_CVAR_NOLOCAL", "1", 0);
+  setenv("MPICH_NOLOCAL", "1", 0);
+  setenv("MPIR_CVAR_CH3_NOLOCAL", "1", 0);   // MPICH <= 3.2
+#endif
   mpi().init(&argc,&argv); MPI_DEBUG_WAIT
   Printer::Print_BigBanner(std::string("Initializing Kelvin-Helmholtz Instability in 3D..."));
   readParam(argc, argv);
@@ -147,10 +163,21 @@ int main(int argc, char* argv[]) {
   // -- geometry --
   // Z is vertical (H_global = Nk*Cell_Len), walls in Z, X & Y are periodic.
   AABB<T,3> domain({0,0,0},{T(Ni*Cell_Len),T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> left  ({T(-Cell_Len),0,0},{0,T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> right ({T(Ni*Cell_Len),0,0},{T((Ni+1)*Cell_Len),T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> front ({0,T(-Cell_Len),0},{T(Ni*Cell_Len),0,T(Nk*Cell_Len)});
-  AABB<T,3> back  ({0,T(Nj*Cell_Len),0},{T(Ni*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  // FIX(左右/四角周期缝异常值, 参考 rosensweig bf37c87 / rosenMag3d 边界伪影备注):
+  // 周期 ghost 区 AABB 必须延伸到角柱 (x=-1∧y=-1 等 4 根 corner ghost 列)。
+  // 旧版本 left/right 只覆盖 y∈[0,Nj], front/back 只覆盖 x∈[0,Ni], 四根
+  // corner ghost 列落在所有 AABB 之外, flag 保持 VoidFlag,
+  // FixedPeriodicBoundaryManager 永远不同步它们 -> POPs 冻结在 t=0 初值。
+  // 物理角柱 (x=0,y=0) 等通过 D3Q19 对角方向 streaming 每步读取这些冻结
+  // ghost, 注入垃圾分布; KH 剪切层把该扰动沿 x=0/Ni 缝平面放大成左右边界
+  // 丝状异常 (无磁场时同样出现)。
+  // 将 left/right 沿 y 延伸到 [-1,Nj+1]、front/back 沿 x 延伸到 [-1,Ni+1],
+  // corner ghost 列被两侧同时标记为 PeriodicFlag, 周期伙伴互为对角 ghost,
+  // 同步链闭合。z 向仍只取 [0,Nk]。
+  AABB<T,3> left  ({T(-Cell_Len),T(-Cell_Len),0},{0,T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  AABB<T,3> right ({T(Ni*Cell_Len),T(-Cell_Len),0},{T((Ni+1)*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  AABB<T,3> front ({T(-Cell_Len),T(-Cell_Len),0},{T((Ni+1)*Cell_Len),0,T(Nk*Cell_Len)});
+  AABB<T,3> back  ({T(-Cell_Len),T(Nj*Cell_Len),0},{T((Ni+1)*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
   BlockGeometryHelper3D<T> GeoHelper(Ni,Nj,Nk,domain,Cell_Len,BlockCellLen);
   // 网格必须能被 BlockCellLen 整除: 每方向块数 = 网格/块长
   GeoHelper.CreateBlocks(4,4,8);
@@ -214,18 +241,16 @@ int main(int argc, char* argv[]) {
   }
 
   // -- flag --
+  // 顺序对齐 bubble3dMRT（PF+NS 已验证）:
+  //   domain=Bulk -> SetupBoundary 标壁面 -> 恢复周期方向物理列 Bulk ->
+  //   最后再给周期 ghost 层标 PeriodicFlag。
+  // 这样周期 ghost（含四角 ghost 列）不会被 SetupBoundary 的 AllNormalCommunicate
+  // 干扰，FixedPeriodicBoundaryManager 也能在最终 flag 上建立配对。
   BlockFieldManager<FLAG,T,3> FlagFM(Geo,VoidFlag);
   FlagFM.forEach(domain,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
-  FlagFM.forEach(left,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
-  FlagFM.forEach(right,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
-  FlagFM.forEach(front,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
-  FlagFM.forEach(back,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
   FlagFM.template SetupBoundary<LatSet>(domain,BouncebackFlag);
   // FIX(边界伪影, 对应 2D rosensweig bf37c87 根因): SetupBoundary 会把 x/y 周期
-  // 侧面上所有域边界格点 (其周期 ghost 邻居在 domain AABB 之外, isInside=false)
-  // 误设为 Bounceback 无滑移壁, 导致四周边界被当固壁 -> 边界伪影与接缝处提前
-  // 起峰。将四个侧面的首/末物理列重置为 BulkFlag (仅保留 z 壁及其相邻棱边为
-  // Bounceback 壁; x/y 均为周期方向, 垂直棱边属于周期-周期角, 也应为 Bulk)。
+  // 侧面上所有域边界格点误设为 Bounceback; 恢复四个侧面的首/末物理列为 BulkFlag。
   AABB<T,3> left_col ({T{0},T{0},Cell_Len},{Cell_Len,T(Nj*Cell_Len),T((Nk-1)*Cell_Len)});
   AABB<T,3> right_col({T((Ni-1)*Cell_Len),T{0},Cell_Len},{T(Ni*Cell_Len),T(Nj*Cell_Len),T((Nk-1)*Cell_Len)});
   AABB<T,3> front_col({T{0},T{0},Cell_Len},{T(Ni*Cell_Len),Cell_Len,T((Nk-1)*Cell_Len)});
@@ -234,6 +259,11 @@ int main(int argc, char* argv[]) {
   FlagFM.forEach(right_col,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
   FlagFM.forEach(front_col,[&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
   FlagFM.forEach(back_col, [&](FLAG&f,std::size_t id){f.SetField(id,BulkFlag);});
+  // 最后标记周期 ghost 层（left/right/front/back 已延伸到四角 ghost 列）。
+  FlagFM.forEach(left,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
+  FlagFM.forEach(right,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
+  FlagFM.forEach(front,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
+  FlagFM.forEach(back,[&](FLAG&f,std::size_t id){f.SetField(id,PeriodicFlag);});
 
   // -- NS lattice --
   using NSFIELDS=TypePack<DENSITY<T>,VELOCITY<T,3>,POP<T,LatSet::q>,FORCE<T,3>,OMEGA<T>,PRESSURE<T>>;
@@ -469,7 +499,7 @@ int main(int argc, char* argv[]) {
 
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-    vtmo::vtmWriter<T,3> MW("khMag3d",Geo);
+    vtmo::vtmWriter<T,3> MW("khMag3dMaxwell",Geo);
   MW.addWriterSet(PW);
 
     auto SyncMFPeriodicGhosts = [&](auto& field, int fidx) {
@@ -645,9 +675,221 @@ int main(int argc, char* argv[]) {
     };
 
 
+  // ===== 全量周期 POP 同步 (KH 专用) ======================================
+  // 根因: FixedPeriodicBoundaryManager::Setup/SetupMPI 在选择跨块 source
+  // 时用 selfblock 判断 sourcePos; 在 z(以及块间 x/y) 相邻块共享 ghost 层
+  // 处, sourcePos 同时落在两个 selfblock 里, 按块序会先命中相邻块的 ghost
+  // 层 -> 周期 ghost 被写入过期的 ghost POP (小网格诊断: PF_Per.Apply 后
+  // x ghost 与对侧物理列有 ~7e-4 间隙, Apply 甚至没有改动该 ghost)。
+  // 这里在 PF/NS 每次碰撞后做一次正确的全量周期 POP 同步:
+  //   每个 rank 按 GlobalBlockTable 枚举所有 x/y 周期 ghost cell,
+  //   显式 wrap 到对侧物理 cell (x/y 取模, z 不 wrap; z ghost 交给后面
+  //   的壁面 ghost fix), 只处理与自己 rank 相关的发送/接收:
+  //   source 在本 rank -> 打包物理 POP 发出; ghost 在本 rank -> 接收写入。
+  // pair 用全局块条目 (ghostEntry, sourceEntry) 分组, 两端 tag 一致。
+  // 小网格验证 (32x8x64, np=4, t=10): 左右/前后缝 PHI 差从 ~0.07 降到
+  // 1e-5 量级, x=0/Ni-1 处 y 向伪三维模式基本消除。
+  auto SyncPeriodicPops = [&](auto& lat, auto* cellPtr, int fidx) {
+    using CELL = typename std::remove_pointer_t<decltype(cellPtr)>;
+    using Q = typename CELL::LatticeSet;
+    constexpr unsigned nq = Q::q;
+    const int nEntry = int(GlobalBlockTable.size() / 11);
+    const int myRank = mpi().getRank();
+#ifdef MPI_ENABLED
+    struct RecvJob { int block; std::size_t ghostId; };
+    std::vector<std::vector<char>> sendBufs(std::size_t(nEntry) * nEntry);
+    std::vector<std::vector<RecvJob>> recvJobs(std::size_t(nEntry) * nEntry);
+    std::vector<int> pairRank(std::size_t(nEntry) * nEntry, -1);
+#endif
+    const int ov = 1;
+    int bnx=-1, bny=-1, bnz=-1; bool uniformBlocks = true;
+    std::map<long long,int> entryByMin;
+    auto encKey = [](int x, int y, int z) {
+      return (static_cast<long long>(x + 4096)) | (static_cast<long long>(y + 4096) << 16) |
+             (static_cast<long long>(z + 4096) << 32);
+    };
+    for (int e = 0; e < nEntry; ++e) {
+      const double* en = &GlobalBlockTable[e * 11];
+      const int bx = int(en[4]) - 2 * ov, by = int(en[5]) - 2 * ov, bz = int(en[6]) - 2 * ov;
+      if (bnx < 0) { bnx = bx; bny = by; bnz = bz; }
+      else if (bx != bnx || by != bny || bz != bnz) uniformBlocks = false;
+      entryByMin[encKey(int(en[1]), int(en[2]), int(en[3]))] = e;
+    }
+    for (int eG = 0; eG < nEntry; ++eG) {
+      const double* enG = &GlobalBlockTable[eG * 11];
+      const bool atL = enG[7] > T{0.5}, atR = enG[8] > T{0.5};
+      const bool atF = enG[9] > T{0.5}, atB = enG[10] > T{0.5};
+      if (!atL && !atR && !atF && !atB) continue;
+      const int nx = int(enG[4]), ny = int(enG[5]), nz = int(enG[6]);
+      const int minX = int(enG[1]), minY = int(enG[2]), minZ = int(enG[3]);
+      const int gRank = int(enG[0]);
+      auto processCell = [&](int i, int j, int k) {
+        int gx = minX + i, gy = minY + j, gz = minZ + k;
+        if (gz < 0 || gz >= Nk) return;      // z ghost 由壁面 fix 处理
+        if (gx < 0) gx += Ni; else if (gx >= Ni) gx -= Ni;
+        if (gy < 0) gy += Nj; else if (gy >= Nj) gy -= Nj;
+        int eS = -1;
+        if (uniformBlocks) {
+          const int mx = (gx / bnx) * bnx - ov;
+          const int my = (gy / bny) * bny - ov;
+          const int mz = (gz / bnz) * bnz - ov;
+          auto it = entryByMin.find(encKey(mx, my, mz));
+          if (it != entryByMin.end()) eS = it->second;
+        } else {
+          for (int e = 0; e < nEntry; ++e) {
+            const double* en = &GlobalBlockTable[e * 11];
+            const int x0 = int(en[1]) + ov, x1 = int(en[1] + en[4]) - 1 - ov;
+            const int y0 = int(en[2]) + ov, y1 = int(en[2] + en[5]) - 1 - ov;
+            const int z0 = int(en[3]) + ov, z1 = int(en[3] + en[6]) - 1 - ov;
+            if (gx >= x0 && gx <= x1 && gy >= y0 && gy <= y1 && gz >= z0 && gz <= z1) {
+              eS = e; break;
+            }
+          }
+        }
+        if (eS < 0) return;
+        const double* enS = &GlobalBlockTable[eS * 11];
+        const int sRank = int(enS[0]);
+        const int pairIdx = std::min(eG, eS) * nEntry + std::max(eG, eS);
+        const int gId = k * (nx * ny) + j * nx + i;
+        if (sRank == myRank && gRank == myRank) {
+          int pb = -1;
+          for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
+            const auto& bkk = Geo.getBlock(bb);
+            if (int(bkk.getMin()[0]) == minX && int(bkk.getMin()[1]) == minY &&
+                int(bkk.getMin()[2]) == minZ) { pb = bb; break; }
+          }
+          int ps = -1;
+          for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
+            const auto& bkk = Geo.getBlock(bb);
+            if (int(bkk.getMin()[0]) == int(enS[1]) && int(bkk.getMin()[1]) == int(enS[2]) &&
+                int(bkk.getMin()[2]) == int(enS[3])) { ps = bb; break; }
+          }
+          if (pb < 0 || ps < 0) return;
+          auto& gbl = lat.getBlockLat(pb);
+          auto& sbl = lat.getBlockLat(ps);
+          const auto& pPr = Geo.getBlock(ps).getProjection();
+          const int sx = gx - int(enS[1]), sy = gy - int(enS[2]), sz = gz - int(enS[3]);
+          const std::size_t sid = std::size_t(sz) * pPr[2] + std::size_t(sy) * pPr[1] + std::size_t(sx);
+          CELL gc(gId, gbl), sc(sid, sbl);
+          for (unsigned q = 0; q < nq; ++q) gc[q] = sc[q];
+        }
+#ifdef MPI_ENABLED
+        else {
+          pairRank[pairIdx] = (gRank == myRank) ? sRank : gRank;
+          if (sRank == myRank) {
+            int ps = -1;
+            for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
+              const auto& bkk = Geo.getBlock(bb);
+              if (int(bkk.getMin()[0]) == int(enS[1]) && int(bkk.getMin()[1]) == int(enS[2]) &&
+                  int(bkk.getMin()[2]) == int(enS[3])) { ps = bb; break; }
+            }
+            if (ps < 0) return;
+            auto& sbl = lat.getBlockLat(ps);
+            const auto& pPr = Geo.getBlock(ps).getProjection();
+            const int sx = gx - int(enS[1]), sy = gy - int(enS[2]), sz = gz - int(enS[3]);
+            const std::size_t sid = std::size_t(sz) * pPr[2] + std::size_t(sy) * pPr[1] + std::size_t(sx);
+            CELL sc(sid, sbl);
+            auto& sb = sendBufs[pairIdx];
+            for (unsigned q = 0; q < nq; ++q) {
+              T v = sc[q];
+              sb.insert(sb.end(), reinterpret_cast<char*>(&v), reinterpret_cast<char*>(&v) + sizeof(T));
+            }
+          } else if (gRank == myRank) {
+            int pb = -1;
+            for (int bb = 0; bb < Geo.getBlockNum(); ++bb) {
+              const auto& bkk = Geo.getBlock(bb);
+              if (int(bkk.getMin()[0]) == minX && int(bkk.getMin()[1]) == minY &&
+                  int(bkk.getMin()[2]) == minZ) { pb = bb; break; }
+            }
+            if (pb < 0) return;
+            recvJobs[pairIdx].push_back({pb, std::size_t(gId)});
+          }
+        }
+#endif
+      };
+      if (atL || atR) {
+        const int i0 = atL ? 0 : nx - ov, i1 = atL ? ov : nx;
+        for (int k = 0; k < nz; ++k)
+          for (int j = 0; j < ny; ++j)
+            for (int i = i0; i < i1; ++i) processCell(i, j, k);
+      }
+      if (atF || atB) {
+        const int j0 = atF ? 0 : ny - ov, j1 = atF ? ov : ny;
+        for (int k = 0; k < nz; ++k)
+          for (int i = 0; i < nx; ++i)
+            for (int j = j0; j < j1; ++j) processCell(i, j, k);
+      }
+    }
+#ifdef MPI_ENABLED
+    // 之前每个 pair 单独 iSend/iRecv, np=8/16 时 outstanding request 可达
+    // 176/286 个, 触发 MPICH CH3/nemesis 大量共享内存 LMT 消息的
+    // "unable to remove shared memory" Waitall 错误。
+    // 这里把发往同一 rank 的所有 pair 缓冲区合并成一个 MPI 消息(接收侧
+    // 按同一 pair 升序重新展开), request 数降为最多 nranks-1。
+    const int nRanks = mpi().getSize();
+    std::vector<std::vector<char>> sendAgg(nRanks), recvAgg(nRanks);
+    std::vector<std::vector<int>> recvPiOrder(nRanks);
+    std::vector<std::size_t> recvExpect(nRanks, 0);
+    for (int pi = 0; pi < int(sendBufs.size()); ++pi) {
+      if (!sendBufs[pi].empty() && pairRank[pi] >= 0 && pairRank[pi] != myRank)
+        sendAgg[pairRank[pi]].insert(sendAgg[pairRank[pi]].end(), sendBufs[pi].begin(), sendBufs[pi].end());
+    }
+    for (int pi = 0; pi < int(sendBufs.size()); ++pi) {
+      if (!recvJobs[pi].empty() && pairRank[pi] >= 0 && pairRank[pi] != myRank) {
+        recvPiOrder[pairRank[pi]].push_back(pi);
+        recvExpect[pairRank[pi]] += recvJobs[pi].size() * nq * sizeof(T);
+      }
+    }
+    const int tagBase = fidx * 1000000;
+    std::vector<MPI_Request> sreqs, rreqs;
+    std::vector<int> sdest, rsrc;
+    for (int r = 0; r < nRanks; ++r) {
+      if (r == myRank) continue;
+      if (!sendAgg[r].empty()) {
+        MPI_Request sr;
+        mpi().iSend(sendAgg[r].data(), int(sendAgg[r].size()), r, &sr, tagBase + myRank);
+        sreqs.push_back(sr); sdest.push_back(r);
+      }
+      if (recvExpect[r] > 0) {
+        recvAgg[r].resize(recvExpect[r]);
+        MPI_Request rr;
+        mpi().iRecv(recvAgg[r].data(), int(recvAgg[r].size()), r, &rr, tagBase + r);
+        rreqs.push_back(rr); rsrc.push_back(r);
+      }
+    }
+    if (!sreqs.empty()) {
+      std::vector<MPI_Status> st(sreqs.size());
+      MPI_Waitall(int(sreqs.size()), sreqs.data(), st.data());
+    }
+    for (std::size_t a = 0; a < rreqs.size(); ++a) {
+      MPI_Wait(&rreqs[a], MPI_STATUS_IGNORE);
+      const int r = rsrc[a];
+      std::size_t off = 0;
+      for (const int pi : recvPiOrder[r]) {
+        const auto& jobs = recvJobs[pi];
+        const auto& buf = recvAgg[r];
+        for (const auto& job : jobs) {
+          auto& f1 = lat.getBlockLat(job.block);
+          const auto& prr = Geo.getBlock(job.block).getProjection();
+          CELL gc(job.ghostId, f1);
+          for (unsigned q = 0; q < nq; ++q) {
+            T v; std::memcpy(&v, &buf[off], sizeof(T)); off += sizeof(T);
+            gc[q] = v;
+          }
+        }
+      }
+    }
+#endif
+  };
+  // ========================================================================  };
+  // ========================================================================
+
   // ===== initial setup =====
   PFLattice.NormalFullCommunicate(); NSLattice.NormalFullCommunicate(); MFLattice.NormalFullCommunicate();
-  NS_Per.Apply(); PF_Per.Apply();
+  // 不再调用 NS_Per.Apply()/PF_Per.Apply(): 下面的 SyncPeriodicPops 已经
+  // 完整同步周期 ghost POP; PHI ghost 由随后的 SyncMFPeriodicGhosts 同步。
+  SyncPeriodicPops(PFLattice, (PFCELL*)nullptr, 0);
+  SyncPeriodicPops(NSLattice, (NSCELL*)nullptr, 100);
 
   // 初始 PHI 周期缝同步：第一次 FF2D 计算 ∇φ 前，必须让左右/前后
   // 周期 ghost 列的 PHI 等于对侧物理列，否则边界梯度从一开始就是错的，
@@ -1135,21 +1377,18 @@ int main(int argc, char* argv[]) {
     NSLattice.getField<FORCE<T,3>>().InitValue(Vector<T,3>{0,0,0});
     STC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,STT>>(t(),FlagFM);
 
-    // A4: Magnetic force (if chi>0 and H0>0)
-    // Paper Eq. (8): F_m = (μ₀χ/2)∇(|H|²) = μ₀χ|H|∇|H| (μ₀≡1, Kelvin form).
-    // Force-free wall bands: the z wall ψ-pins and the D3Q7 ψ-solver's
-    // far-field slope mismatch leave a spurious |H| spike within ~6 rows of
-    // each wall (worst at the x/y periodic corners). The Kelvin force there
-    // (χ|H|∇|H|) is a numerical artifact, so it is zeroed in the bands
-    // |z|<=16 and |z-H_global|<=16.
+    // A4: 完整 Maxwell 磁应力算子（实现已移入 src/mfield/mfield3d.h/.hh）
+    //   F_m = MagPressure_Factor × [ χ·|H|·∇|H| − 0.5·|H|²·∇χ ]
+    // 上下壁 band 过滤仍保留，去除壁面 ghost 数值尖峰。
     if(H0>T{0}){
       const T band=std::min(T{16.0}, H_global*T{0.1});
+      const T magScale = MagPressureEnabled ? MagPressureFactor : T{1};
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
         auto& ns_bl=NSLattice.getBlockLat(b);
         const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         int ov=bk.getOverlap();
-        T minX=bk.getMin()[0],minZ=bk.getMin()[2],vs=bk.getVoxelSize();
+        T minZ=bk.getMin()[2],vs=bk.getVoxelSize();
         for(int k=ov;k<bk.getNz()-ov;++k){
           T z=minZ+T(k-ov)*vs;
           if(z<=band||z>=H_global-band) continue;
@@ -1157,24 +1396,8 @@ int main(int argc, char* argv[]) {
             for(int i=ov;i<bk.getNx()-ov;++i){
               std::size_t id=k*pr[2]+j*pr[1]+i;
               PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
-              // 法向场案例 (bubbleMag3d/rosenMag3d) 继续使用 src 的
-              // Kelvin 力 F=chi*|H|*grad|H|, 且已验证正确。这里只针对
-              // KH 的水平切向场补充磁压力项。完整 Maxwell 应力散度
-              //  F_m = -0.5*H^2*grad(mu)
-              // 在切向场下 H^2 沿界面起伏, grad(mu) 沿界面法向;
-              // 该项是水平场抑制 KH 波浪的主项。为保证量纲与数值稳定,
-              // 只用切向 Hx 分量: F_m = -0.5*Hx^2*grad(mu)。
-              MFMagneticForce3D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
-              if(MagPressureEnabled){
-                T Hx=mf.template get<HX<T>>();
-                const auto& grad_phi=pf.template get<GRAD<T,3>>();
-                T dmu=mf.template get<MU_H<T>>()-mf.template get<MU_L<T>>();
-                auto& F=ns.template get<FORCE<T,3>>();
-                T pref=MagPressureFactor*(-T{0.5})*Hx*Hx*dmu;
-                F[0]+=pref*grad_phi[0];
-                F[1]+=pref*grad_phi[1];
-                F[2]+=pref*grad_phi[2];
-              }
+              MFMagneticForceFullMaxwell3D<PFCELL,MFCELL,NSCELL>::apply(
+                pf,mf,ns,magScale);
             }
           }
         }
@@ -1188,11 +1411,13 @@ int main(int argc, char* argv[]) {
 
     // ===== Phase B-C: PF + NS collision =====
     PFLattice.template ApplyInnerCellDynamics<PFSel>(FlagFM);
-    PF_Per.Apply(); PFLattice.NormalFullCommunicate();
+    SyncPeriodicPops(PFLattice, (PFCELL*)nullptr, 0);
+    PFLattice.NormalFullCommunicate();
 
     ViC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,ViT>>(t(),FlagFM);
     NSLattice.template ApplyInnerCellDynamics<NSSel>(FlagFM);
-    NS_Per.Apply(); NSLattice.NormalFullCommunicate();
+    SyncPeriodicPops(NSLattice, (NSCELL*)nullptr, 100);
+    NSLattice.NormalFullCommunicate();
 
     // ===== Phase D: Streaming =====
     PF_BB.Apply(t());

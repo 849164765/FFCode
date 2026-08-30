@@ -38,7 +38,7 @@ int MaxStep, OutputStep;
 std::string work_dir;
 
 void readParam(int argc, char* argv[]) {
-  std::string iniName = "khMag3d.ini";
+  std::string iniName = "khMag3dMaxwellFix.ini";
   if (argc > 1) iniName = argv[1];
   iniReader r(iniName);
   work_dir = r.getValue<std::string>("workdir","workdir_");
@@ -147,10 +147,23 @@ int main(int argc, char* argv[]) {
   // -- geometry --
   // Z is vertical (H_global = Nk*Cell_Len), walls in Z, X & Y are periodic.
   AABB<T,3> domain({0,0,0},{T(Ni*Cell_Len),T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> left  ({T(-Cell_Len),0,0},{0,T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> right ({T(Ni*Cell_Len),0,0},{T((Ni+1)*Cell_Len),T(Nj*Cell_Len),T(Nk*Cell_Len)});
-  AABB<T,3> front ({0,T(-Cell_Len),0},{T(Ni*Cell_Len),0,T(Nk*Cell_Len)});
-  AABB<T,3> back  ({0,T(Nj*Cell_Len),0},{T(Ni*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  // FIX(左右/四角周期缝异常值, 参考 rosensweig bf37c87 / rosenMag3d 边界伪影备注):
+  // 周期 ghost 区 AABB 必须延伸到角柱 (x=-1∧y=-1 等 4 根 corner ghost 列)。
+  // 旧版本 left/right 只覆盖 y∈[0,Nj], front/back 只覆盖 x∈[0,Ni], 四根
+  // corner ghost 列 (x=-1,y=-1)/(x=-1,y=Nj)/(x=Ni,y=-1)/(x=Ni,y=Nj) 落在
+  // 所有 AABB 之外, flag 保持 VoidFlag, FixedPeriodicBoundaryManager 永远
+  // 不同步它们 -> 它们的 POPs 冻结在 t=0 初值。物理角柱 (x=0,y=0) 等
+  // 通过 D3Q19 对角方向 streaming 每步读取这些冻结 ghost, 注入垃圾分布;
+  // KH 剪切层把该扰动沿 x=0/Ni 缝平面放大成可见的左右边界丝状异常
+  // (图像中界面左右两侧的点状/丝状 phi 异常, 无磁场时同样出现)。
+  // 将 left/right 沿 y 延伸到 [-1,Nj+1]、front/back 沿 x 延伸到 [-1,Ni+1]
+  // 后, corner ghost 列被两侧同时标记为 PeriodicFlag, 周期伙伴互为
+  // 对角 ghost, 同步链闭合。z 向仍只取 [0,Nk] (z ghost 行由壁面
+  // BB + Z ghost pop fix 处理, 不参与周期同步)。
+  AABB<T,3> left  ({T(-Cell_Len),T(-Cell_Len),0},{0,T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  AABB<T,3> right ({T(Ni*Cell_Len),T(-Cell_Len),0},{T((Ni+1)*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
+  AABB<T,3> front ({T(-Cell_Len),T(-Cell_Len),0},{T((Ni+1)*Cell_Len),0,T(Nk*Cell_Len)});
+  AABB<T,3> back  ({T(-Cell_Len),T(Nj*Cell_Len),0},{T((Ni+1)*Cell_Len),T((Nj+1)*Cell_Len),T(Nk*Cell_Len)});
   BlockGeometryHelper3D<T> GeoHelper(Ni,Nj,Nk,domain,Cell_Len,BlockCellLen);
   // 网格必须能被 BlockCellLen 整除: 每方向块数 = 网格/块长
   GeoHelper.CreateBlocks(4,4,8);
@@ -469,8 +482,15 @@ int main(int argc, char* argv[]) {
 
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-    vtmo::vtmWriter<T,3> MW("khMag3d",Geo);
+    vtmo::vtmWriter<T,3> MW("khMag3dMaxwellFix",Geo);
   MW.addWriterSet(PW);
+  vtmo::ScalarWriter PW2("NS_RHO",NSLattice.getField<DENSITY<T>>());
+  vtmo::ScalarWriter PW3("NS_P",NSLattice.getField<PRESSURE<T>>());
+  vtmo::VectorWriter PW4("NS_U",NSLattice.getField<VELOCITY<T,3>>());
+  vtmo::VectorWriter PW5("NS_F",NSLattice.getField<FORCE<T,3>>());
+  vtmo::VectorWriter PW6("PF_GRAD",PFLattice.getField<GRAD<T,3>>());
+  MW.addWriterSet(PW2); MW.addWriterSet(PW3); MW.addWriterSet(PW4);
+  MW.addWriterSet(PW5); MW.addWriterSet(PW6);
 
     auto SyncMFPeriodicGhosts = [&](auto& field, int fidx) {
       using ValT = typename std::decay_t<decltype(field.getBlockField(0))>::value_type;
@@ -1135,21 +1155,18 @@ int main(int argc, char* argv[]) {
     NSLattice.getField<FORCE<T,3>>().InitValue(Vector<T,3>{0,0,0});
     STC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,STT>>(t(),FlagFM);
 
-    // A4: Magnetic force (if chi>0 and H0>0)
-    // Paper Eq. (8): F_m = (μ₀χ/2)∇(|H|²) = μ₀χ|H|∇|H| (μ₀≡1, Kelvin form).
-    // Force-free wall bands: the z wall ψ-pins and the D3Q7 ψ-solver's
-    // far-field slope mismatch leave a spurious |H| spike within ~6 rows of
-    // each wall (worst at the x/y periodic corners). The Kelvin force there
-    // (χ|H|∇|H|) is a numerical artifact, so it is zeroed in the bands
-    // |z|<=16 and |z-H_global|<=16.
+    // A4: 完整 Maxwell 磁应力算子（实现已移入 src/mfield/mfield3d.h/.hh）
+    //   F_m = MagPressure_Factor × [ χ·|H|·∇|H| − 0.5·|H|²·∇χ ]
+    // 上下壁 band 过滤仍保留，去除壁面 ghost 数值尖峰。
     if(H0>T{0}){
       const T band=std::min(T{16.0}, H_global*T{0.1});
+      const T magScale = MagPressureEnabled ? MagPressureFactor : T{1};
       for(int b=0;b<Geo.getBlockNum();++b){
         auto& pf_bl=PFLattice.getBlockLat(b); auto& mf_bl=MFLattice.getBlockLat(b);
         auto& ns_bl=NSLattice.getBlockLat(b);
         const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
         int ov=bk.getOverlap();
-        T minX=bk.getMin()[0],minZ=bk.getMin()[2],vs=bk.getVoxelSize();
+        T minZ=bk.getMin()[2],vs=bk.getVoxelSize();
         for(int k=ov;k<bk.getNz()-ov;++k){
           T z=minZ+T(k-ov)*vs;
           if(z<=band||z>=H_global-band) continue;
@@ -1157,24 +1174,8 @@ int main(int argc, char* argv[]) {
             for(int i=ov;i<bk.getNx()-ov;++i){
               std::size_t id=k*pr[2]+j*pr[1]+i;
               PFCELL pf(id,pf_bl); MFCELL mf(id,mf_bl); NSCELL ns(id,ns_bl);
-              // 法向场案例 (bubbleMag3d/rosenMag3d) 继续使用 src 的
-              // Kelvin 力 F=chi*|H|*grad|H|, 且已验证正确。这里只针对
-              // KH 的水平切向场补充磁压力项。完整 Maxwell 应力散度
-              //  F_m = -0.5*H^2*grad(mu)
-              // 在切向场下 H^2 沿界面起伏, grad(mu) 沿界面法向;
-              // 该项是水平场抑制 KH 波浪的主项。为保证量纲与数值稳定,
-              // 只用切向 Hx 分量: F_m = -0.5*Hx^2*grad(mu)。
-              MFMagneticForce3D<PFCELL,MFCELL,NSCELL>::apply(pf,mf,ns);
-              if(MagPressureEnabled){
-                T Hx=mf.template get<HX<T>>();
-                const auto& grad_phi=pf.template get<GRAD<T,3>>();
-                T dmu=mf.template get<MU_H<T>>()-mf.template get<MU_L<T>>();
-                auto& F=ns.template get<FORCE<T,3>>();
-                T pref=MagPressureFactor*(-T{0.5})*Hx*Hx*dmu;
-                F[0]+=pref*grad_phi[0];
-                F[1]+=pref*grad_phi[1];
-                F[2]+=pref*grad_phi[2];
-              }
+              MFMagneticForceFullMaxwell3D<PFCELL,MFCELL,NSCELL>::apply(
+                pf,mf,ns,magScale);
             }
           }
         }
@@ -1193,6 +1194,36 @@ int main(int argc, char* argv[]) {
     ViC.ApplyInnerCellDynamics<CoupledTaskSelector<std::uint8_t,PFCELL,NSCELL,ViT>>(t(),FlagFM);
     NSLattice.template ApplyInnerCellDynamics<NSSel>(FlagFM);
     NS_Per.Apply(); NSLattice.NormalFullCommunicate();
+
+    // DEBUG: trace NS pops at seam cell (x=0,y=16,z=64) & partner (x=127)
+    auto TraceNS = [&](const char* tag){
+      if(t()>1) return;
+      for(int b=0;b<Geo.getBlockNum();++b){
+        const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
+        int ov=bk.getOverlap();
+        T mx=bk.getMin()[0],my=bk.getMin()[1],mz2=bk.getMin()[2];
+        T Mx=mx+T(bk.getNx()-2*ov)*bk.getVoxelSize();
+        T My=my+T(bk.getNy()-2*ov)*bk.getVoxelSize();
+        T Mz2=mz2+T(bk.getNz()-2*ov)*bk.getVoxelSize();
+        int tgx=-1, ggx=-1; const char* who="";
+        if(mx<-T{0.5}&&my<=T(16)&&My>T(16)&&mz2<=T(64)&&Mz2>T(64)){tgx=ov; ggx=0; who="L";}       // left-edge block: holds x=0
+        if(Mx>T(Ni)-T{1.5}&&mx>T(Ni)-T{2.5}*Cell_Len&&my<=T(16)&&My>T(16)&&mz2<=T(64)&&Mz2>T(64)){tgx=bk.getNx()-1-ov; ggx=bk.getNx()-1; who="R";} // right-edge block: holds x=127
+        if(tgx<0) continue;
+        int j=16-(int(my)+ov), k=64-(int(mz2)+ov);
+        auto& bl=NSLattice.getBlockLat(b);
+        for(int pass=0;pass<3;++pass){
+          int ii = pass==0?tgx:(pass==1?ggx:(who[0]=='L'?tgx+1:tgx-1));
+          const char* nm = pass==0?"phys":(pass==1?"ghost":"nbr");
+          std::size_t id=k*pr[2]+j*pr[1]+ii;
+          NSCELL c(id,bl);
+          T s=0,ux=0,uz=0;
+          for(unsigned q2=0;q2<LatSet::q;++q2){s+=c[q2];ux+=latset::c<LatSet>(q2)[0]*c[q2];uz+=latset::c<LatSet>(q2)[2]*c[q2];}
+          printf("[t=%d %s] rank%d block%d %s i=%d sumf=%.8f ux=%.6f | f1=%.3e f2=%.3e\n",
+                 (int)t(),tag,mpi().getRank(),b,nm,ii,s,ux,c[1],c[2]);
+        }
+      }
+    };
+    TraceNS("afterNSPer");
 
     // ===== Phase D: Streaming =====
     PF_BB.Apply(t());
@@ -1227,7 +1258,8 @@ int main(int argc, char* argv[]) {
             for(int i=0;i<nx;++i){NSCELL g((nz-1)*pr[2]+jj*pr[1]+i,bl),w((nz-1-ov)*pr[2]+jj*pr[1]+i,bl); for(unsigned k2=0;k2<LatSet::q;++k2)g[k2]=w[k2];}
       }
     }
-    NSLattice.Stream(); NSLattice.NormalFullCommunicate();
+    NSLattice.Stream(); TraceNS("afterStreamPreComm"); NSLattice.NormalFullCommunicate();
+    TraceNS("afterStream");
 
     // ===== Phase E: Macro update =====
     // phi = sum(g_i)

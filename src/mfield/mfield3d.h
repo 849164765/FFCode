@@ -59,6 +59,18 @@ struct MFMagneticForce3D {
   __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell);
 };
 
+// MF4-3D: 完整 Maxwell 磁应力算子
+//   F_m = scale * [ χ·|H|·∇|H|  −  0.5·|H|²·∇χ ]
+// 其中 ∇χ = (χ_h − χ_l)·∇φ；∇|H| 使用 D3Q7 各向同性梯度 (Q2=1/4)。
+// 该算子由 khMag3dMaxwell 验证，因子由调用方传入 (scale)。
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+struct MFMagneticForceFullMaxwell3D {
+  using T = typename PFCELL::FloatType;
+  using LatSet = typename MFCELL::LatticeSet;
+  __any__ static void apply(PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell,
+                            T scale = T{1});
+};
+
 // ===================================================================
 //  Communication Functions (3D)
 // ===================================================================

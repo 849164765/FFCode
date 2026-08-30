@@ -104,7 +104,9 @@ __any__ void MFMagneticForce2D<PFCELL, MFCELL, NSCELL>::apply(
   grad_Hmag[0] /= LatSet::cs2;
   grad_Hmag[1] /= LatSet::cs2;
 
-  // F_mag = χ·|H|·∇|H|  (Guo 2025, Eq. (8), μ₀ ≡ 1)
+  // F_mag = χ·|H|·∇|H|  (对应 Eq.(8) 的 (μ₀χ/2)∇|H|²)
+  // 实测: 额外加 -0.5|H|²∇χ 会和 Kelvin 项部分抵消，使净磁力更小，
+  // 因此这里保持论文 Eq.(8) 的 Kelvin 形式。
   T Fmag_x = chi * Hmag * grad_Hmag[0];
   T Fmag_y = chi * Hmag * grad_Hmag[1];
 

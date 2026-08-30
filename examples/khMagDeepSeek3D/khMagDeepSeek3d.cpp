@@ -38,7 +38,7 @@ int MaxStep, OutputStep;
 std::string work_dir;
 
 void readParam(int argc, char* argv[]) {
-  std::string iniName = "khMag3d.ini";
+  std::string iniName = "khMagDeepSeek3d.ini";
   if (argc > 1) iniName = argv[1];
   iniReader r(iniName);
   work_dir = r.getValue<std::string>("workdir","workdir_");
@@ -92,7 +92,7 @@ void readParam(int argc, char* argv[]) {
   eta_l = std::max(eta_l_re, eta_l_stable);
   sigma = rho_ref*L_ref*U0*U0/We;
   gravity = U0*U0/(Fr*L_ref);
-  eta_h = r.getValue<T>("Two_Phase","eta_h", eta_l);
+  eta_h = r.getValue<T>("Two_Phase","eta_h", eta_l);   // 文献未指定下相粘度, 默认等粘度
   // 显式覆盖 (可选): 若 ini 直接给出这些格子值则优先
   rho_l   = r.getValue<T>("Two_Phase","rho_l", rho_l);
   rho_h   = r.getValue<T>("Two_Phase","rho_h", rho_h);
@@ -110,7 +110,7 @@ void readParam(int argc, char* argv[]) {
   Tau_ns=T{0.5}+std::max(eta_l,eta_h)/std::min(rho_l,rho_h)/LatSet::cs2;
 
   MPI_RANK(0){
-    printf("---- Kelvin-Helmholtz Instability in Ferrofluid (3D) ----\n");
+    printf("---- DeepSeek Kelvin-Helmholtz Instability (3D) ----\n");
     printf("Mesh: %dx%dx%d  BlockCellLen=%d  L=%.0f (2L=%.0f)\n",Ni,Nj,Nk,BlockCellLen,L_ref,T{2}*L_ref);
     printf("Interface: z0=%.1f  perturb A=%.2f (0.1L=%.1f)  periods=%.0f  W=%.1f\n",
            InterfaceZ,PerturbAmp,T{0.1}*L_ref,PerturbPeriods,Interface_Width);
@@ -132,7 +132,7 @@ void readParam(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   constexpr std::uint8_t VoidFlag=1,BulkFlag=2,BouncebackFlag=4,PeriodicFlag=8;
   mpi().init(&argc,&argv); MPI_DEBUG_WAIT
-  Printer::Print_BigBanner(std::string("Initializing Kelvin-Helmholtz Instability in 3D..."));
+  Printer::Print_BigBanner(std::string("Initializing DeepSeek Kelvin-Helmholtz Instability (3D)..."));
   readParam(argc, argv);
 
   // -- converters --
@@ -287,14 +287,12 @@ int main(int argc, char* argv[]) {
   for(int b=0;b<Geo.getBlockNum();++b){
     const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
     auto& bPhi=phiField.getBlockField(b);
-    T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1],mz=bk.getMin()[2];
     int ov=0;
     for(int k=ov;k<bk.getNz()-ov;++k){
-      T z=mz+T(k)*vs;
       for(int j=ov;j<bk.getNy()-ov;++j){
-        T y=my+T(j)*vs;
         for(int i=ov;i<bk.getNx()-ov;++i){
-          T x=mx+T(i)*vs;
+          auto vox=bk.getVoxel(Vector<int,3>{i,j,k});
+          T x=vox[0], y=vox[1], z=vox[2];
           T h=interfaceHeight(x,y);
           T phi=T{0.5}-T{0.5}*std::tanh(T{2.0}*(z-h)/W_phys);
           bPhi.get(k*pr[2]+j*pr[1]+i)=phi;
@@ -325,14 +323,12 @@ int main(int argc, char* argv[]) {
   for(int b=0;b<Geo.getBlockNum();++b){
     auto& bl=NSLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
     auto& bPhi=phiField.getBlockField(b);
-    T vs=bk.getVoxelSize(),mx=bk.getMin()[0],my=bk.getMin()[1],mz=bk.getMin()[2];
     int ov=0;
     for(int k=ov;k<bk.getNz()-ov;++k){
-      T z=mz+T(k)*vs;
       for(int j=ov;j<bk.getNy()-ov;++j){
-        T y=my+T(j)*vs;
         for(int i=ov;i<bk.getNx()-ov;++i){
-          T x=mx+T(i)*vs;
+          auto vox=bk.getVoxel(Vector<int,3>{i,j,k});
+          T x=vox[0], y=vox[1], z=vox[2];
           T h=interfaceHeight(x,y);
           T p = (z>=h) ? rho_l*gravity*(H_total-z)
                        : rho_l*gravity*(H_total-h) + rho_h*gravity*(h-z);
@@ -386,12 +382,11 @@ int main(int argc, char* argv[]) {
     for(int b=0;b<Geo.getBlockNum();++b){
       auto& bl=MFLattice.getBlockLat(b); const auto& bk=Geo.getBlock(b); const auto& pr=bk.getProjection();
       auto& bPsi=psiF.getBlockField(b);
-      T vs=bk.getVoxelSize(),mx=bk.getMin()[0],mz=bk.getMin()[2];
       for(int k=0;k<bk.getNz();++k){
-        T z=mz+T(k)*vs;
         for(int j=0;j<bk.getNy();++j){
           for(int i=0;i<bk.getNx();++i){
-            T x=mx+T(i)*vs, psi=psiKH(x,z);
+            auto vox=bk.getVoxel(Vector<int,3>{i,j,k});
+            T x=vox[0], z=vox[2], psi=psiKH(x,z);
             std::size_t id=k*pr[2]+j*pr[1]+i; MFCELL c(id,bl);
             for(unsigned kk=0;kk<MFLatSet::q;++kk) c[kk]=latset::w<MFLatSet>(kk)*psi;
             bPsi.get(id)=psi;
@@ -469,7 +464,7 @@ int main(int argc, char* argv[]) {
 
   // Writers
   vtmo::ScalarWriter PW("PHI",PFLattice.getField<PHI<T>>());
-    vtmo::vtmWriter<T,3> MW("khMag3d",Geo);
+    vtmo::vtmWriter<T,3> MW("khMagDeepSeek3d",Geo);
   MW.addWriterSet(PW);
 
     auto SyncMFPeriodicGhosts = [&](auto& field, int fidx) {

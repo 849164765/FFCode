@@ -8,5 +8,5 @@ module load gcc/12.2
 
 make clean
 make
-# 128x64x256 / BlockCellLen=32 -> 4x2x8=64 blocks, 用 64 进程
-mpiexec -n 64 ./khMag3d.exe
+# 128x128x512 网格 / BlockCellLen=32 -> 4x4x16=256 blocks, 用 128 进程 (每进程 2 块)
+mpiexec -n 128 ./RTDeepSeek3D.exe

@@ -131,4 +131,53 @@ __any__ void MFMagneticForce3D<PFCELL, MFCELL, NSCELL>::apply(
   ns_force[2] += Fmag_z;
 }
 
+
+// ---- MFMagneticForceFullMaxwell3D ----
+// 完整 Maxwell 磁应力算子 (khMag3dMaxwell 验证版，已从 cpp 移入 src)
+//   F_m = scale * [ χ·|H|·∇|H|  −  0.5·|H|²·∇χ ]
+// 其中 ∇χ = (χ_h − χ_l)·∇φ；∇|H| 使用与 MFComputeH3D 相同的 D3Q7 Q2 归一化。
+template <typename PFCELL, typename MFCELL, typename NSCELL>
+__any__ void MFMagneticForceFullMaxwell3D<PFCELL, MFCELL, NSCELL>::apply(
+    PFCELL& pf_cell, MFCELL& mf_cell, NSCELL& ns_cell, T scale) {
+  using LatSet = typename MFCELL::LatticeSet;
+
+  T chi_l = mf_cell.template get<CHI_L<T>>();
+  T chi_h = mf_cell.template get<CHI_H<T>>();
+  T phi   = pf_cell.template get<typename PFCELL::GenericRho>();
+  T chi   = chi_l + phi * (chi_h - chi_l);
+  T Hmag  = mf_cell.template get<HMAG<T>>();
+
+  T Q2 = T{0};
+  for (unsigned int k = 1; k < LatSet::q; ++k) {
+    T wk = latset::w<LatSet>(k);
+    const auto& ck = latset::c<LatSet>(k);
+    Q2 += wk * ck[0] * ck[0];
+  }
+
+  // ∇|H| via D3Q7 6-direction isotropic gradient
+  Vector<T, 3> grad_Hmag{0, 0, 0};
+  for (unsigned int k = 1; k < LatSet::q; ++k) {
+    T Hmag_k = mf_cell.getNeighbor(k).template get<HMAG<T>>();
+    T wk = latset::w<LatSet>(k);
+    const auto& ck = latset::c<LatSet>(k);
+    grad_Hmag[0] += wk * ck[0] * Hmag_k;
+    grad_Hmag[1] += wk * ck[1] * Hmag_k;
+    grad_Hmag[2] += wk * ck[2] * Hmag_k;
+  }
+  grad_Hmag[0] /= Q2;
+  grad_Hmag[1] /= Q2;
+  grad_Hmag[2] /= Q2;
+
+  const auto& grad_phi = pf_cell.template get<GRAD<T, 3>>();
+  T dchi = chi_h - chi_l;
+  Vector<T, 3> grad_chi{dchi * grad_phi[0],
+                         dchi * grad_phi[1],
+                         dchi * grad_phi[2]};
+
+  auto& F = ns_cell.template get<FORCE<T, 3>>();
+  F[0] += scale * (chi * Hmag * grad_Hmag[0] - T{0.5} * Hmag * Hmag * grad_chi[0]);
+  F[1] += scale * (chi * Hmag * grad_Hmag[1] - T{0.5} * Hmag * Hmag * grad_chi[1]);
+  F[2] += scale * (chi * Hmag * grad_Hmag[2] - T{0.5} * Hmag * Hmag * grad_chi[2]);
+}
+
 }  // namespace mfield
